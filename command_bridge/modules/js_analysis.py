@@ -507,14 +507,49 @@ class _LocalJsAnalysisWorker(_JsAnalysisWorker):
 class JsAnalysisMixin:
     """Web Scraping → JS recon & analysis button handler."""
 
-    def run_downloaded_js_analysis(self):
-        """Analyse the JS files that 'Retrieve JS Files' already downloaded."""
+    def run_retrieve_and_analyse_js(self):
+        """Pull the site's JavaScript down, then analyse what landed.
+
+        Retrieving the scripts and then reading them are one job, not two —
+        nobody downloads a folder of JS in order to leave it alone. The wget
+        stage runs as a normal editable command (so the depth, host span and
+        file types stay tweakable), and a one-shot follow-up hook kicks off
+        the static analysis the moment it exits cleanly. If wget fails, the
+        follow-up is skipped rather than analysing an empty folder.
+        """
+        template = self.command_registry.get("web_retrieve_js")
+        if not template:
+            self.console.append_ansi("\n[!] No retrieve command is configured.\n")
+            return
+        self._command_follow_up = self._analyse_retrieved_js
+        self.run_command_template(template, label="Retrieve & Analyse JS Files")
+
+    def _analyse_retrieved_js(self):
+        """Follow-up stage: analyse the folder wget has just populated."""
+        safe = self.sanitize_target_for_filename(getattr(self, "target", "") or "target")
+        js_dir = Path(self.output_dir) / f"{safe}_js_files"
+        if not js_dir.is_dir():
+            self.console.append_ansi(
+                f"\n[i] Nothing to analyse — {js_dir} was not created, which "
+                "usually means the site served no .js files at that crawl depth.\n"
+            )
+            return
+        self.run_downloaded_js_analysis(js_dir=js_dir)
+
+    def run_downloaded_js_analysis(self, js_dir=None):
+        """Analyse a folder of downloaded JavaScript.
+
+        Called directly by the retrieve-and-analyse chain with the folder it
+        just filled, and still usable on its own — with no folder given it
+        looks for <target>_js_files and otherwise asks for one, so a set of
+        scripts pulled down by hand can be analysed too.
+        """
         from PyQt6.QtWidgets import QFileDialog
 
         safe = self.sanitize_target_for_filename(getattr(self, "target", "") or "target")
         default_dir = Path(self.output_dir) / f"{safe}_js_files"
 
-        js_dir = default_dir
+        js_dir = Path(js_dir) if js_dir else default_dir
         if not js_dir.is_dir():
             chosen = QFileDialog.getExistingDirectory(
                 self,
@@ -523,8 +558,8 @@ class JsAnalysisMixin:
             )
             if not chosen:
                 self.console.append_ansi(
-                    f"\n[!] {default_dir} does not exist yet — run 'Retrieve JS Files' "
-                    "first, or pick a folder to analyse.\n"
+                    f"\n[!] {default_dir} does not exist yet — run 'Retrieve & "
+                    "Analyse JS Files' first, or pick a folder to analyse.\n"
                 )
                 return
             js_dir = Path(chosen)

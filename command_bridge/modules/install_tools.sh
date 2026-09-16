@@ -75,7 +75,64 @@ check_tool() {
         echo "broken"
         return
     fi
+    # A Python tool that dies before it can print its own --help is just as
+    # broken, and this is the second failure mode a Kali box reliably
+    # produces: a pip-installed console script in /usr/local/bin pinned to an
+    # old version ("wafw00f==2.2.0") shadowing the apt package that actually
+    # got upgraded, so every run ends in DistributionNotFound or
+    # VersionConflict. A working tool's --help never contains a traceback.
+    if echo "$out" | grep -qE 'Traceback \(most recent call last\)|DistributionNotFound|VersionConflict|ModuleNotFoundError|ImportError:'; then
+        echo "broken"
+        return
+    fi
     echo "ok"
+}
+
+# fix_stale_pip_shim <bin>
+#
+# Repairs the "/usr/local/bin shadows the real package" failure. pip (and old
+# easy_install) drop a console script into /usr/local/bin that hard-codes the
+# version it was installed against:
+#
+#     __import__('pkg_resources').run_script('wafw00f==2.2.0', 'wafw00f')
+#
+# When the tool is later upgraded — or reinstalled from apt into
+# /usr/lib/python3/dist-packages — that pinned version no longer exists, but
+# /usr/local/bin still comes first on PATH, so every invocation raises
+# DistributionNotFound. The apt-installed copy is sitting right there in
+# /usr/bin, unused.
+#
+# The shim is renamed rather than deleted, so nothing is destroyed and the
+# change can be undone by moving it back.
+fix_stale_pip_shim() {
+    local bin="$1" shim other
+    shim="$(command -v "$bin" 2>/dev/null)"
+    [ -n "$shim" ] || return 1
+
+    # Only ever touch /usr/local/bin — a distro-managed binary is not ours
+    # to move, and a pipx shim in ~/.local/bin is handled by pipx_install.
+    case "$shim" in
+        /usr/local/bin/*) ;;
+        *) return 1 ;;
+    esac
+
+    # It must actually look like a Python entry-point script.
+    grep -qE 'pkg_resources|importlib.metadata|EntryPoint' "$shim" 2>/dev/null || return 1
+
+    # And there must be another copy for PATH to fall back to, or renaming
+    # this one just removes the tool entirely.
+    other="$(type -aP "$bin" 2>/dev/null | grep -v "^${shim}$" | head -1)"
+    if [ -z "$other" ]; then
+        echo "$shim looks like a stale pip shim, but there is no other copy of $bin to fall back to -- leaving it alone."
+        return 1
+    fi
+
+    echo "[*] $shim is a stale pip shim shadowing $other -- renaming it to ${shim}.cb-disabled"
+    if [ "$(id -u)" = "0" ]; then
+        mv -f "$shim" "${shim}.cb-disabled"
+    else
+        sudo mv -f "$shim" "${shim}.cb-disabled"
+    fi
 }
 
 report() {
@@ -211,6 +268,18 @@ handle_tool() {
     fi
 
     echo "  [*] $name: $status -- attempting install/repair..."
+
+    # A stale /usr/local/bin pip shim shadowing a working package is cheap to
+    # test for and cheap to fix, and when it is the cause no install is needed
+    # at all — so try it before reaching for apt/pipx/go. Applies to every
+    # tool, not just the one that surfaced it.
+    if [ "$status" = "broken" ] && fix_stale_pip_shim "$bin" >/dev/null 2>&1; then
+        if [ "$(check_tool "$bin" "$flag")" = "ok" ]; then
+            report "$name" fixed "removed a stale pip shim from /usr/local/bin"
+            return
+        fi
+    fi
+
     local log
     log="$(mktemp /tmp/cb_install_XXXXXX.log)"
     "$installer" >"$log" 2>&1
@@ -264,7 +333,16 @@ _i_hping3()      { apt_install hping3; }
 _i_nikto()       { apt_install nikto; }
 _i_ike_scan()    { apt_install ike-scan; }
 _i_dotdotpwn()   { apt_install dotdotpwn; }
-_i_wafw00f()     { apt_install wafw00f || pipx_install wafw00f; }
+# wafw00f is the tool this bites most often: Kali ships 2.4.2 in
+# dist-packages while an old pip install leaves a /usr/local/bin/wafw00f
+# pinned to 2.2.0 ahead of it on PATH. Clear that first — if it was the only
+# problem the tool is already working and nothing needs installing.
+_i_wafw00f() {
+    if fix_stale_pip_shim wafw00f; then
+        [ "$(check_tool wafw00f)" = "ok" ] && return 0
+    fi
+    apt_install wafw00f || pipx_install wafw00f
+}
 
 # ssh-audit is packaged, but the pipx release is usually newer and the apt
 # one is occasionally held back, so fall through rather than giving up.

@@ -17,11 +17,13 @@ class ToolSetupMixin:
         """Scan PATH for every tool this app uses and report OK/MISSING/BROKEN.
         Makes no changes — safe to run at any time."""
         self.run_raw_command(
-            "bash {CB_DIR}/command_bridge/modules/install_tools.sh --check-only"
+            "bash {CB_DIR}/command_bridge/modules/install_tools.sh --check-only",
+            label="Tool Status Check",
         )
 
     def run_install_tools(self):
         """Best-effort install/repair for every missing or broken tool."""
         self.run_raw_command(
-            "bash {CB_DIR}/command_bridge/modules/install_tools.sh"
+            "bash {CB_DIR}/command_bridge/modules/install_tools.sh",
+            label="Tool Install / Repair",
         )
