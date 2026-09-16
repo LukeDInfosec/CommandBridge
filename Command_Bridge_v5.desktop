@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Command Bridge v5
+Comment=Professional Penetration Testing Command Center
+Exec=bash /home/ldawson/Desktop/Luke_Software/Test26/launch.sh
+Icon=utilities-terminal
+Terminal=true
+Categories=Development;Security;
+StartupNotify=true
+Path=/home/ldawson/Desktop/Luke_Software/Test26

@@ -1,0 +1,995 @@
+================================================================================
+ COMMAND BRIDGE v4 — PROJECT REFERENCE & CHANGELOG
+ (Reference doc for Claude / future sessions. Keep this updated after changes.)
+ Last updated: 2026-09-15
+================================================================================
+
+HOW TO USE THIS FILE
+--------------------
+- This is a map + dictionary of the app so we don't have to re-read every file
+  each session. Read this first.
+- Line numbers are ACCURATE AS OF the "Last updated" date but DRIFT when code is
+  edited. If a line number looks wrong, grep for the function name
+  (e.g. `def run_externals_workflow`) to find it again — names are stable.
+- After making changes, add a CHANGELOG entry at the top and update any line
+  numbers / sections you touched.
+
+
+================================================================================
+ CHANGELOG (most recent first)
+================================================================================
+
+## 2026-09-15 (c) — Soft-404/wildcard filtering for all 4 directory fuzzers
+VERSION: constants.py APP_VERSION 4.4.0 -> 4.5.0.
+User reported FFUF returning ~500 "200 OK" hits that were all, on manual
+inspection, the exact same "not found" page (byte-identical) — a classic
+soft-404/wildcard responder (common with SPAs and custom error handlers that
+answer every unmatched path with 200 instead of 404). Researched and applied
+each tool's own real, documented mechanism for this rather than guessing,
+verified against official docs/README/PRs for each:
+FFUF (modules/fuzzing.py web_ffuf, ui/tabs_web.py fallback, ui/tabs_api.py
+  api_ffuf incl. the show_api_fuzz_menu fallback): added -ac (auto-
+  calibrate) — ffuf's own built-in fix. It probes the target with a few
+  random/nonexistent paths before the real run, learns what that false-
+  positive response looks like, and filters matching results automatically.
+FFUF_CLEAN.PY BACKSTOP (modules/ffuf_clean.py): -ac's calibration samples
+  are "obviously random junk" paths, which some servers treat differently
+  from a real dictionary word that just isn't a real page — so as defense in
+  depth, ffuf_clean.py now also groups all results by exact response byte
+  length. If one length accounts for >= 5 results AND >= 25% of all results,
+  those are pulled into a clearly-labelled "[FILTERED] N of M results were
+  X bytes..." section at the bottom of the output instead of the main
+  findings list — NOT deleted (kept for audit), just no longer buried among
+  real findings. Verified against a synthetic 503-result JSON matching the
+  user's exact scenario (500 identical soft-404 hits + 3 genuine findings):
+  the 3 genuine hits surface at the top, the 500 clones get grouped below.
+FEROXBUSTER: no change needed — confirmed via feroxbuster's own --help text
+  that it auto-filters wildcard/soft-404 responses BY DEFAULT (-D/
+  --dont-filter is the flag that turns this OFF, which the app never
+  passes), so this button was already covered.
+DIRSEARCH (modules/fuzzing.py web_dirsearch, ui/tabs_web.py fallback): added
+  --filter-threshold 10 — dirsearch's purpose-built flag for this exact
+  problem (added via dirsearch PR #1436 for issue #1293), which filters out
+  further results once a given response has already been seen 10+ times.
+GOBUSTER (modules/fuzzing.py web_gobuster, ui/tabs_web.py fallback): unlike
+  the other three, gobuster's `dir` mode has NO built-in auto-calibration —
+  confirmed via its actual --help output (no wildcard-detection flag exists
+  in dir mode at all; the only relevant flag is --exclude-length/--xl, which
+  needs a byte count supplied up front, i.e. gobuster expects YOU to already
+  know the soft-404 size). Built that calibration ourselves: the command now
+  probes one virtually-guaranteed-nonexistent path with curl first (unique
+  per run via $(date +%s%N)_$$), and if the server answers with content
+  (rather than an empty/real 404), feeds that response's byte size straight
+  into gobuster's own --exclude-length. Verified end-to-end against two
+  throwaway local HTTP servers: one always answering 200 with a fixed body
+  (correctly triggers --exclude-length) and one answering a real empty 404
+  (correctly stays off).
+MIGRATION (core/commands.py migrate_command_template(), new rule 12): self-
+  heals any previously-saved custom ffuf/dirsearch/gobuster command that
+  predates this fix and still lacks the relevant flag — adds -ac to ffuf,
+  --filter-threshold 10 to dirsearch, and prepends the calibration probe to
+  gobuster (only for commands still recognisably shaped like one of this
+  app's own past defaults, so a genuinely hand-written custom command is
+  left untouched rather than risk mangling it). Verified against the user's
+  actual currently-saved commands from earlier in this session.
+VALIDATION: py_compile on every changed file; the gobuster probe snippet's
+  exact final bash (with {TARGET}/{SAFE_TARGET} substituted) syntax-checked
+  with `bash -n`; the migration rules functionally tested against real
+  saved-command strings; full offscreen PyQt6 instantiation test of the
+  whole updated app passed with no errors.
+
+## 2026-09-15 (b) — Install/Repair Tools: fixed real-world failures from first run
+Follow-up to the same day's batch below, after the user actually ran
+"Install / Repair Missing Tools" on their real Kali box and hit 3 real
+failures out of 10 (droopescan, uro, kxss) that the dev sandbox couldn't
+have caught (no real pipx/go environment there). Both root-caused and fixed
+in modules/install_tools.sh:
+PIPX "--force" CRASHES ON A TRULY-BROKEN VENV (droopescan + uro both failed
+  identically: `FileNotFoundError: [Errno 2] No such file or directory:
+  '.../pipx/venvs/<tool>/bin/python'`, raised from pip's own subprocess.py
+  during posix_spawn). This is a known long-standing pipx bug (pypa/pipx
+  #146, #294): `pipx install --force` tries to reinstall IN PLACE and, as
+  part of that, spawns the OLD venv's own python — which is exactly the
+  interpreter that no longer exists after a system Python upgrade, so pipx
+  itself crashes with an uncaught traceback instead of just rebuilding the
+  venv. Rewrote pipx_install() to: (1) try `pipx repair <tool>` first — this
+  is pipx's own purpose-built subcommand for exactly this scenario (rebuilds
+  the venv from recorded metadata without needing the old interpreter to
+  still exist), confirmed via pipx's official troubleshooting docs; (2) if
+  that's unavailable (older pipx without `repair`) or doesn't fully fix it,
+  manually `rm -rf` the broken venv directory and shim first, THEN run a
+  plain `pipx install` (no --force) — a plain install of a target that no
+  longer exists on disk can't hit the same in-place-reinstall codepath.
+  Verified with a mocked `pipx` binary exercising both branches (repair
+  succeeds; repair unsupported -> manual cleanup -> plain install succeeds).
+  This also fixes every OTHER tool that goes through pipx_install() (arjun,
+  graphql-cop, ghauri, graphw00f's pipx path), not just droopescan/uro.
+KXSS WRONG GITHUB USERNAME: _i_kxss was pointed at
+  `github.com/Emenalf/kxss` — that repo doesn't exist (a typo'd/incorrect
+  username from the original research), which is why `go install` failed
+  with a confusing "could not read Username for 'https://github.com':
+  terminal prompts disabled" error (go's module resolution treats some
+  GitHub 404s as "maybe private" and tries to prompt for credentials, which
+  fails outright in a non-interactive shell). Corrected to the real repo,
+  `github.com/Emoe/kxss` (verified via web search + fetching the repo's own
+  README, which shows `go install github.com/Emoe/kxss@latest` verbatim).
+
+## 2026-09-15 — API/Scanning fixes, GUI modernization, Install/Repair Tools
+VERSION: constants.py APP_VERSION 4.3.0 -> 4.4.0.
+CONSOLE COPY/PASTE HTML LEAK (widgets/console.py): copying selected text out
+  of the console and pasting into Notepad/etc. was leaking Qt's internal rich-
+  text HTML serialization (raw `<span style=" color:#22c55e;">...</span><br />`
+  tags) alongside the visible text. Root cause: QTextEdit's default copy()
+  places BOTH a text/plain AND a text/html flavor on the clipboard, and some
+  paste targets prefer/mangle the html flavor. Fixed by overriding
+  createMimeDataFromSelection() to only ever put plain text (with
+  QTextCursor's U+2029 paragraph separators normalised to real '\n') on the
+  clipboard — the console's own colourization code was never the bug.
+FFUF (Web tab + API tab) writing raw JSON as its own output file: ffuf's
+  `-of json` dump includes full per-result metadata (duration, resultfile,
+  scraper, position, ...) which is useless to open directly. New
+  modules/ffuf_clean.py post-processes that raw JSON into clean
+  "[STATUS] URL  (len=…, words=…)" lines, one per finding, sorted by status
+  then URL. Wired into modules/fuzzing.py (`_build_fuzzing_command` web_ffuf
+  case) and ui/tabs_api.py (`api_ffuf`, both the create_editable_button
+  default and the show_api_fuzz_menu fallback): ffuf now writes the raw dump
+  to a "_raw.json" file, immediately piped through ffuf_clean.py into the
+  user-facing "_ffuf.txt" / "_api_fuzz.txt" file, which is also what streams
+  to the console. core/commands.py migrate_command_template() gained a rule
+  to self-heal any previously-saved custom ffuf/api-fuzz command templates
+  that still point at the old raw-JSON output path.
+GOBUSTER `--wildcard` flag doesn't exist ("Incorrect Usage: flag provided but
+  not defined: -wildcard", confirmed from the user's own pasted error) — that
+  flag was a mistaken carry-over from a different tool. Removed from
+  modules/fuzzing.py's web_gobuster command builder and the ui/tabs_web.py
+  fallback template; migrate_command_template() gained a rule to strip it
+  from any saved custom gobuster command too. -b (status blacklist, already
+  present) is gobuster's actual mechanism for this.
+SMARTFUZZ progress-line spam (smartfuzz.py `_run_ffuf`): added ffuf's `-s`
+  (silent) flag so ffuf stops emitting its own progress bar in the first
+  place (every other fuzzing tool's command already used -s); hardened the
+  Python-side per-line filter with an ANSI-escape-stripping regex (some ffuf
+  builds colourize output even when piped, defeating a plain string check)
+  plus a more permissive "::…Progress:…Errors: N::" match, as defense in
+  depth.
+DROOPESCAN "bad interpreter" crash (pipx venv pointing at a since-removed
+  Python interpreter after a system Python upgrade — `command -v droopescan`
+  still finds the shim FILE even though every invocation fails): the
+  ui/tabs_web.py web_droopescan command now actually RUNS droopescan (via a
+  tee'd temp log) instead of just checking it exists, and greps that log for
+  the shell's exec-failure signature to print a clear, actionable diagnostic
+  ("its pipx virtual environment points at a Python interpreter that no
+  longer exists... Fix it from Target Setup -> Install/Repair Missing
+  Tools") instead of a raw bash traceback. NOTE: the exact wording bash uses
+  for "file exists but can't execute" is NOT consistent across systems/bash
+  builds — observed as both "bad interpreter: No such file or directory"
+  (classic glibc bash, matches the user's real error) and "cannot execute:
+  required file not found" (confirmed via a deliberately-broken test shim in
+  this dev sandbox's bash 5.2.21) — so the grep matches BOTH phrasings, not
+  just one. The same broadened matching was applied to install_tools.sh's
+  check_tool() (see below), which additionally runs tools through `timeout`
+  and so also matches timeout's own "failed to run command" wording for the
+  same underlying failure.
+NEW: "Environment / Tool Setup" feature (fixes the whole family of
+  "command not found" / "bad interpreter" errors the XSS Pipeline, Dalfox,
+  and other multi-tool commands hit on a machine that's missing some of the
+  ~30 external CLI tools this app shells out to — gau, gf, Gxss, kxss, uro,
+  dalfox, etc.):
+  - NEW modules/install_tools.sh: standalone bash script, `--check-only`
+    (read-only scan, safe anytime) or full install/repair mode. Per-tool
+    check_tool() verifies not just presence (`command -v`) but that the tool
+    actually RUNS (catches pipx-venv rot that a bare existence check misses).
+    Installer strategy per tool: apt package where one exists, else
+    `pipx install --force <tool>` (also self-heals rotted pipx venvs), else
+    `go install <module>@latest` with the resulting $GOPATH/bin binary
+    copied into ~/.local/bin (confirmed already on PATH, unlike ~/go/bin
+    which a non-interactive `bash -c` shell won't have sourced from
+    .bashrc). Special-cased: testssl.sh apt package -> `testssl` symlink
+    (this app's commands call the bare name); httpx installed under Kali's
+    `httpx-toolkit` name to avoid clashing with the unrelated Python httpx
+    package; graphw00f has no packaging metadata pipx can use reliably, so
+    it falls back to a manual git clone + a small `~/.local/bin/graphw00f`
+    wrapper script; gf additionally gets its pattern files (xss.json,
+    sqli.json, ...) fetched from 1ndianl33t/Gf-Patterns into ~/.gf/, since gf
+    runs "successfully" but silently matches nothing without them.
+  - NEW core/commands.py run_raw_command(): runs a command through the same
+    console/status-bar/runner pipeline as every other command, but WITHOUT
+    run_command_template()'s hard gate requiring a target to already be set
+    — installing/checking tools has nothing to do with the current target.
+  - NEW modules/tool_setup.py (ToolSetupMixin): run_check_tools() /
+    run_install_tools(), wired to two new buttons. Registered in
+    ui/window.py's CommandBridgeV4 mixin list.
+  - ui/tabs_target.py: new "🧰 Environment / Tool Setup" card with "Check
+    Installed Tools" and "Install / Repair Missing Tools" buttons.
+TARGET SETUP TAB REORDER + CHECKBOX REMOVAL (ui/tabs_target.py,
+  core/preferences.py, ui/window.py):
+  - Removed the "Add X-Bug-Bounty: HackerOne-Envy93" and second custom-header
+    checkbox widgets entirely (dead/confusing UI clutter per request) —
+    removed the widgets themselves, the `if self.chk_*.isChecked()` blocks in
+    window.py's get_headers_string(), and preferences.py's
+    save_checkbox_preference()/load_checkbox_preference() methods.
+  - Card order is now Primary Target -> Output Directory -> Custom Headers
+    (Output Directory moved up to sit directly beneath Primary Target, per
+    request; was previously below Custom Headers).
+GUI MODERNIZATION (ui/theme.py, ui/cards.py, constants.py): refreshed the QSS
+  — larger corner radii (buttons 5->8px, cards 10->14px), more generous
+  padding/spacing throughout (card content margins 18/22/18/18 -> 20/26/20/22,
+  spacing 12->16; button padding/min-height increased across primary/
+  secondary/warning buttons; input fields, textareas and combo boxes all
+  gained more breathing room), secondary buttons switched from a transparent
+  fill to a solid subtle background so the button grid reads less "flat/
+  cluttered", and a QToolTip style block was added (tooltips previously used
+  the OS default, clashing with the dark theme). NEW default theme "Aurora
+  Slate" (calm dark-slate/indigo palette) added as the first THEMES entry and
+  as preferences.py's fallback default for new configs; all 14 pre-existing
+  themes are unchanged and still selectable. This was a structural QSS
+  refresh rather than a full per-tab layout rewrite — a reasonable scope
+  tradeoff for "modernise the look" without restructuring every tab's widget
+  layout.
+VALIDATION: py_compile on every changed/new file; bash -n on install_tools.sh;
+  live-executed install_tools.sh --check-only end-to-end (clean run, correct
+  summary counts); live-tested ffuf_clean.py against a hand-built JSON
+  matching the user's exact pasted example (correct output); a standalone
+  bash unit test against a deliberately-broken test shim (bad shebang) caught
+  a real gap in the initial "bad interpreter"-only grep — fixed by broadening
+  the match (see DROOPESCAN entry above) and re-verified; full offscreen
+  PyQt6 instantiation test (QT_QPA_PLATFORM=offscreen) of the complete
+  updated app confirmed: Aurora Slate theme applies without error, the
+  reordered Target Setup tab (incl. new Tool Setup card) builds correctly,
+  ToolSetupMixin methods are present and wired, checkbox attributes are
+  confirmed fully gone, window shows and processes events with no crashes.
+
+## 2026-08-18 — Batch of 12 fixes: Recon reorder, Web/API tab fixes, window
+## resize, new Response Analysis tab
+VERSION: constants.py APP_VERSION 4.2.0 -> 4.3.0.
+RECON TAB: ui/tabs_recon.py — moved the "🔥 Advanced Nmap & Vulnerability
+  Scanning" card (Nmap Vuln Scripts/HTTP Scripts/SMB Scripts, Masscan Fast
+  Scan, Nmap+NSE CVE Check, Nmap Aggressive Scan) to sit directly after Auto
+  Scan and before "⚡ Nuclei Scanning" (previously it sat after everything,
+  including DNS, at the bottom of the tab).
+CARD TITLE "&" BUG (root cause of "Fuzzing _Directory Enumeration"):
+  - ui/cards.py create_card(): QGroupBox interprets a lone "&" in its title as
+    a keyboard-mnemonic marker — it consumes the "&" and underlines the next
+    character, which is what actually produced "Fuzzing _Directory
+    Enumeration" (the source string was already correct: "Fuzzing &
+    Directory Enumeration"). Fixed centrally for every card by escaping to
+    "&&" in create_card(), rather than patching the one string the user
+    noticed — this was affecting every "&"-titled card app-wide.
+  - Right-click wordlist quick-select + Auth/Unauth system on Gobuster/ffuf/
+    Feroxbuster/Dirsearch (modules/fuzzing.py) was checked and found already
+    correctly implemented, tool-specific flags included — no changes needed
+    there.
+WEB TAB — Parameter Finder tooltips: ui/tabs_web.py param_dev_btn/
+  param_live_btn now have detailed tooltips clarifying these buttons do
+  historical/live URL PARAMETER-NAME discovery (waybackurls/gau/katana), NOT
+  adaptive wordlist-switching based on detected server headers — that
+  adaptive behaviour is SmartFuzz's job, not this one (the requester's
+  original description of "expected" behaviour matched SmartFuzz).
+WEB TAB — OAuth section removed: ui/tabs_web.py — deleted the entire
+  "🔑 Authentication & Session Testing" card. Its only button ran
+  `oauth-scan {TARGET} -o {SAFE_TARGET}_oauth.txt`; oauth-scan is not a real
+  Kali tool/script, so the button always failed. No replacement — flagged as
+  dead functionality and removed outright per request.
+API TAB (ui/tabs_api.py, extensively rewritten):
+  - Introspection Query: was calling a nonexistent `graphql-introspection`
+    binary. Replaced with a curl POST of the canonical 7-level introspection
+    query (matches graphql-js getIntrospectionQuery()) to {TARGET}/graphql,
+    writing + validating {SAFE_TARGET}_graphql_intro.json (checks it's valid
+    JSON AND contains "__schema").
+  - "Batch Query Attack" renamed "GraphQL Cop" and its command fixed to match
+    the real CLI (`graphql-cop -t '{TARGET}/graphql' -o json`, output format
+    flag not a filename) — verified against the tool's actual --help output
+    the requester pasted. Tooltip documents -H/-f/-e flags via right-click.
+  - graphw00f: was mislabeled "Field Fuzzing" and always failed (real CLI
+    requires -d and/or -f mode flags, which the old command omitted
+    entirely). NEW FILE modules/graphql_tools.py (GraphqlToolsMixin):
+    _build_graphw00f_command() rebuilds fresh each run (like SmartFuzz) from
+    stored overrides — mode (-d / -f / -d -f), header (-H, auth), wordlist
+    (-w), proxy (-p), timeout (-T); run_graphw00f(); show_graphw00f_menu()
+    right-click QMenu covering every real graphw00f flag incl. -l (list
+    technologies) and manual command override; detailed disambiguating
+    tooltip (fingerprinting tool, not a fuzzer). Registered in window.py.
+  - API Fuzzing: default wordlist api-wordlist.txt didn't exist on disk —
+    now defaults to the seclists path
+    /usr/share/wordlists/seclists/Discovery/Web-Content/api/api-endpoints.txt.
+    New show_api_fuzz_menu() right-click: "📄 Manually Configure API
+    Wordlist" (file picker, rewrites the -w flag in place) + manual command
+    edit.
+  - Rate limiting: old command `wfuzz -z range,1-1000 {TARGET}/api -o ...`
+    was broken (no FUZZ keyword for the range payload to land on) and
+    produced no structured result. NEW FILE modules/rate_limit_check.py —
+    standalone stdlib script, capped/modest by design (default 150 requests
+    / 10 concurrent, hard caps 2000/50) via ThreadPoolExecutor; detects
+    throttling via HTTP 429 count + Retry-After header; prints an ASCII PoC
+    table (requests sent, concurrency, elapsed, req/s, 2xx/429/other-4xx-5xx
+    counts, connection errors, Retry-After seen, first-429-at-request#) plus
+    a VERDICT line, optional --json-out report. button_id api_wfuzz ->
+    api_ratelimit. Verified live against a local ThreadingHTTPServer that
+    starts 429'ing + Retry-After after 30 requests.
+  - Swagger/OpenAPI: renamed "Detect Swagger/OpenAPI Documentation"; command
+    now loops 8 common spec paths (/swagger.json, /openapi.json,
+    /v2/api-docs, /v3/api-docs, /api-docs, /swagger/v1/swagger.json,
+    /swagger/index.html, root), validates each as real JSON containing a
+    "swagger"/"openapi" key before reporting FOUND.
+WINDOW RESIZE FIX (frameless window couldn't be resized, only moved):
+  - Root cause: with Qt.WindowType.FramelessWindowHint and full-bleed child
+    widgets (header bar, nav rail, tab content, status bar), a mouse press/
+    move at the window edge lands on a CHILD widget first — Qt delivers the
+    event to that child before QMainWindow's own mousePressEvent/
+    mouseMoveEvent, which is why only dragging (via the header bar's own
+    handlers) ever worked and edge-resize never fired.
+  - Fix: ui/window.py init_ui() now ALSO installs the event filter on
+    QApplication.instance() (`app.installEventFilter(self)`, in addition to
+    the existing `self.installEventFilter(self)`), so
+    WindowControlsMixin.eventFilter() sees every mouse event app-wide before
+    the child widget consumes it.
+  - ui/window_controls.py: eventFilter() rewritten to detect resize edges by
+    translating the event's widget-local position to window coordinates
+    (`obj.mapTo(self, pos)`), start/continue/end a resize drag independent of
+    which child widget is under the cursor, and update the cursor shape on
+    hover near an edge. Genuinely-interactive controls (buttons, sliders,
+    combo boxes, line edits, spin boxes — via new _is_resize_excluded())
+    are excluded from resize-edge hijacking so clicks on window-control
+    buttons / nav-rail buttons / inputs near an edge still work normally.
+    Resize math factored into _apply_resize()/_update_cursor_for_edge()
+    helpers shared with the pre-existing mousePressEvent/mouseMoveEvent/
+    mouseReleaseEvent/leaveEvent methods.
+  - NOT functionally tested by dragging a real window (offscreen/headless
+    session) — validated via code review + the same resize-math/edge-
+    detection logic already used successfully elsewhere in the class.
+REQUEST ANALYSIS — 6 new detectors added to modules/request_analysis.py
+  RequestAnalyzer (now ~35 total): _d_verb_tunneling (X-HTTP-Method-Override
+  / _method param), _d_insecure_deserialization (Java/PHP/Python
+  serialisation signatures — Critical), _d_graphql_batching (JSON-array
+  batched GraphQL body — brute-force/rate-limit-bypass risk),
+  _d_debug_endpoint (path matches /actuator, /debug, /graphiql, /swagger,
+  etc.), _d_sensitive_query_data (apikey/secret/password params or
+  email/card-like values in the query string), _d_uuid_idor (UUID-shaped
+  path identifiers, distinct from the existing numeric-ID IDOR check).
+NEW: RESPONSE ANALYSIS TAB (nav index 8) — companion to Request Analysis:
+  - NEW FILE modules/response_analysis.py:
+      * ResponseModel (parse a raw HTTP response, multi-Set-Cookie aware),
+        parse_raw_response().
+      * ResponseAnalyzer — 18 detectors: missing/weak HSTS, missing CSP,
+        clickjacking (missing X-Frame-Options AND no CSP frame-ancestors,
+        with an iframe PoC), missing X-Content-Type-Options, missing
+        Referrer-Policy, missing Permissions-Policy, legacy X-XSS-Protection
+        present, CORS wildcard origin (Critical if combined with
+        Allow-Credentials: true, with a fetch() PoC), CORS allow-list
+        present (flags to verify it isn't origin-reflection), server/
+        framework version disclosure, insecure Set-Cookie flags (missing
+        Secure/HttpOnly/SameSite, per-cookie), verbose error/stack-trace
+        disclosure (Python/Java/.NET/PHP/MSSQL/Oracle/Django/Spring
+        signatures), directory listing, sensitive data in body (AWS keys,
+        PEM private keys, JWTs, bulk emails), missing Cache-Control on
+        cookie/token-bearing responses, risky HTTP methods advertised via
+        Allow, mixed content (http:// refs in HTML), sensitive HTML
+        comments, verbose JSON error bodies. Each finding carries risk,
+        evidence, suggested test, remediation and (where useful) a PoC.
+      * ResponseAnalysisMixin: analyse_response() / clear_response() /
+        copy_original_response() / copy_response_finding_detail() /
+        save_response_analysis() (writes response_analysis_summary.txt +
+        response_analysis_findings.json). PASSIVE — never sends anything.
+      * SESSION-LEVEL DEDUP ("clear identified findings" feature): findings
+        are fingerprinted by title. analyse_response() suppresses any
+        fingerprint already surfaced earlier this session (so pasting many
+        responses from the same target doesn't keep re-flagging the same
+        site-wide issue) and shows a "(N of M already identified, use Clear
+        Identified Findings)" note in the summary instead. New
+        clear_identified_findings() resets the session's seen-fingerprint
+        set. Saved reports (save_response_analysis) always include EVERY
+        finding from the current response regardless of this suppression,
+        so nothing is lost from a pentest report.
+  - NEW FILE ui/tabs_response_analysis.py (ResponseAnalysisTabMixin): same
+    2-pane layout pattern as Request Analysis (paste box left; Response
+    Summary / Detected Issues list / Finding Detail / PoC-Example panel
+    right) plus a "🧹 Clear Identified Findings (this session)" button.
+  - EDITED: ui/navigation.py — nav rail item ("📥","Response",8,
+    "Response Analysis"), addTab(create_response_analysis_tab(),...),
+    _NAV_FULL_NAMES[8], switch_category maps. Tab indices 0-7 unchanged.
+  - EDITED: ui/window.py — registered ResponseAnalysisTabMixin +
+    ResponseAnalysisMixin.
+Validated (this batch): py_compile on every edited/new file; full offscreen
+PyQt6 instantiation of CommandBridgeV4 (QT_QPA_PLATFORM=offscreen, fresh
+HOME) — 9 tabs build, tab 8 = "Response Analysis", resp_*/ra_* widgets all
+present, 9 nav rail buttons; unit tests of every new RequestAnalyzer/
+ResponseAnalyzer detector against hand-built request/response fixtures
+(verb tunneling, insecure deserialization, GraphQL batching, debug
+endpoint, sensitive query data, UUID IDOR / HSTS, CSP, clickjacking, CORS
+wildcard+credentials -> Critical, insecure cookies, verbose error, sensitive
+data exposure, cache-control, risky methods, directory listing, mixed
+content, HTML comment leak); live end-to-end drive of analyse_response()
+through the real widgets confirming a repeated identical response suppresses
+all findings on the 2nd pass and clear_identified_findings() restores them
+on the 3rd; graphw00f command builder unit-tested with/without overrides;
+rate_limit_check.py live-tested against a local HTTP server that starts
+429'ing after 30 requests. Window resize fix NOT tested by physically
+dragging (headless environment) — code-reviewed only.
+
+## 2026-08-18 — Bulk web-facing host check, SSL/TLS Analysis fix, bugfix
+VERSION: constants.py APP_VERSION 4.1.0 -> 4.2.0.
+EXTERNALS:
+  - modules/externals.py: NEW class _WebFacingCheckWorker(QObject) — fast
+    concurrent TCP-connect probe (ThreadPoolExecutor, WEB_PORTS=(443,80,8443,
+    8080), 2.5s timeout, up to 64 workers) against every host pasted into the
+    IP list box. NOT a full port scan — built so hundreds of IPs can be
+    checked quickly for "does this host have a reachable web service".
+    NEW ExternalsMixin methods: run_externals_web_facing_check() /
+    _on_webcheck_progress() / _on_webcheck_done() — writes
+    bulk_web_facing_hosts.txt (host -> open ports) and
+    bulk_web_facing_hosts_comma_separated.txt to the output dir; prints a
+    red/green console summary.
+  - ui/tabs_externals_ui.py: new "🌐 Check Web-Facing Hosts (Bulk)" button
+    under the core IP-list button grid, wired to run_externals_web_facing_check.
+SSL/TLS ANALYSIS BUG FIX:
+  - core/commands.py migrate_command_template(): rule 7a used to only patch
+    the old `sslyze {TARGET_HOST} --regular` flag (removed in sslyze 5+) back
+    into another *raw* sslyze CLI invocation — which just dumps data with no
+    vulnerability flagging at all (no BEAST/Lucky13/deprecated-TLS/cert-expiry
+    findings), even though ssl_cipher_check.py already existed and does flag
+    all of that with CRITICAL/HIGH/MEDIUM/LOW severities and is the button's
+    actual default in network_scan.py. Any raw `sslyze {TARGET_HOST} ...`
+    template (any flags) now migrates to
+    `python3 {CB_DIR}/command_bridge/modules/ssl_cipher_check.py {TARGET_HOST}
+    2>&1 | tee {SAFE_TARGET}_ssl_ciphers.txt` — un-shadowing the real script
+    for anyone with an old saved command override. Runs automatically next
+    launch (load_custom_commands() migrates every saved template).
+  - widgets/console.py: _apply_feroxbuster_colors() now colours
+    ssl_cipher_check.py's `[CRITICAL]`/`[HIGH]` (red), `[MEDIUM]` (orange),
+    `[LOW]` (yellow) and `[OK]` (green) tags, matching the [DANGEROUS]/
+    [WARNING] convention used elsewhere.
+BUGFIX (unrelated, found during validation):
+  - core/preferences.py: was missing `DEFAULT_OUTPUT_DIR` in its import from
+    command_bridge.constants, so load_output_dir_preference() raised
+    NameError on first launch with no saved preferences file (fresh install /
+    fresh config dir). Added to the import.
+VERIFIED ALREADY WORKING (no code change — re-test on Kali if still broken):
+  - "Save CSV IPs" (save_externals_ips_csv) already writes
+    ips_comma_separated.txt with hosts joined by ", ".
+  - Bulk HTTP Response Analysis already auto-prepends https:// to bare
+    IPs/hosts via _normalise_externals_url_lines().
+Validated: py_compile all edited files; full offscreen PyQt6 instantiation of
+CommandBridgeV4 (QT_QPA_PLATFORM=offscreen) with a fresh HOME — imports,
+builds the whole UI including the new button, no crash; unit-tested
+migrate_command_template() against the exact broken command from the bug
+report, _normalise_externals_url_lines/_normalise_externals_host_lines, the
+new _WebFacingCheckWorker._check_host() against a real local listening
+socket, and the new console severity colour rules. NOT run against real
+external hosts on Kali.
+
+## 2026-06-11 — Batch: version 4.1.0, ICMP check, tab rename, upload lab, cleanup
+VERSION: constants.py APP_VERSION 4.0.0 -> 4.1.0 (bump after each completed batch).
+EXTERNALS:
+  - tabs_externals_ui.py: "Service Verification Playbooks" -> "Individual External
+    Checks" (card max-width 600, right column narrowed). New button "ICMP Timestamp
+    Disclosure" -> externals.py run_externals_icmp_timestamp(): loops
+    `sudo -n hping3 <ip> --icmp --icmp-ts -c 1 -V` over live_hosts.txt (fallback
+    up.txt/ips.txt), prints one sample reply then a CSV "Affected Hosts" line +
+    icmp_timestamp_affected.txt. Needs hping3 + passwordless sudo.
+NAV: "Methods"/"Methodology" tab renamed to "Injections" (navigation.py nav_items
+  icon 💉 label "Inject", _NAV_FULL_NAMES[4], switch_category, addTab title). Tab
+  index 4 unchanged; internal content (XSS/SQLi methodology) left as-is.
+API: Swagger/OpenAPI button no longer uses the missing `swagger-parser` CLI — now
+  curl-fetches the spec and json.tool-validates it (clear message if the URL isn't
+  a real spec). commands.py migrate_command_template rewrites old saved commands.
+JS ANALYSIS: js_analysis.py CATEGORY_GUIDANCE (per-category how-to-test/PoC). Console
+  output now GROUPS findings by category with a "How to test / PoC:" line; same
+  guidance added to js_analysis_results.txt.
+WEB TAB CLEANUP (removed sections): HTTP Request Smuggling, Clickjacking & Cache
+  Poisoning, IDOR & Business Logic Testing (Autorize / IDOR brute / Mass Assignment
+  / Nuclei IDOR) — all deleted. Replaced with NEW "File Upload Testing" card.
+NEW FILE: modules/file_upload_lab.py (FileUploadLabMixin) — buttons generate test
+  artifacts into <output>/upload_tests/ + print PoC: EICAR, PHP shell (+variants),
+  image/PHP polyglot, ASP/ASPX/JSP shells, SVG/HTML stored-XSS, cookie stealer
+  (asks for the tester's OAST/Collaborator URL), .htaccess/web.config bypass,
+  bad-filename cheatsheet. Nothing is uploaded; manual use only. Registered in
+  window.py.
+
+## 2026-06-11 — New "Request Analysis" tab (nav index 7)
+NEW FILES:
+  - modules/request_analysis.py — Qt-free engine + GUI mixin:
+      * RequestModel (parse/mutate/serialize a raw HTTP request),
+        parse_raw_request(), decode_jwt() (no-verify).
+      * RequestAnalyzer: ~29 detectors covering the 32 spec categories (IDOR,
+        mass assignment, BFLA, session-in-URL, cookie flags, auth header, JWT,
+        param tampering, open redirect, SSRF, SQLi, NoSQLi, XSS, file upload,
+        traversal, GraphQL, XXE, CORS, CSRF, host-header, method tampering,
+        header-ACL bypass, rate limit, user enum, excessive data, API version,
+        content-type confusion, cache, smuggling). Each finding carries risk +
+        evidence + suggested test + a generated MODIFIED REQUEST (Burp-ready).
+      * RequestAnalysisMixin: analyse_request / _on_ra_vector_selected /
+        copy_original/modified / clear / save_request_analysis (writes
+        request_analysis_summary.txt, request_analysis_findings.json,
+        modified_request.txt). PASSIVE — never sends requests.
+  - ui/tabs_request_analysis.py (RequestAnalysisTabMixin): Repeater-style 2-pane
+    UI. Left = paste box + Analyse/Clear/Copy Original. Right = Request Summary,
+    Detected Attack Vectors list (pick one → generates modified request),
+    Modified Request box + Copy Modified/Save.
+EDITED:
+  - ui/navigation.py: nav rail item ("📋","Request",7,...), addTab(...) for the
+    new tab, _NAV_FULL_NAMES[7], switch_category maps. NOTE tab indices now:
+    Console=5, Externals=6, Request Analysis=7 (Console=5 unchanged, so the many
+    setCurrentIndex(5) calls still target Console).
+  - ui/window.py: registered RequestAnalysisTabMixin + RequestAnalysisMixin.
+Validated: py_compile, stubbed-PyQt6 full import, engine unit tests vs every spec
+example (IDOR id-increment, mass-assign fields, open-redirect/NoSQL payloads,
+JWT decode) + false-positive fixes. NOT run live.
+
+## 2026-06-11 — Web tab: Nuclei, All-Scans, JS analysis, fuzzing fixes
+NEW FILES:
+  - modules/network_scan.py (NetworkScanMixin): single source for the Network
+    Scanning tool list (now incl. "Nuclei Scan" = net_nuclei), plus
+    run_all_network_scans() which chains every net scan sequentially by reusing
+    the Auto Scan engine (_auto_scan_*). _substitute_web_placeholders() does
+    {TARGET}/{TARGET_HOST}/{SAFE_TARGET}/{CB_DIR} replacement without running.
+  - modules/js_analysis.py (JsAnalysisMixin + _JsAnalysisWorker, QThread):
+    "JS Recon & Analysis" button. Phase 1 spiders same-domain (MAX_PAGES=60,
+    depth 2) -> identified_js.txt. Phase 2 downloads each JS and runs 25 static
+    checks (secrets/creds/endpoints/source maps/DOM-XSS/cloud/GraphQL/WS/JWT/…)
+    -> js_analysis_results.txt + colour-coded console + summary block.
+EDITED:
+  - ui/window.py: registered NetworkScanMixin + JsAnalysisMixin.
+  - ui/tabs_web.py: Network Scanning now uses self._network_scan_tools() with a
+    centered "All Network Scans" button (row0, span2). Web Scraping gained
+    "JS Recon & Analysis" (3,1) and "Wildcard SSL Cert" (4,0). SmartFuzz button
+    stored as self.smartfuzz_btn + right-click -> show_smartfuzz_menu.
+  - modules/web_testing.py: check_wildcard_cert() — single-target wildcard TLS
+    check; red [✖] if wildcard, green [✔] if not.
+  - modules/fuzzing.py: GOBUSTER FIX — _build_fuzzing_command gobuster now uses
+    "--wildcard --expanded -q" (fixes the "status code matches non-existing
+    urls" abort + prints copy-pasteable full URLs). DIRSEARCH gets "--full-url".
+    Added show_smartfuzz_menu() + per-tech wordlist overrides in
+    _build_smartfuzz_command (registry keys smartfuzz_wl_<tech>).
+  - core/status.py: _summarize_ffuf_if_applicable now prints hits as coloured
+    HTML (200 green full URL, 3xx yellow, 4xx orange) like Feroxbuster.
+  - widgets/console.py: new url_status_pattern colours "http(s)://… (Status:NNN)"
+    lines (gobuster --expanded / dirsearch --full-url) — 200 green.
+  - smartfuzz.py: new repeatable --wl TECH=PATH arg overrides
+    SIGNATURES[tech]['wordlist'] (nginx/apache/iis/tomcat/wordpress/drupal/
+    joomla/laravel).
+Validated: py_compile all; stubbed-PyQt6 import of full app; JS analyzer unit
+test across all 25 categories. NOT run live (needs the Kali box).
+
+## 2026-06-11 — Launch hardening (Kali "click does nothing" fix)
+Cause of silent launch failures: the .desktop used Terminal=false (hides any
+startup traceback) + a hardcoded Exec path. Added launch.sh (path-independent
+wrapper: cd's to its dir, checks PyQt6, logs the traceback to launch_error.log,
+keeps the window open on error). Updated Command_Bridge_v3.desktop to
+Exec=bash .../launch.sh, Terminal=true, Path set. NOTE: the absolute path in the
+.desktop still assumes /home/ldawson/Desktop/Test25 — fix the user/path if the
+Kali box differs. Verified the full app import chain with a stubbed PyQt6 (no
+import-time crash); confirmed launch.sh/command_bridge_v3.py are LF, no BOM.
+No new Python deps were added by the recon engine (all stdlib + PyQt6).
+
+## 2026-06-11 — External Pentest Recon Engine (big feature)
+Transformed the Externals tab "Run Externals Test" button into an automated
+external-recon engine (Nessus/Nuclei-style). Findings are now prioritised and
+written to a full report set, ending with a Nessus-style console summary.
+
+NEW FILE:
+  - modules/externals_reporting.py
+      * class _ExternalsWebReconWorker(QObject)  — background QThread worker that
+        does ACTIVE web recon (admin-panel detection, exposed .git/.env/backups,
+        HTTP TRACE, directory listing, robots/sitemap, server-banner disclosure)
+        and optional whatweb/nuclei when those tools are installed.
+      * class ExternalsReportingMixin           — findings engine, grouped
+        summaries, prioritisation, all report-file writers, Nessus summary.
+
+EDITED:
+  - ui/window.py
+      * import ExternalsReportingMixin; added it to CommandBridgeV4 base classes.
+  - modules/externals.py
+      * run_externals_workflow(): cleanup list now also removes the new report
+        files (open_ports_by_service.txt, technology_fingerprints.txt,
+        missing_security_headers.txt, externals_tls_summary.txt, etc.).
+      * _externals_process_nmap_results(): nmap regex now captures the version
+        banner (group 4); accumulates ALL open ports + web-tech fingerprints into
+        self._externals_context ("open_ports", "web_tech", "tech_by_host").
+      * _on_externals_command_finished() nmap branch: after dangerous-port
+        summary, calls _externals_record_dangerous_findings /
+        _externals_write_dangerous_services / _externals_write_open_ports_summary;
+        stores web_assets into context.
+      * _externals_run_security_headers(): now records findings, adds
+        Referrer-Policy / Permissions-Policy, flags deprecated X-XSS-Protection,
+        weak CSP (unsafe-inline/eval/wildcard), and Server-version disclosure.
+      * _externals_start_directory_enumeration(): now picks a tech-tailored
+        wordlist (nginx/IIS/Tomcat/WordPress) before the generic raft/dirb list.
+      * HANDOFF CHANGE: both workflow end-points (end of TLS phase, and the
+        "no TLS hosts" path in _externals_start_tls_phase) now call
+        self._externals_begin_web_recon() instead of finishing. That runs the
+        web-recon worker, then _externals_finalize_assessment() writes reports.
+  - ui/tabs_externals_ui.py
+      * Updated the description label + added a tooltip on the Run button.
+
+NEW REPORT FILES written to the output dir by a full run:
+  dangerous_services.txt, open_ports_by_service.txt, web_facing_hosts.txt,
+  potential_admin_interfaces.txt, additional_external_checks.txt,
+  technology_fingerprints.txt, tls_findings.txt, missing_security_headers.txt,
+  technical_findings.txt, executive_summary.txt,
+  external_assessment_summary.txt, external_findings.json
+  (plus existing: live_hosts.txt, unreachable_hosts.txt, externals_tls_summary.txt,
+   directory_findings.txt, Nmap/*, SSL_Scan/*)
+
+STATUS / NOT YET DONE:
+  - Verified by static compile (py_compile) + stubbed-Qt unit tests of the
+    reporting logic. NOT run live (Windows dev box has no PyQt6; app runs on
+    Linux). Needs one real run on Kali/WSL.
+  - Phase 9 remainder still TODO: ICMP timestamp disclosure, open-proxy check,
+    default-credential probing.
+
+
+================================================================================
+ APP OVERVIEW
+================================================================================
+
+WHAT IT IS
+  "Command Bridge v4" — a PyQt6 desktop GUI that automates a penetration tester's
+  workflow by chaining external tools (nmap, testssl, ffuf, sqlmap, nuclei,
+  whatweb, ike-scan, ssh-audit, gobuster/dirsearch, feroxbuster, etc.) behind
+  buttons, with live colourised console output and auto-generated report files.
+
+PLATFORM (IMPORTANT)
+  - RUNS ON LINUX (Kali / WSL). CommandRunner executes via `/bin/bash -c` and
+    depends on Linux tools + paths like /usr/share/seclists, /usr/share/wordlists.
+  - EDITED ON WINDOWS. PyQt6 is NOT installed on the Windows box, so the GUI
+    CANNOT be launched here. Only `python -m py_compile <file>` works for
+    validation on Windows. To test logic, stub PyQt6.QtCore and import the module.
+
+ENTRY POINT
+  - command_bridge/main.py -> main()  (creates QApplication + CommandBridgeV4).
+  - Run with: python -m command_bridge.main  (from Test25/), or command_bridge_v3.py.
+
+PROJECT ROOT LAYOUT
+  Test25/
+    command_bridge/        <- the app package
+      main.py              <- entry point
+      constants.py         <- APP_TITLE/VERSION, THEMES (15 colour themes), BASE_DIR
+      core/                <- non-UI logic mixins (commands, output, status, prefs)
+      modules/             <- feature mixins (externals, fuzzing, sqlmap, web, ...)
+      ui/                  <- tab creators, theme, navigation, window shell
+      widgets/             <- CommandRunner (QProcess), EnhancedConsole
+    smartfuzz.py, param_finder.sh  <- standalone helper scripts
+    PROJECT_REFERENCE.txt  <- THIS FILE
+
+
+================================================================================
+ ARCHITECTURE (how it fits together)
+================================================================================
+
+MIXIN COMPOSITION
+  ui/window.py -> class CommandBridgeV4(QMainWindow, <all the mixins...>).
+  Every feature is a Mixin class added to this one god-object. So `self` inside
+  any mixin method can see EVERY other mixin's methods/attributes. When adding a
+  feature, write a new Mixin and add it to the CommandBridgeV4 base list (line ~49).
+
+KEY SHARED STATE (set in window.py __init__, ~line 79)
+  self.target                 - primary target string (Target Setup tab)
+  self.output_dir             - where all results/report files are written
+  self.command_registry       - dict of editable command templates {button_id: cmd}
+                                persisted via save_custom_commands()/load_custom_commands()
+  self.runner                 - CommandRunner (QProcess). runner.output_ready ->
+                                on_command_output; runner.finished -> on_command_finished
+  self.console                - EnhancedConsole (the output terminal widget)
+  self.tab_widget             - the QTabWidget; Console tab is index 5
+  Externals state machine:
+    self._externals_active     - bool, True while a workflow is running
+    self._externals_phase      - "discovery"|"nmap"|"directory_enum"|"tls"|
+                                  "web_recon"|"check-discovery"|None
+    self._externals_context    - dict carrying everything for the current run
+                                  (targets, live_hosts, web_assets, open_ports,
+                                   web_tech, tls_issues, findings, admin_interfaces)
+
+COMMAND EXECUTION FLOW (the core loop)
+  1. A button handler builds a shell command string and calls
+     self.runner.run_command(cmd, cwd=self.output_dir)   (widgets/runner.py).
+  2. QProcess runs `/bin/bash -c "<cmd>"` (sqlmap uses `script` for a PTY).
+     stdout+stderr merged -> runner.output_ready signal.
+  3. on_command_output (core/output.py:258) receives text -> may post-process
+     (nmap port highlight, gobuster/sqlmap formatting) -> console.append_ansi().
+  4. On exit, runner.finished -> on_command_finished (core/output.py:400):
+     prints summaries, refreshes file list, and ADVANCES STATE MACHINES:
+       - Auto Scan       (if self._auto_scan_active)
+       - Externals        (if self._externals_active -> _on_externals_command_finished)
+
+CONSOLE COLOURING (widgets/console.py)
+  append_ansi() strips ANSI then _apply_feroxbuster_colors() regex-colours lines:
+    - Lines starting "[DANGEROUS]"  -> RED bold
+    - Lines starting "[WARNING]"    -> ORANGE bold
+    - "NNN/tcp open ..."            -> GREEN (nmap open ports)
+    - ffuf/gobuster/dirsearch hits, sqlmap, "[✖]"/"[✔]" -> coloured
+  append_html() inserts raw HTML (used for custom coloured summaries).
+  => To make console text red/orange, prefix the line with [DANGEROUS]/[WARNING],
+     or build HTML and call console.append_html().
+
+BACKGROUND WORK
+  Long/blocking jobs run in a QThread with a QObject worker that emits
+  progress(str) + finished(dict). Pattern used by: _SslScanWorker,
+  _HttpAnalysisWorker, _NmapAllHostsWorker, and the new _ExternalsWebReconWorker.
+  Keep a ref on self (e.g. self._extrecon_thread) so it isn't garbage-collected.
+
+EDITABLE COMMANDS
+  Many buttons store their command template in self.command_registry under a
+  button_id and expose a right-click editor. See core/commands.py
+  (run_command_template, open_command_edit_dialog) and the Externals editors
+  (externals.py: show_externals_button_editor, _open_externals_workflow_editor).
+
+
+================================================================================
+ FILE-BY-FILE MAP (the dictionary / table of contents)
+ Format:  path :: line — function — what it does
+================================================================================
+
+--- ENTRY / CONFIG ---
+command_bridge/main.py
+    9   main()                                  - build QApplication, show window
+command_bridge/constants.py
+    -   APP_TITLE, APP_VERSION, BASE_DIR, DEFAULT_OUTPUT_DIR, THEMES (15 themes)
+
+--- WINDOW SHELL (ui/) ---
+ui/window.py
+    49  class CommandBridgeV4(...)               - god-object; lists ALL mixins
+    79  __init__                                 - sets shared state, runner, registry
+    131 init_ui                                  - builds header/nav/content/status
+    199 get_headers_string                       - curl -H string from Target tab
+ui/window_controls.py                            - frameless-window drag/resize, close
+    26  toggle_maximize / 33 title_bar_*         - custom titlebar move
+    51  mousePressEvent / 64 mouseMoveEvent      - edge-resize logic
+    189 closeEvent / 210 save_window_geometry / 228 load_window_geometry
+ui/navigation.py                                 - header bar + left nav rail + tabs
+    19  create_header_bar / 105 create_nav_rail / 275 create_content_area
+    221 _nav_rail_activate / 295 switch_category - tab switching
+ui/cards.py                                      - collapsible "card" group boxes
+    26  create_card / 103 create_editable_button - editable-command button factory
+ui/theme.py                                      - QSS theming for all 15 themes
+    28  apply_theme / 650 apply_theme_to_menu / 687 apply_theme_to_dialog
+    826 show_themed_message                      - themed QMessageBox helper
+ui/tabs_target.py      :: 26 create_target_tab        - Target URL, headers, output dir
+ui/tabs_recon.py       :: 26 create_reconnaissance_tab
+ui/tabs_web.py         :: 26 create_web_testing_tab
+ui/tabs_api.py         :: 26 create_api_testing_tab
+ui/tabs_methodology.py :: 26 create_methodology_tab
+ui/tabs_console.py     :: 26 create_console_tab       - the output console + file list
+ui/tabs_externals_ui.py:: 26 create_externals_tab     - EXTERNALS TAB UI (buttons)
+
+--- CORE LOGIC (core/) ---
+core/commands.py
+    26  sanitize_target_for_filename             - safe filenames from URLs
+    97  get_scanner_target / 116 run_command_template  - placeholder substitution+run
+    275 run_command_from_registry / 286 load_custom_commands / 383 save_custom_commands
+    396 open_command_edit_dialog                 - generic right-click command editor
+core/output.py
+    26  browse_output_dir / 69 refresh_file_list / 85 on_file_selected
+    169 pause_current_process / 211 skip_current_task / 238 stop_current_process
+    258 on_command_output                        - live stdout router + formatting
+    400 on_command_finished                      - **central completion handler**;
+                                                   advances Auto Scan + Externals SMs
+core/status.py
+    26  update_status_bar / 101 start_progress_animation / 155 stop_progress_animation
+    162 _summarize_testssl_if_applicable / 200 _summarize_ffuf_if_applicable
+    261 _summarize_sqlmap_if_applicable / 290 _summarize_testssl
+    710 _cleanup_ansi_in_command_outputs         - strips ANSI from output files
+core/preferences.py                              - load/save theme, output dir,
+    (26..171) target, headers, checkboxes to a prefs file
+
+--- WIDGETS ---
+widgets/runner.py
+    10  class CommandRunner(QtCore.QObject)       - QProcess wrapper
+    67  run_command(command, cwd, output_file)    - runs `/bin/bash -c`; testssl gets
+                                                    `yes |`; adds go/bin to PATH; sqlmap
+                                                    uses `script` for a PTY
+    134 stop                                      - kill running process
+widgets/console.py
+    8   class EnhancedConsole(QTextEdit)
+    32  append_ansi / 54 _apply_feroxbuster_colors / 274 append_html  (see COLOURING)
+
+--- FEATURE MODULES (modules/) ---
+modules/auto_scan.py    :: 26 run_auto_scan          - chained multi-step scan
+                           101 _start_next_auto_scan_command (sequential SM;
+                               REUSED by run_all_network_scans)
+                           130 _build_feroxbuster_command
+modules/network_scan.py :: NetworkScanMixin
+                           _network_scan_tools()       - shared net tool list (+nuclei)
+                           run_all_network_scans()      - sequential all-scans runner
+                           _substitute_web_placeholders - {TARGET}/.. without running
+modules/js_analysis.py  :: JsAnalysisMixin + _JsAnalysisWorker (QThread)
+                           run_js_analysis()            - spider + 25-check JS analysis
+                           _JsAnalysisWorker._spider     - Phase 1 -> identified_js.txt
+                           _JsAnalysisWorker._analyse    - Phase 2 static checks
+                           module-level *_RE constants   - the 25 detection patterns
+modules/request_analysis.py :: Qt-free engine + RequestAnalysisMixin (GUI glue)
+                           RequestModel                  - parse/mutate/serialize raw req
+                           parse_raw_request / decode_jwt
+                           RequestAnalyzer.analyze()      - runs the ~29 _d_* detectors
+                           RequestAnalyzer._d_*           - one method per attack vector
+                           RequestAnalysisMixin.*         - analyse/copy/save handlers
+ui/tabs_request_analysis.py :: RequestAnalysisTabMixin.create_request_analysis_tab
+                           - Repeater-style 2-pane UI (ra_input/ra_summary/
+                             ra_vectors/ra_modified)
+modules/fuzzing.py      :: 144 class FuzzingMixin     - dir/param fuzzing (ffuf etc.)
+                           (top-level 29..142) auth helpers (cookie/bearer/header)
+                           243 show_command_editor / 451 fuzzing_workflow
+                           502 run_smartfuzz_with_auth / 639 run_param_finder
+modules/sqlmap.py       :: 50 run_sqlmap_from_http_request - sqlmap from raw request
+                           260 show_sqlmap_http_menu / 374 show_wpscan_menu
+modules/web_testing.py  :: 26 analyze_security_headers - single-target header analysis
+                           559 jwt_decode_prompt / 744 generate_cors_poc
+                           895 search_js_library_issues / 1189 run_insecure_redirect_scan
+modules/ssl_cipher_check.py  - STANDALONE script run by Bulk SSL scan worker
+                           128 scan_full / 187 check_http_security / 219 main
+
+--- EXTERNALS (the big workflow) ---  modules/externals.py
+    23  class ExternalsMixin
+    26  check_self_signed_cert                    - openssl self-signed check (1 host)
+    134 tidy_externals_ips                        - clean pasted IP/CIDR list
+    186 _normalise_externals_host_lines / 222 _normalise_externals_url_lines
+    239 save_externals_ips_csv
+    272 run_externals_check_whats_up              - host discovery only -> up.txt
+    359 run_externals_workflow                    - **ENTRY: "Run Externals Test"**
+                                                    picks IP source, cleans old files,
+                                                    writes ips.txt/up.txt, starts
+                                                    discovery phase
+    543 set_externals_single_host
+    558 run_externals_ike_aggressive              - service verification playbooks
+    585 run_externals_ssh_audit                     (right-column buttons): ike-scan,
+    604 run_externals_smb_validation                ssh-audit, SMB, RDP, FTP-anon,
+    622 run_externals_rdp_encryption                SMTP relay, wildcard/self-signed
+    640 run_externals_ftp_anon                      certs
+    658 run_externals_smtp_relay
+    676 run_externals_wildcard_certs
+    817 _run_externals_command                    - log+run a workflow shell cmd
+    835 _externals_pick_ip_list_for_checks        - up.txt else ips.txt
+    875 _externals_add_finding                    - **FINDINGS DB writer** (severity,
+                                                    title, target, detail, evidence)
+    904 _externals_parse_discovery_results        - live/unreachable -> live_hosts.txt
+    956 _on_externals_command_finished            - **STATE MACHINE** (advances phases)
+    1253 _externals_finish_check_whats_up         - classify up/down for Check What's Up
+    1371 _externals_process_nmap_results          - parse nmap; dangerous ports + http/
+                                                    tls hosts; NOW also open_ports +
+                                                    web_tech fingerprints into context
+    1492 _externals_get_dangerous_ports           - port -> (severity, reason) DB
+    1635 _externals_get_dangerous_service_keywords - service-name -> (sev, reason)
+    1671 _externals_get_port_label                - port -> short label (SSH/RDP/...)
+    1794 _externals_get_admin_indicators          - admin/dashboard keyword list
+    1808 _externals_print_dangerous_ports_summary - per-line console summary
+    1833 _externals_run_security_headers          - header analysis (NOW richer +
+                                                    records findings)
+    1976 _externals_write_web_facing_hosts        - web_facing_hosts.txt
+    2009 _externals_prompt_directory_enumeration  - Yes/No popup
+    2028 _externals_start_directory_enumeration    - ffuf loop (NOW adaptive wordlist)
+    2071 _externals_start_tls_phase               - begin per-host testssl (or skip to
+                                                    web recon if no TLS hosts)
+    2088 _externals_start_next_tls_host           - run testssl for next host
+    2123 _highlight_nmap_discovered_ports         - live "[DANGEROUS] SSH ..." colouring
+    2168 show_externals_button_editor / 2257 _open_externals_workflow_editor  - right-click
+                                                    command editors (discovery/nmap/testssl)
+    2335 run_bulk_ssl_scan / 2417 _on_ssl_scan_done    - Bulk SSL/TLS scan (URL list)
+    2555 run_bulk_http_analysis / 2604 _on_http_analysis_done - Bulk HTTP analysis
+    2716 run_externals_nmap_all_hosts / 2785 _on_nmap_all_done - Exposed Services scan
+    2865 class _HttpAnalysisWorker  (QThread worker)
+    2981 class _NmapAllHostsWorker  (QThread worker)
+    3092 class _SslScanWorker       (QThread worker; runs ssl_cipher_check.py)
+
+--- EXTERNALS RECON ENGINE (new) ---  modules/externals_reporting.py
+  module-level: SEVERITY_ORDER, SEVERITY_COLORS, CRITICAL_EXPOSURE_PORTS,
+                ADMIN_PATHS, EXPOSURE_PATHS, DIR_LISTING_PATHS, MAX_ACTIVE_ASSETS(=100)
+    84  class _ExternalsWebReconWorker(QObject)   - **background active web recon**
+    111 _http / 140 _title / 150 _host_of         - HTTP helpers (stdlib, unverified TLS)
+    158 _probe_asset                              - per-URL: admin paths, .git/.env/
+                                                    backups, TRACE, dir listing,
+                                                    robots/sitemap, server banner
+    263 _run_whatweb / 274 _run_nuclei            - optional external tools (if present)
+    324 run                                       - thread pool over assets -> results
+    387 class ExternalsReportingMixin
+    391 _externals_findings                       - ctx["findings"] accessor
+    395 _externals_finding_severity_for_port      - escalate CRITICAL_EXPOSURE_PORTS
+    401 _externals_record_dangerous_findings      - dangerous nmap -> findings DB
+    414 _externals_write_dangerous_services       - dangerous_services.txt (GROUPED:
+                                                    "SSH (22) -> affected hosts")
+    458 _externals_write_open_ports_summary       - open_ports_by_service.txt (grouped)
+    487 _externals_select_wordlist_snippet        - tech -> candidate wordlists
+    510 _externals_record_tls_findings            - tls_issues -> findings + tls_findings.txt
+    551 _externals_begin_web_recon                - **HANDOFF**: record TLS, start worker
+    595 _on_externals_web_recon_progress          - worker progress -> console
+    598 _on_externals_web_recon_done              - merge findings, write admin/tech/
+                                                    additional files, then finalize
+    646 _externals_write_additional_checks        - additional_external_checks.txt
+    675 _externals_finalize_assessment            - **PHASE 10/11**: counts, write all
+                                                    reports, print Nessus summary, reset
+    722 _externals_aggregate_findings             - group (sev,title,detail)->targets,
+                                                    sort by severity then host count
+    746 _externals_write_technical_findings       - technical_findings.txt
+    767 _externals_write_executive_summary        - executive_summary.txt
+    798 _externals_write_assessment_summary       - external_assessment_summary.txt
+    835 _externals_write_findings_json            - external_findings.json
+    840 _externals_print_final_summary            - "ASSESSMENT COMPLETE" box (HTML)
+    875 _externals_write_text                     - small write-file-to-output helper
+
+
+================================================================================
+ EXTERNALS WORKFLOW — STATE MACHINE (how a full run flows)
+================================================================================
+
+Trigger: Externals tab -> "Run Externals Test" -> run_externals_workflow()
+Driver:  on_command_finished (core/output.py:400) calls
+         _on_externals_command_finished(exit_code) after each QProcess command,
+         which switches on self._externals_phase.
+
+Phases (self._externals_phase):
+  "discovery"     nmap -sn host discovery -> live_hosts.txt / unreachable_hosts.txt
+                  -> sets phase "nmap"
+  "nmap"          fast top-ports scan + full -sV -sC -O scan
+                  -> _externals_process_nmap_results (open_ports, web_tech, dangerous,
+                     http_hosts, tls_hosts)
+                  -> dangerous summary + GROUPED dangerous_services.txt +
+                     open_ports_by_service.txt + findings
+                  -> _externals_run_security_headers (missing_security_headers.txt +
+                     findings)
+                  -> web_facing_hosts.txt (stored in context["web_assets"])
+                  -> if web assets & user says Yes: phase "directory_enum"
+                     else: _externals_start_tls_phase
+  "directory_enum" ffuf over web_facing_hosts.txt (adaptive wordlist) ->
+                     directory_findings.txt -> _externals_start_tls_phase
+  "tls"           per-host `testssl` (sequential QProcess). Aggregates issues into
+                  context["tls_issues"] -> externals_tls_summary.txt. When done:
+                  -> _externals_begin_web_recon()
+  "web_recon"     (QThread, not QProcess) _ExternalsWebReconWorker does active HTTP
+                  recon. record TLS findings + tls_findings.txt first. On finish:
+                  -> _on_externals_web_recon_done -> potential_admin_interfaces.txt,
+                     technology_fingerprints.txt, additional_external_checks.txt
+                  -> _externals_finalize_assessment()
+  finalize        tally severities, write technical_findings.txt /
+                  executive_summary.txt / external_assessment_summary.txt /
+                  external_findings.json, print "ASSESSMENT COMPLETE", reset state.
+
+  "check-discovery" is the separate, standalone "Check What's Up" path (discovery
+                  only -> up.txt; no full run).
+
+FINDINGS / SEVERITY MODEL
+  Add a finding anywhere with: self._externals_add_finding(SEV, title, target,
+  detail, evidence).  SEV in CRITICAL/HIGH/MEDIUM/LOW/INFO.
+  Ports in CRITICAL_EXPOSURE_PORTS (redis, mongo, elastic, docker/k8s api, vault,
+  consul, memcached, couchdb, ...) escalate to CRITICAL automatically.
+
+
+================================================================================
+ CONVENTIONS & GOTCHAS (read before editing)
+================================================================================
+
+- LINUX RUNTIME: commands are `/bin/bash -c` strings. Use Linux paths/tools. Guard
+  optional tools with `if command -v TOOL >/dev/null 2>&1; then ... else echo ...`.
+- CAN'T RUN GUI ON WINDOWS: validate with `python -m py_compile <file>`. For logic,
+  stub PyQt6.QtCore (QObject/QThread/pyqtSignal) and import the module directly.
+- ADD A FEATURE = ADD A MIXIN: create modules/<feature>.py with a *Mixin class,
+  then add it to CommandBridgeV4's base list in ui/window.py (~line 49) and import it.
+- CONSOLE COLOUR: prefix lines with [DANGEROUS] (red) / [WARNING] (orange), or use
+  console.append_html() for custom colours. Plain append_ansi() strips ANSI.
+- DON'T BLOCK THE UI: anything slow (network loops, external scanners) goes in a
+  QThread worker (copy the _SslScanWorker / _ExternalsWebReconWorker pattern) and
+  keep a reference on self so it isn't GC'd.
+- COMMAND TEMPLATES: prefer self.command_registry + a right-click editor for any
+  command a tester might want to tweak. Persist with save_custom_commands().
+- OUTPUT FILES: write into self.output_dir; call self.refresh_file_list() so the
+  file panel updates. The Externals run cleans old report files at the start of
+  run_externals_workflow() — add new report filenames to that cleanup list.
+- TAB INDEX: Console tab is index 5 (self.tab_widget.setCurrentIndex(5)).
+
+
+================================================================================
+ QUICK "WHERE DO I LOOK TO..." INDEX
+================================================================================
+  Change what "Run Externals Test" does .......... externals.py:359 + the state
+                                                    machine externals.py:956 +
+                                                    externals_reporting.py
+  Add/adjust a report file ....................... externals_reporting.py (write_* fns)
+  Change dangerous-port classification ........... externals.py:1492 / :1635 /
+                                                    CRITICAL_EXPOSURE_PORTS in
+                                                    externals_reporting.py
+  Add an active web check (admin/exposure) ....... _ExternalsWebReconWorker._probe_asset
+                                                    (externals_reporting.py:158)
+  Change console colours/formatting .............. widgets/console.py:54
+  Change how commands run (bash/env/PATH) ........ widgets/runner.py:67
+  Central "command finished" hook ................ core/output.py:400
+  Add a new tab .................................. ui/tabs_*.py + navigation.py +
+                                                    window.py base list
+  Theme colours ................................. constants.py THEMES + ui/theme.py
+================================================================================
