@@ -81,7 +81,7 @@ class StatusMixin:
     def update_status_bar(self, status, command=""):
         """Reflect the current run in the console strip and the status bar."""
         full = self.get_display_command(command)
-        tool = self.get_scan_name_from_command(command) if command else None
+        tool = self.get_action_display_name(command) if command else None
 
         detail = {
             "idle": "Idle",
@@ -134,6 +134,46 @@ class StatusMixin:
             return display
         return command[:80] + "..." if len(command) > 80 else command
 
+    #: Scripts that ship with the app. Matched before tool names, because the
+    #: interesting part of "bash .../install_tools.sh --check-only" is what it
+    #: does, not that bash ran it. Order matters — the more specific
+    #: invocation has to be tested first.
+    _SCRIPT_DISPLAY_NAMES = (
+        ("install_tools.sh --check-only", "Tool Status Check"),
+        ("install_tools.sh", "Tool Install / Repair"),
+        ("smartfuzz.py", "SmartFuzz"),
+        ("param_finder.sh", "Parameter Finder"),
+        ("crtsh.py", "Certificate Transparency"),
+        ("ssl_cipher_check.py", "Cipher Suite Check"),
+        ("ffuf_clean.py", "FFUF"),
+    )
+
+    #: Proper names for the tools, so the console reads like software rather
+    #: than like a shell history. Anything missing falls back to the binary
+    #: name, which is still better than nothing.
+    _TOOL_DISPLAY_NAMES = {
+        "nmap": "Nmap", "rustscan": "RustScan", "masscan": "Masscan",
+        "hping3": "hping3", "ike-scan": "IKE Scan", "ssh-audit": "SSH Audit",
+        "nikto": "Nikto", "nuclei": "Nuclei", "whatweb": "WhatWeb",
+        "wafw00f": "WAF Detection", "testssl": "TestSSL", "sslscan": "SSLScan",
+        "sslyze": "SSLyze", "openssl": "OpenSSL",
+        "dirsearch": "Dirsearch", "ffuf": "FFUF", "feroxbuster": "Feroxbuster",
+        "gobuster": "Gobuster", "wfuzz": "Wfuzz",
+        "sqlmap": "SQLMap", "ghauri": "Ghauri", "dalfox": "Dalfox",
+        "corsy": "CORS Scan", "ssrfmap": "SSRFmap", "sstimap": "SSTImap",
+        "tplmap": "Tplmap", "lfimap": "LFImap", "dotdotpwn": "DotDotPwn",
+        "wpscan": "WPScan", "droopescan": "Droopescan",
+        "graphql-cop": "GraphQL Cop", "graphw00f": "GraphQL Fingerprint",
+        "arjun": "Arjun", "paramspider": "ParamSpider",
+        "subfinder": "Subfinder", "amass": "Amass", "subzy": "Subdomain Takeover",
+        "dnsx": "DNSx", "hakrawler": "Hakrawler", "katana": "Katana",
+        "httpx-toolkit": "HTTPX", "httpx": "HTTPX",
+        "gau": "GetAllURLs", "waybackurls": "Wayback URLs",
+        "urldedupe": "URL Dedupe", "uro": "URL Reduce", "gf": "GF Patterns",
+        "Gxss": "Gxss", "kxss": "kXSS", "theHarvester": "theHarvester",
+        "curl": "HTTP Request",
+    }
+
     def get_scan_name_from_command(self, command: str) -> str:
         """Derive a simple scan name from the underlying command string."""
         if not command:
@@ -150,6 +190,35 @@ class StatusMixin:
         if primary in wrappers and len(parts) > 1:
             primary = parts[1]
         return primary.split('/')[-1]
+
+    def get_action_display_name(self, command: str = "") -> str:
+        """What to call the thing that just ran, in the console and status bar.
+
+        Preference order, best first:
+
+        1. the label of the button that started it — "Retrieve & Analyse JS
+           Files" says far more than "wget", and for a piped command like the
+           crt.sh lookup the first binary ("curl") is actively misleading;
+        2. a friendly name for a bundled script, so a tool check reports as
+           "Tool Status Check" rather than "install_tools.sh";
+        3. the proper name of the tool being driven ("SQLMap", not "sqlmap");
+        4. the bare binary name, as a last resort.
+        """
+        label = getattr(self, "current_action_label", None)
+        if label:
+            return label
+
+        text = command or ""
+        for needle, friendly in self._SCRIPT_DISPLAY_NAMES:
+            if needle in text:
+                return friendly
+
+        known = self._find_known_scan_tool(text)
+        if known:
+            return self._TOOL_DISPLAY_NAMES.get(known, known)
+
+        raw = self.get_scan_name_from_command(text)
+        return self._TOOL_DISPLAY_NAMES.get(raw, raw)
 
     def append_scan_completion_message(self, scan_name: str, success: bool = True, exit_code=None):
         """Append a colored completion message for the last scan.

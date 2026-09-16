@@ -546,7 +546,7 @@ class OutputMixin:
             except Exception:
                 pass
  
-        scan_name = self.get_scan_name_from_command(self.current_command)
+        scan_name = self.get_action_display_name(self.current_command)
         # For ffuf we already print a dedicated summary (hits or "no matching
         # results"), so avoid adding the generic "[ffuf] has been completed."
         # line to keep the console output clean and focused.
@@ -570,7 +570,22 @@ class OutputMixin:
         QTimer.singleShot(3000, lambda: self.update_status_bar("idle", ""))
         
         self.refresh_file_list()
-        
+
+        # One-shot follow-up. A button that chains two stages — "Retrieve &
+        # Analyse JS Files" runs wget and then the static analysis over what
+        # landed — leaves a callable here. It is cleared *before* being called
+        # so an exception inside it can never leave the hook armed for the
+        # next, unrelated command, and it is skipped on a non-zero exit:
+        # analysing a download that failed only prints noise.
+        follow_up = getattr(self, "_command_follow_up", None)
+        if follow_up is not None:
+            self._command_follow_up = None
+            if exit_code == 0:
+                try:
+                    follow_up()
+                except Exception as exc:
+                    self.console.append_ansi(f"\n[!] Follow-up step failed: {exc}\n")
+
         # Ensure pause state/label are reset when a command finishes
         if hasattr(self, "_process_paused"):
             self._process_paused = False

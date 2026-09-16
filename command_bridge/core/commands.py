@@ -113,8 +113,15 @@ class CommandsMixin:
             t = t.split('@', 1)[1]
         return t.strip()
 
-    def run_command_template(self, cmd_template):
-        """Run a command with template substitution"""
+    def run_command_template(self, cmd_template, label: str = None):
+        """Run a command with template substitution.
+
+        `label` is the human name for what is running (normally the button's
+        caption); it is what the console and status bar report instead of the
+        first binary in the pipeline. Passing nothing clears any previous
+        label so a later run never inherits the last one's name.
+        """
+        self.current_action_label = label
         if not self.target:
             self.show_themed_message("No Target", "Please set a target first in the Target Setup tab.", QMessageBox.Icon.Warning)
             return
@@ -269,13 +276,14 @@ class CommandsMixin:
         # Run command with optional output file
         self.runner.run_command(cmd, str(self.output_dir), output_file=output_file)
 
-    def run_raw_command(self, cmd_template: str):
+    def run_raw_command(self, cmd_template: str, label: str = None):
         """Run a command that needs no {TARGET}/{SAFE_TARGET} — e.g. the
         environment/tool-setup scripts, which make no sense to gate behind
         "set a target first" the way run_command_template does. Still
         resolves {CB_DIR} and streams through the same console/status bar/
         runner as every other command so the UX is identical.
         """
+        self.current_action_label = label
         cmd = cmd_template.replace("{CB_DIR}", str(BASE_DIR))
 
         self.goto_console()
@@ -298,10 +306,13 @@ class CommandsMixin:
         if button_id == 'web_smartfuzz':
             self.run_smartfuzz_with_auth()
             return
-        
+
         cmd_template = self.command_registry.get(button_id)
         if cmd_template:
-            self.run_command_template(cmd_template)
+            # The button's own caption is the best name for what is running —
+            # see get_action_display_name(). Registered by create_editable_button.
+            label = getattr(self, "button_labels", {}).get(button_id)
+            self.run_command_template(cmd_template, label=label)
 
     def load_custom_commands(self):
         """Load custom commands from config file and migrate problematic templates"""
