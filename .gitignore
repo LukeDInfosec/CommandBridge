@@ -1,0 +1,52 @@
+# Python bytecode — regenerated on every run, and if these are tracked the
+# working tree is permanently "dirty", which blocks the in-app updater.
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtualenvs, if anyone makes one inside the tree
+.venv/
+venv/
+env/
+
+# Scan output. Command Bridge writes results next to wherever the output
+# directory points, which is often the install folder on a quick engagement —
+# these must never end up in the repo.
+*_nmap*.txt
+*_nuclei*.txt
+*_ffuf*.json
+*_dirsearch*.txt
+*_gobuster*.txt
+*_sqlmap*.txt
+*_testssl*.txt
+*_rustscan*.txt
+*_dalfox*.txt
+*_corsy*.txt
+*_dotdotpwn*.txt
+*_lfimap*.txt
+*_sstimap*.txt
+*_tplmap*.txt
+*_harvester*
+*_waf.txt
+*_hakrawler.txt
+*_dnsx.txt
+*_subdomains.txt
+*_alive.txt
+*_js_files/
+externals_*.txt
+results/
+subs.txt
+alive.txt
+ips.txt
+up.txt
+request.txt
+
+# Written by launch.sh when a start-up fails
+launch_error.log
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
