@@ -199,8 +199,13 @@ class ReconTabMixin:
              "dnsx -l {SAFE_TARGET}_subdomains.txt -a -aaaa -cname -mx -resp -silent | tee {SAFE_TARGET}_dnsx.txt"),
             ("DNS Brute Force", "recon_dns_brute",
              "dnsx -d {TARGET_HOST} -w /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt -silent | tee {SAFE_TARGET}_dns_brute.txt"),
+            # crt.sh answers busy periods with HTML, a 502 or nothing at all,
+            # and the old inline `json.load(sys.stdin)` pipe turned every one
+            # of those into a Python traceback in the console. crtsh.py does
+            # the fetch, the retries and the deduplication, and explains any
+            # failure in one sentence.
             ("CRT.sh Cert Transparency", "recon_crtsh",
-             "curl -s 'https://crt.sh/?q=%.{TARGET_HOST}&output=json' | python3 -c \"import json,sys; data=json.load(sys.stdin); [print(n) for d in data for n in d.get('name_value','').split()]\" | sort -u | tee {SAFE_TARGET}_crtsh.txt"),
+             "python3 {CB_DIR}/command_bridge/modules/crtsh.py {TARGET_HOST} | tee {SAFE_TARGET}_crtsh.txt"),
             ("WhatWeb Tech Detection", "recon_whatweb",
              "whatweb -a 3 '{TARGET}' --log-json={SAFE_TARGET}_whatweb.json 2>&1 | tee {SAFE_TARGET}_whatweb.txt"),
             ("Wafw00f WAF Detect", "recon_wafw00f",

@@ -200,6 +200,13 @@ class CardsMixin:
         # Store the command (so we can use it in tooltips and execution)
         if button_id not in self.command_registry:
             self.command_registry[button_id] = default_cmd
+
+        # Remember the caption so the console can report "[Quick Nmap] has
+        # been completed" rather than naming whichever binary happened to come
+        # first in the pipeline. See get_action_display_name() in core/status.py.
+        if not hasattr(self, "button_labels"):
+            self.button_labels = {}
+        self.button_labels[button_id] = strip_leading_glyphs(name)
         cmd_for_tooltip = self.command_registry[button_id]
 
         # Attach an informative tooltip built from the command template.
@@ -220,6 +227,10 @@ class CardsMixin:
             btn.clicked.connect(
                 lambda checked, b=btn, bid=button_id, def_cmd=default_cmd: self._on_fuzzing_button_clicked(b, bid, def_cmd)
             )
+        elif button_id == "web_retrieve_js":
+            # Two-stage button: run the (editable) wget command, then analyse
+            # the JavaScript it pulled down. See run_retrieve_and_analyse_js().
+            btn.clicked.connect(lambda checked: self.run_retrieve_and_analyse_js())
         elif button_id == "web_wpscan_full":
             # WordPress Scan (WPScan) – left-click runs the currently selected
             # profile, right-click opens a dedicated menu with quick profiles

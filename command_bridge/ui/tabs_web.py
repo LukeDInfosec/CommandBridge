@@ -57,11 +57,21 @@ class WebTabMixin:
         jwt_btn.clicked.connect(self.jwt_decode_prompt)
         scraping_layout.addWidget(jwt_btn, 0, 1)
         
-        # Retrieve JS Files (command remains editable)
+        # Retrieve & Analyse JS Files — one button, two stages. The wget
+        # command stays editable (depth, host span, file types); the static
+        # analysis runs automatically over whatever it pulled down.
         js_btn = self.create_editable_button(
-            "Retrieve JS Files",
+            "Retrieve & Analyse JS Files",
             "web_retrieve_js",
             "wget -r -l 1 -H -t 1 -nd -N -np -A.js -erobots=off {TARGET} -P {SAFE_TARGET}_js_files",
+        )
+        js_btn.setToolTip(
+            "Downloads the site's JavaScript into <target>_js_files/ and then\n"
+            "statically analyses it for hardcoded secrets, credentials, API\n"
+            "keys, internal endpoints, source maps, DOM-XSS sinks and cloud\n"
+            "storage references.\n\n"
+            "Right-click to edit the download command (crawl depth, host span,\n"
+            "file types). Findings are written to js_analysis_results.txt."
         )
         scraping_layout.addWidget(js_btn, 1, 0)
         
@@ -73,25 +83,6 @@ class WebTabMixin:
         js_issue_btn.setMinimumHeight(40)
         js_issue_btn.clicked.connect(self.search_js_library_issues)
         scraping_layout.addWidget(js_issue_btn, 1, 1)
-
-        # Retrieving the JS is only half the job — this runs the static
-        # analysis rules (secrets, credentials, API keys, endpoints, source
-        # maps, DOM-XSS sinks, cloud storage, JWT handling) over the files
-        # already pulled down into <target>_js_files.
-        js_parse_btn = QPushButton("Analyse Downloaded JS")
-        js_parse_btn.setObjectName("secondaryButton")
-        js_parse_btn.setMinimumHeight(40)
-        js_parse_btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
-        js_parse_btn.setToolTip(
-            "Statically analyse the JavaScript already downloaded by\n"
-            "'Retrieve JS Files' (<target>_js_files/) for hardcoded secrets,\n"
-            "credentials, API keys, internal endpoints, source maps, DOM-XSS\n"
-            "sinks and cloud storage references.\n\n"
-            "If that folder doesn't exist yet you'll be asked to pick one.\n"
-            "Findings are written to js_analysis_results.txt."
-        )
-        js_parse_btn.clicked.connect(self.run_downloaded_js_analysis)
-        scraping_layout.addWidget(js_parse_btn, 4, 1)
 
         # CMS scanning (Drupal / WordPress) – lightweight buttons in the
         # Web Scraping section for quick platform checks.
