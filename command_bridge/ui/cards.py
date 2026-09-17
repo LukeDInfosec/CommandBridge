@@ -197,9 +197,11 @@ class CardsMixin:
         btn.setMinimumHeight(38)
         btn.setMaximumHeight(42)
 
-        # Store the command (so we can use it in tooltips and execution)
-        if button_id not in self.command_registry:
-            self.command_registry[button_id] = default_cmd
+        # Register the shipped default and work out what this button should
+        # actually run — a saved override only wins if it is a real edit
+        # rather than a stale copy of an older default. See
+        # register_default_command() in core/commands.py.
+        self.register_default_command(button_id, default_cmd)
 
         # Remember the caption so the console can report "[Quick Nmap] has
         # been completed" rather than naming whichever binary happened to come

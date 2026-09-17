@@ -185,36 +185,31 @@ class ApiTabMixin:
         )
         rest_layout.addWidget(ratelimit_btn, 1, 0)
 
-        # Swagger/OpenAPI — renamed for clarity, and now tries every common
-        # spec path (not just the literal Target URL) so it actually finds
-        # documentation that isn't hosted at exactly the target path.
+        # Swagger/OpenAPI discovery. The previous shell loop only accepted a
+        # JSON body, so a client saying "docs are at /swagger" — which serves
+        # Swagger UI, an HTML page that loads the spec from somewhere else —
+        # came back as "no documentation found". swagger_discover.py probes
+        # the real spec paths, recognises a documentation UI and reads the
+        # spec URL back out of it (including out of swagger-initializer.js),
+        # and accepts YAML as well as JSON.
         swagger_cmd = (
-            "echo '[*] Probing for Swagger/OpenAPI documentation on {TARGET}'; "
-            "FOUND=0; "
-            "for p in \"\" \"/swagger.json\" \"/openapi.json\" \"/v2/api-docs\" \"/v3/api-docs\" "
-            "\"/api-docs\" \"/swagger/v1/swagger.json\" \"/swagger/index.html\"; do "
-            "URL=\"{TARGET}$p\"; "
-            "echo \"[*] Trying: $URL\"; "
-            "curl -sk -m 8 \"$URL\" -o {SAFE_TARGET}_swagger.json; "
-            "if python3 -m json.tool {SAFE_TARGET}_swagger.json >/dev/null 2>&1 "
-            "&& grep -qE '\"(swagger|openapi)\"' {SAFE_TARGET}_swagger.json; then "
-            "echo \"[+] Valid Swagger/OpenAPI spec found at: $URL\"; "
-            "echo '[+] Saved to {SAFE_TARGET}_swagger.json'; "
-            "python3 -m json.tool {SAFE_TARGET}_swagger.json | head -120; "
-            "FOUND=1; break; fi; "
-            "done; "
-            "if [ \"$FOUND\" -eq 0 ]; then "
-            "echo '[!] No Swagger/OpenAPI documentation found at the target path or common "
-            "spec locations. Try right-clicking to point the target at a known doc path.'; fi"
+            "python3 {CB_DIR}/command_bridge/modules/swagger_discover.py '{TARGET}' "
+            "--out {SAFE_TARGET}_swagger.json 2>&1 | tee {SAFE_TARGET}_swagger_discovery.txt"
         )
         swagger_btn = self.create_editable_button(
             "Detect Swagger/OpenAPI Documentation", "api_swagger", swagger_cmd
         )
         swagger_btn.setToolTip(
-            "Checks the target URL itself, then automatically tries the common\n"
-            "Swagger/OpenAPI spec paths (/swagger.json, /openapi.json, /v2/api-docs,\n"
-            "/v3/api-docs, /api-docs, /swagger/v1/swagger.json, /swagger/index.html)\n"
-            "and stops at the first one that returns a valid swagger/openapi JSON spec."
+            "Finds the API specification, not just the URL you typed.\n\n"
+            "Tries the target itself, then ~20 common spec paths (/swagger.json,\n"
+            "/openapi.json|yaml, /v2|v3/api-docs, /swagger/v1/swagger.json, ...).\n"
+            "If it lands on a documentation UI instead — Swagger UI, Redoc, RapiDoc,\n"
+            "Stoplight, Scalar — it reads the spec URL back out of the page and\n"
+            "follows it, which is what makes a bare /swagger URL work.\n\n"
+            "Accepts YAML specs as well as JSON. Only counts a document as a spec if\n"
+            "it declares swagger/openapi, so an ordinary JSON response is not\n"
+            "reported as documentation.\n\n"
+            "Spec saved to <target>_swagger.json, full probe log alongside it."
         )
         rest_layout.addWidget(swagger_btn, 1, 1)
 

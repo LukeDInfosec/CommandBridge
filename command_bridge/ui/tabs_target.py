@@ -147,6 +147,26 @@ class TargetTabMixin:
         install_tools_btn.clicked.connect(self.run_install_tools)
         tools_btn_row.addWidget(install_tools_btn)
 
+        # Reset All Commands — the escape hatch for the override problem. An
+        # older build saved every command to disk the moment one was edited,
+        # so a lot of installs are running commands frozen from whenever that
+        # happened, with shipped fixes silently ignored.
+        reset_row = QHBoxLayout()
+        reset_cmds_btn = QPushButton("Reset All Commands to Shipped Defaults")
+        reset_cmds_btn.setObjectName("secondaryButton")
+        reset_cmds_btn.setMinimumHeight(38)
+        reset_cmds_btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        reset_cmds_btn.setToolTip(
+            "Discards every saved command override and goes back to the commands "
+            "that ship with this version. Use this if buttons are behaving like an "
+            "older release. Your target, headers, theme and output directory are "
+            "not affected — only command templates."
+        )
+        reset_cmds_btn.clicked.connect(self.confirm_reset_all_commands)
+        reset_row.addWidget(reset_cmds_btn)
+        reset_row.addStretch()
+        tools_layout.addLayout(reset_row)
+
         tools_layout.addLayout(tools_btn_row)
         tools_group.layout().addLayout(tools_layout)
         layout.addWidget(tools_group)
