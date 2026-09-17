@@ -54,6 +54,7 @@ from command_bridge.modules.response_analysis import ResponseAnalysisMixin
 from command_bridge.modules.file_upload_lab import FileUploadLabMixin
 from command_bridge.modules.graphql_tools import GraphqlToolsMixin
 from command_bridge.modules.tool_setup import ToolSetupMixin
+from command_bridge.modules.api_testing import ApiTestingMixin
 
 
 class CommandBridgeV5(
@@ -93,6 +94,7 @@ class CommandBridgeV5(
     FileUploadLabMixin,
     GraphqlToolsMixin,
     ToolSetupMixin,
+    ApiTestingMixin,
 ):
     """Main application window — Command Bridge v5."""
 
