@@ -314,21 +314,228 @@ class CommandsMixin:
             label = getattr(self, "button_labels", {}).get(button_id)
             self.run_command_template(cmd_template, label=label)
 
+    # ── Command persistence ──────────────────────────────────────────────
+    #
+    # The rule: the app ships a default for every button, and the user can
+    # override any of them. Only genuine overrides are ever written to disk.
+    #
+    # This used to be badly broken. save_custom_commands() persisted the
+    # WHOLE registry, so the first time anyone edited a single wordlist, all
+    # ~97 commands were frozen to disk. load_custom_commands() then ran
+    # before the UI was built and filled the registry from that file, and
+    # create_editable_button()'s "if button_id not in self.command_registry"
+    # meant every shipped default was skipped from then on. The effect was
+    # silent and permanent: every command fix shipped in an update was
+    # invisible, and the app kept running commands from whenever that file
+    # was written.
+    #
+    # Now: saved entries are held aside until each button registers its
+    # shipped default, and an entry only wins if it actually differs from the
+    # default it was saved against. Entries that merely echo an old default
+    # are discarded, so updates land.
+
+    #: More saved commands than this means the file is a wholesale dump from
+    #: the old build rather than deliberate edits. Nobody hand-edits twenty
+    #: commands; the old save wrote all ninety-odd in one go.
+    LEGACY_DUMP_THRESHOLD = 20
+
     def load_custom_commands(self):
-        """Load custom commands from config file and migrate problematic templates"""
+        """Read saved command overrides. Does not populate the registry yet.
+
+        Nothing is applied here because the shipped defaults are not known
+        until the tabs are built — see register_default_command().
+        """
+        self._saved_overrides = {}
+        self._migrated_overrides = []   # provenance unknown (old file format)
+        self._stale_overrides = []      # user edit, but the default has since changed
+        self._legacy_dump = {}          # wholesale dump from the old build
+        config_dir = Path.home() / ".config" / "CommandBridge"
+
+        # Current format: commands.json, which records the default each
+        # override was made against.
+        json_file = config_dir / "commands.json"
+        if json_file.exists():
+            try:
+                with open(json_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                for button_id, entry in (data or {}).items():
+                    if isinstance(entry, dict) and entry.get("command"):
+                        self._saved_overrides[button_id] = {
+                            "command": self.migrate_command_template(entry["command"]),
+                            "base": entry.get("base"),
+                        }
+                return
+            except Exception as e:
+                print(f"Error loading commands.json: {e}")
+
+        # Legacy format: custom_commands.txt, one "id::command" per line, with
+        # no record of what the default was at the time.
+        legacy = config_dir / "custom_commands.txt"
+        if not legacy.exists():
+            return
         try:
-            config_dir = Path.home() / ".config" / "CommandBridge"
-            config_file = config_dir / "custom_commands.txt"
-            
-            if config_file.exists():
-                with open(config_file, 'r') as f:
-                    for line in f:
-                        if '::' in line:
-                            button_id, cmd = line.strip().split('::', 1)
-                            migrated = self.migrate_command_template(cmd)
-                            self.command_registry[button_id] = migrated
+            entries = {}
+            with open(legacy, "r", encoding="utf-8") as f:
+                for line in f:
+                    if "::" in line:
+                        button_id, cmd = line.strip().split("::", 1)
+                        entries[button_id] = self.migrate_command_template(cmd)
         except Exception as e:
             print(f"Error loading custom commands: {e}")
+            return
+
+        # The old build wrote the ENTIRE registry the moment any one command
+        # was edited, so a file with dozens of entries is a wholesale dump,
+        # not a set of deliberate customisations. Honouring it would keep
+        # masking every shipped fix — which is the bug this is here to end.
+        # So a dump is set aside rather than applied. Nothing is lost: the
+        # file is preserved as a backup and every discarded command is listed
+        # in the console, so a real edit can be put back deliberately.
+        if len(entries) > self.LEGACY_DUMP_THRESHOLD:
+            self._legacy_dump = entries
+            # Retire the file now, not at the next save — otherwise it would
+            # be read again on the next launch and keep re-masking defaults
+            # for anyone who never edits a command again.
+            try:
+                legacy.rename(config_dir / "custom_commands.txt.pre-json-backup")
+            except OSError as exc:
+                print(f"Could not archive the legacy command file: {exc}")
+            return
+
+        # A short file is plausibly a genuine set of edits, so those are kept
+        # and flagged for review instead.
+        for button_id, cmd in entries.items():
+            self._saved_overrides[button_id] = {"command": cmd, "base": None}
+
+    def register_default_command(self, button_id: str, default_cmd: str):
+        """Record a button's shipped default and decide what it should run.
+
+        Called by create_editable_button() as each button is built.
+        """
+        if not hasattr(self, "default_commands"):
+            self.default_commands = {}
+        self.default_commands[button_id] = default_cmd
+
+        override = getattr(self, "_saved_overrides", {}).get(button_id)
+        if not override:
+            self.command_registry[button_id] = default_cmd
+            return
+
+        saved = override["command"]
+        base = override.get("base")
+
+        if saved == default_cmd:
+            # Identical to what ships — nothing to preserve.
+            self.command_registry[button_id] = default_cmd
+            return
+
+        if base is None:
+            # Legacy entry: can't tell an edit from a stale default. Keep it
+            # (losing a real edit silently would be worse) but flag it.
+            self._migrated_overrides.append(button_id)
+        elif saved == base:
+            # Saved copy is just the old shipped default — the update wins.
+            self.command_registry[button_id] = default_cmd
+            return
+        elif base != default_cmd:
+            # A real edit, but the shipped default has moved on since.
+            self._stale_overrides.append(button_id)
+
+        self.command_registry[button_id] = saved
+
+    def reset_command_to_default(self, button_id: str) -> bool:
+        """Drop a user override and go back to the shipped command."""
+        default = getattr(self, "default_commands", {}).get(button_id)
+        if default is None:
+            return False
+        self.command_registry[button_id] = default
+        getattr(self, "_saved_overrides", {}).pop(button_id, None)
+        self.save_custom_commands()
+        return True
+
+    def reset_all_commands_to_defaults(self) -> int:
+        """Drop every override. Returns how many were reset."""
+        defaults = getattr(self, "default_commands", {})
+        changed = 0
+        for button_id, default in defaults.items():
+            if self.command_registry.get(button_id) != default:
+                self.command_registry[button_id] = default
+                changed += 1
+        self._saved_overrides = {}
+        self._migrated_overrides = []
+        self._stale_overrides = []
+        self.save_custom_commands()
+        return changed
+
+    def report_command_overrides(self):
+        """Tell the user which commands are not running the shipped version.
+
+        Runs once after the UI is built. Without this, an override that is
+        really a stale default from an old version is completely invisible —
+        which is exactly how a fixed command kept appearing broken.
+        """
+        migrated = getattr(self, "_migrated_overrides", [])
+        stale = getattr(self, "_stale_overrides", [])
+        dump = getattr(self, "_legacy_dump", {})
+        if not migrated and not stale and not dump:
+            return
+        labels = getattr(self, "button_labels", {})
+
+        def name(bid):
+            return labels.get(bid, bid)
+
+        try:
+            if dump:
+                defaults = getattr(self, "default_commands", {})
+                differing = sorted(
+                    bid for bid, cmd in dump.items()
+                    if bid in defaults and cmd != defaults[bid]
+                )
+                self.console.append_ansi(
+                    f"\n[i] {len(dump)} saved commands were found from an older "
+                    "build that wrote every command to disk whenever one was "
+                    "edited. That was masking shipped fixes, so they have been "
+                    "set aside and the versions from this release are in use.\n"
+                )
+                self.console.append_ansi(
+                    "    Backup: ~/.config/CommandBridge/custom_commands.txt.pre-json-backup\n"
+                )
+                if differing:
+                    self.console.append_ansi(
+                        f"    {len(differing)} of them differed from this release "
+                        "— if any were deliberate edits of yours, re-apply them by "
+                        "right-clicking the button:\n"
+                    )
+                    for bid in differing[:20]:
+                        self.console.append_ansi(f"      - {name(bid)}\n")
+                    if len(differing) > 20:
+                        self.console.append_ansi(
+                            f"      ... and {len(differing) - 20} more (see the backup file)\n"
+                        )
+            if migrated:
+                self.console.append_ansi(
+                    f"\n[i] {len(migrated)} saved command(s) differ from the versions "
+                    "that ship with this release. They were saved by an older build "
+                    "that could not tell an edit from a default, so they may simply "
+                    "be out of date:\n"
+                )
+                for bid in sorted(migrated)[:25]:
+                    self.console.append_ansi(f"      - {name(bid)}\n")
+                if len(migrated) > 25:
+                    self.console.append_ansi(f"      ... and {len(migrated) - 25} more\n")
+                self.console.append_ansi(
+                    "    Right-click a button -> Reset to Shipped Default to take the "
+                    "updated version, or use Reset All Commands on the Target tab.\n"
+                )
+            if stale:
+                self.console.append_ansi(
+                    f"\n[i] {len(stale)} command(s) you have edited have also changed "
+                    "in this release — your version is still being used:\n"
+                )
+                for bid in sorted(stale)[:25]:
+                    self.console.append_ansi(f"      - {name(bid)}\n")
+        except Exception:
+            pass
 
     def migrate_command_template(self, cmd: str) -> str:
         """Migrate legacy/broken command templates to current format.
@@ -527,15 +734,34 @@ class CommandsMixin:
             return cmd
 
     def save_custom_commands(self):
-        """Save custom commands to config file"""
+        """Persist only the commands that actually differ from the defaults.
+
+        Writing the whole registry is what broke updates before: it turned
+        every shipped command into a frozen user override the moment anything
+        was edited. Each entry records the default it was made against, so a
+        later release can tell "the user changed this" from "this is just an
+        old default".
+        """
         try:
             config_dir = Path.home() / ".config" / "CommandBridge"
             config_dir.mkdir(parents=True, exist_ok=True)
-            config_file = config_dir / "custom_commands.txt"
-            
-            with open(config_file, 'w') as f:
-                for button_id, cmd in self.command_registry.items():
-                    f.write(f"{button_id}::{cmd}\n")
+            defaults = getattr(self, "default_commands", {})
+
+            data = {}
+            for button_id, cmd in self.command_registry.items():
+                default = defaults.get(button_id)
+                if default is None or cmd != default:
+                    data[button_id] = {"command": cmd, "base": default}
+
+            with open(config_dir / "commands.json", "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, sort_keys=True)
+
+            # Retire the legacy file so it can never be read back and undo
+            # this. Renamed rather than deleted — it is the only copy of any
+            # edit made under the old build.
+            legacy = config_dir / "custom_commands.txt"
+            if legacy.exists():
+                legacy.rename(config_dir / "custom_commands.txt.pre-json-backup")
         except Exception as e:
             print(f"Error saving custom commands: {e}")
 
@@ -565,10 +791,23 @@ class CommandsMixin:
         text_edit.setMinimumHeight(250)
         layout.addWidget(text_edit)
         
-        # Buttons
+        # Buttons. "Restore Defaults" puts the shipped command back in the
+        # editor rather than applying it immediately, so the change is still
+        # reviewed and confirmed like any other edit.
         button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
+        shipped = getattr(self, "default_commands", {}).get(button_id, default_cmd)
+        if shipped and shipped != current_cmd:
+            reset_btn = button_box.addButton(
+                "Reset to Shipped Default", QDialogButtonBox.ButtonRole.ResetRole
+            )
+            reset_btn.setToolTip(
+                "Replace the text above with the command that ships with this "
+                "version of Command Bridge. Useful after an update: your saved "
+                "copy is kept until you press OK."
+            )
+            reset_btn.clicked.connect(lambda: text_edit.setPlainText(shipped))
         button_box.accepted.connect(dialog.accept)
         button_box.rejected.connect(dialog.reject)
         layout.addWidget(button_box)
