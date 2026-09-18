@@ -47,7 +47,25 @@ mkdir -p "$TOOLS_DIR"
 
 hr() { printf '%.0s-' $(seq 1 70); echo; }
 
-# check_tool <bin> [test-flag] -> prints: ok | missing | broken
+# _last_meaningful_line <text>
+#
+# The useful part of a failure is almost always the last line: a Python
+# traceback ends on the exception, and a shell exec failure is a single line.
+# Pulling that out beats matching a list of phrases, which was fragile and
+# quietly produced nothing when the wording differed.
+_last_meaningful_line() {
+    printf '%s\n' "$1" \
+        | grep -vE '^\s*$|^\s*File "|^\s*\^+\s*$|^\s*~+\^*~*\s*$|Traceback \(most recent' \
+        | tail -1 \
+        | sed 's/^[[:space:]]*//' \
+        | cut -c1-100
+}
+
+# check_tool <bin> [test-flag] -> prints: ok | missing | broken|<reason>
+#
+# The reason rides on the same line because check_tool is always called inside
+# a command substitution, which is a subshell — a variable set in here never
+# reaches the caller, which is why the reason came back empty at first.
 check_tool() {
     local bin="$1" flag="${2:---help}"
     local path
@@ -72,7 +90,7 @@ check_tool() {
     # A working tool's own --help output essentially never contains any of
     # these phrases, so this stays safe against false positives.
     if echo "$out" | grep -qiE 'bad interpreter|cannot execute|required file not found|failed to run command'; then
-        echo "broken"
+        echo "broken|$(_last_meaningful_line "$out")"
         return
     fi
     # A Python tool that dies before it can print its own --help is just as
@@ -82,7 +100,10 @@ check_tool() {
     # got upgraded, so every run ends in DistributionNotFound or
     # VersionConflict. A working tool's --help never contains a traceback.
     if echo "$out" | grep -qE 'Traceback \(most recent call last\)|DistributionNotFound|VersionConflict|ModuleNotFoundError|ImportError:'; then
-        echo "broken"
+        local reason
+        reason="$(_last_meaningful_line "$out")"
+        [ -z "$reason" ] && reason="python error on startup"
+        echo "broken|$reason"
         return
     fi
     echo "ok"
@@ -128,11 +149,15 @@ fix_stale_pip_shim() {
     fi
 
     echo "[*] $shim is a stale pip shim shadowing $other -- renaming it to ${shim}.cb-disabled"
-    if [ "$(id -u)" = "0" ]; then
-        mv -f "$shim" "${shim}.cb-disabled"
-    else
-        sudo mv -f "$shim" "${shim}.cb-disabled"
+    if run_privileged mv -f "$shim" "${shim}.cb-disabled"; then
+        return 0
     fi
+    # Nothing here can escalate, so hand over the one command that fixes it
+    # rather than failing with a raw sudo error.
+    echo "[!] Could not rename it — this needs root and there is no terminal"
+    echo "    for sudo to prompt on. Run this once, then re-check:"
+    echo "        sudo mv -f '$shim' '${shim}.cb-disabled'"
+    return 1
 }
 
 report() {
@@ -147,15 +172,64 @@ report() {
     esac
 }
 
-apt_install() {
+# Packages that need apt but could not be installed, collected so the run can
+# end with ONE command to paste rather than a failure per tool.
+declare -a APT_DEFERRED=()
+
+# run_privileged <command...>
+#
+# Anything needing root goes through here. Launched from the GUI there is no
+# terminal for sudo to prompt on — plain `sudo` just prints "a terminal is
+# required to read the password" and fails — so cached/NOPASSWD sudo is tried
+# first, then pkexec, which raises the desktop's own password dialog.
+run_privileged() {
     if [ "$(id -u)" = "0" ]; then
-        apt-get install -y "$1"
-    elif sudo -n true 2>/dev/null; then
-        sudo -n apt-get install -y "$1"
-    else
-        echo "[*] Installing $1 via sudo apt-get — you may be prompted for your password:"
-        sudo apt-get install -y "$1"
+        "$@"
+        return
     fi
+    if sudo -n true 2>/dev/null; then
+        sudo -n "$@"
+        return
+    fi
+    if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && command -v pkexec >/dev/null 2>&1; then
+        pkexec "$@"
+        return
+    fi
+    return 1
+}
+
+# apt_install <package>
+#
+# This script is normally launched from the GUI, where there is no terminal
+# for sudo to prompt on — "sudo: a terminal is required to read the password"
+# is what a plain `sudo apt-get` produces there, and it failed every apt tool.
+#
+# So, in order of how little it bothers the user:
+#   1. already root, or sudo is cached / NOPASSWD  -> just do it
+#   2. a desktop session is present                -> pkexec, which opens the
+#      system's own password dialog
+#   3. neither                                     -> defer it, and print one
+#      apt-get line at the end covering everything that needs it
+apt_install() {
+    local pkg="$1"
+
+    if [ "$(id -u)" = "0" ] || sudo -n true 2>/dev/null; then
+        run_privileged apt-get install -y "$pkg"
+        return
+    fi
+
+    if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && command -v pkexec >/dev/null 2>&1; then
+        echo "[*] Requesting authorisation to install $pkg (a password dialog should appear)…"
+        if run_privileged apt-get install -y "$pkg"; then
+            return
+        fi
+        echo "[!] The authorisation dialog was dismissed or failed."
+    fi
+
+    APT_DEFERRED+=("$pkg")
+    echo "[!] $pkg needs apt, and there is no terminal here for sudo to prompt on."
+    echo "    It has been added to the summary at the end of this run."
+    return 1
 }
 
 pipx_install() {
@@ -254,8 +328,11 @@ go_install_to_local_bin() {
 # handle_tool <display-name> <binary-to-check> <installer-function-name> [test-flag]
 handle_tool() {
     local name="$1" bin="$2" installer="$3" flag="${4:---help}"
-    local status
-    status="$(check_tool "$bin" "$flag")"
+    local status raw why
+    raw="$(check_tool "$bin" "$flag")"
+    status="${raw%%|*}"
+    why=""
+    [ "$raw" != "$status" ] && why="${raw#*|}"
 
     if [ "$status" = "ok" ]; then
         report "$name" ok
@@ -263,7 +340,9 @@ handle_tool() {
     fi
 
     if [ "$CHECK_ONLY" = "1" ]; then
-        report "$name" "$status"
+        # "[BROKEN] dirsearch" on its own says nothing. The reason was already
+        # captured while checking — show it.
+        report "$name" "$status" "$why"
         return
     fi
 
@@ -273,6 +352,8 @@ handle_tool() {
     # test for and cheap to fix, and when it is the cause no install is needed
     # at all — so try it before reaching for apt/pipx/go. Applies to every
     # tool, not just the one that surfaced it.
+    [ -n "$why" ] && echo "      reason: $why"
+
     if [ "$status" = "broken" ] && fix_stale_pip_shim "$bin" >/dev/null 2>&1; then
         if [ "$(check_tool "$bin" "$flag")" = "ok" ]; then
             report "$name" fixed "removed a stale pip shim from /usr/local/bin"
@@ -283,8 +364,17 @@ handle_tool() {
     local log
     log="$(mktemp /tmp/cb_install_XXXXXX.log)"
     "$installer" >"$log" 2>&1
+
+    # bash caches the path of every command it has run, so a tool that has
+    # just been reinstalled somewhere earlier on PATH still resolves to the
+    # old broken copy. That is why droopescan reported FAILED immediately
+    # after pipx said "installed package droopescan 1.45.1". Forget the
+    # cached paths before re-checking.
+    hash -r 2>/dev/null
+
     local newstatus
     newstatus="$(check_tool "$bin" "$flag")"
+    newstatus="${newstatus%%|*}"
     if [ "$newstatus" = "ok" ]; then
         report "$name" fixed
         rm -f "$log"
@@ -339,7 +429,7 @@ _i_dotdotpwn()   { apt_install dotdotpwn; }
 # problem the tool is already working and nothing needs installing.
 _i_wafw00f() {
     if fix_stale_pip_shim wafw00f; then
-        [ "$(check_tool wafw00f)" = "ok" ] && return 0
+        [ "$(check_tool wafw00f)" = "ok" ] && return 0   # status word only; "broken|…" never equals "ok"
     fi
     apt_install wafw00f || pipx_install wafw00f
 }
@@ -366,7 +456,15 @@ _i_wpscan()      { apt_install wpscan; }
 _i_droopescan()  { pipx_install droopescan; }
 _i_graphql_cop() { pipx_install graphql-cop; }
 _i_amass()       { apt_install amass; }
-_i_ghauri()      { pipx_install ghauri; }
+# ghauri has never been published to PyPI — "pip install ghauri" fails with
+# "No matching distribution found". It installs from its own repository.
+_i_ghauri() {
+    if [ "$HAVE_PIPX" = "1" ]; then
+        rm -rf "$HOME/.local/share/pipx/venvs/ghauri" 2>/dev/null
+        pipx install --force "git+https://github.com/r0oth3x49/ghauri.git" && return 0
+    fi
+    git_script_install ghauri https://github.com/r0oth3x49/ghauri.git ghauri.py
+}
 _i_urldedupe()   { go_install_to_local_bin github.com/ameenmaali/urldedupe@latest urldedupe; }
 
 _i_testssl() {
@@ -595,6 +693,22 @@ if [ "${#MISSING_LIST[@]}" -gt 0 ] && [ "$CHECK_ONLY" = "1" ]; then
 fi
 if [ "${#SKIPPED_LIST[@]}" -gt 0 ]; then
     echo "  Skipped: ${SKIPPED_LIST[*]}"
+fi
+
+# Anything that needed apt but had nowhere to ask for a password. One command
+# beats a failure line per tool, and it can be pasted straight into a terminal.
+if [ "${#APT_DEFERRED[@]}" -gt 0 ]; then
+    echo
+    echo "  ----------------------------------------------------------------"
+    echo "  ${#APT_DEFERRED[@]} tool(s) need apt, which cannot ask for your password"
+    echo "  from inside the app. Run this once in a terminal, then press"
+    echo "  'Check Installed Tools' again:"
+    echo
+    echo "      sudo apt-get install -y ${APT_DEFERRED[*]}"
+    echo
+    echo "  (Installing the 'pkexec' package, or giving your user a NOPASSWD"
+    echo "  sudo rule for apt-get, lets this button do it for you next time.)"
+    echo "  ----------------------------------------------------------------"
 fi
 echo
 echo "[i] Go/pipx-installed binaries are copied into ~/.local/bin so they are"
