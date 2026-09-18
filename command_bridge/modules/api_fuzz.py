@@ -39,6 +39,7 @@ import json
 import re
 import ssl
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -81,6 +82,11 @@ STATE_CHANGING = {"POST", "PUT", "PATCH", "DELETE"}
 SOAP_HINTS = ("soap:envelope", "soap-env", "application/soap+xml", "wsdl:definitions",
               "<definitions", "text/xml", "xmlns:soap")
 
+#: Progress is redrawn in place at most this often. A fuzz of 12,000 paths
+#: printing a fresh line every 500 produced two dozen near-identical lines
+#: that pushed the actual findings off the screen.
+PROGRESS_INTERVAL = 0.25
+
 
 def make_context(insecure: bool):
     if not insecure:
@@ -89,6 +95,11 @@ def make_context(insecure: bool):
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     return ctx
+
+
+def clear_line():
+    """Wipe the in-place progress counter before printing something lasting."""
+    print("\r" + " " * 70 + "\r", end="", flush=True)
 
 
 def request(url, ctx, timeout, method="GET", headers=None, body=None):
@@ -237,14 +248,32 @@ def load_wordlists(paths):
     return list(words), used, missing
 
 
+def _body_signature(text: str, word: str) -> str:
+    """A comparable fingerprint of a response body.
+
+    The probe word is stripped first because soft-404 pages routinely echo
+    what was asked for ("/foo was not found"), which would otherwise make
+    every miss look unique. Whitespace is collapsed and the result truncated,
+    so trivial differences do not matter.
+    """
+    cleaned = (text or "").replace(word, "")
+    return " ".join(cleaned.split())[:300]
+
+
 def calibrate(target, ctx, timeout, headers):
-    """Learn what a miss looks like, so soft-404s can be filtered out."""
+    """Learn what a miss looks like, so soft-404s can be filtered out.
+
+    This compares the body, not its length. Bucketing by length (//64) put a
+    36-byte "not found" page and an 8-byte real response in the same bucket
+    and silently discarded a live endpoint — a false negative, which on an
+    engagement is far worse than a little noise.
+    """
     signatures = set()
     for probe in ("cb-probe-zzz-404", "cb-probe-does-not-exist-9821"):
-        status, text, _, length = request(f"{target.rstrip('/')}/{probe}", ctx, timeout,
-                                          headers=headers)
+        status, text, _, _ = request(f"{target.rstrip('/')}/{probe}", ctx, timeout,
+                                     headers=headers)
         if status:
-            signatures.add((status, length // 64))
+            signatures.add((status, _body_signature(text, probe)))
     return signatures
 
 
@@ -253,29 +282,47 @@ def fuzz_paths(target, words, ctx, timeout, threads, headers, signatures):
     hits = []
     total = len(words)
     done = 0
+    last_drawn = 0.0
 
     def check(word):
         url = f"{base}/{word}"
-        status, _, content_type, length = request(url, ctx, timeout, headers=headers)
+        status, text, content_type, length = request(url, ctx, timeout, headers=headers)
         if status is None:
             return None
         if status == 404:
             return None
-        if (status, length // 64) in signatures:
-            return None   # soft-404
+        if (status, _body_signature(text, word)) in signatures:
+            return None   # soft-404: same status, same body as a known miss
         return {"url": url, "status": status, "length": length,
                 "content_type": content_type.split(";")[0]}
+
+    def draw_progress(force=False):
+        """Redraw the counter on the current line, a few times a second."""
+        nonlocal last_drawn
+        now = time.monotonic()
+        if not force and now - last_drawn < PROGRESS_INTERVAL:
+            return
+        last_drawn = now
+        percent = (done * 100 // total) if total else 100
+        print(f"\r{DIM}    {percent:3d}%  {done}/{total} paths tested, "
+              f"{len(hits)} hit(s){RESET}   ", end="", flush=True)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as pool:
         for result in pool.map(check, words):
             done += 1
-            if done % 500 == 0:
-                print(f"    … {done}/{total} paths tested, {len(hits)} hit(s)")
+            draw_progress()
             if result:
                 hits.append(result)
                 colour = GREEN if 200 <= result["status"] < 300 else YELLOW
+                # Wipe the counter first so it can never end up spliced into
+                # the finding that follows it.
+                clear_line()
                 print(f"  {colour}[{result['status']}]{RESET} {result['url']} "
-                      f"{DIM}({result['length']} bytes, {result['content_type']}){RESET}")
+                      f"{DIM}({result['length']} bytes, {result['content_type']}){RESET}",
+                      flush=True)
+                last_drawn = 0.0
+    draw_progress(force=True)
+    print(flush=True)
     return hits
 
 
@@ -291,7 +338,9 @@ def fuzz_verbs(hits, ctx, timeout, headers, limit):
     if not targets:
         return interesting
     print(f"\n{BOLD}{CYAN}[*] Verb fuzzing {len(targets)} endpoint(s){RESET}")
-    for hit in targets:
+    for index, hit in enumerate(targets, 1):
+        print(f"\r{DIM}    {index}/{len(targets)} endpoints{RESET}   ",
+              end="", flush=True)
         baseline = hit["status"]
         row = {"url": hit["url"], "GET": baseline}
         notable = False
@@ -308,8 +357,10 @@ def fuzz_verbs(hits, ctx, timeout, headers, limit):
         if notable:
             interesting.append(row)
             allowed = ", ".join(f"{v}={row[v]}" for v in VERBS if row.get(v))
+            clear_line()
             print(f"  {RED}[!]{RESET} {hit['url']} — GET {baseline} but succeeds on "
-                  f"another method  {DIM}({allowed}){RESET}")
+                  f"another method  {DIM}({allowed}){RESET}", flush=True)
+    clear_line()
     if not interesting:
         print(f"{DIM}    No method asymmetries found.{RESET}")
     return interesting

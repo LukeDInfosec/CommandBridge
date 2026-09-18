@@ -54,6 +54,10 @@ RESET = "\033[0m"
 #: friends often answer with 503/403 plus a Retry-After rather than 429.
 THROTTLE_CODES = {429, 503}
 
+#: Progress is redrawn in place at most this often, rather than adding a line
+#: every 25 requests — a burst should occupy one updating line, not six.
+PROGRESS_INTERVAL = 0.2
+
 
 def build_context(insecure: bool = True):
     if not insecure:
@@ -162,13 +166,14 @@ def main() -> int:
         print("[i] Fix connectivity or the request itself before testing rate limiting.")
         return 1
 
+    # Kept aside because the burst loop below rebinds `status` — quoting the
+    # last burst response as the baseline made the report contradict itself.
     baseline_status = status
     print(f"    HTTP {baseline_status} in {elapsed * 1000:.0f}ms")
     baseline_ok = 200 <= (baseline_status or 0) < 400
     if not baseline_ok:
         if baseline_status in THROTTLE_CODES:
-            print(f"{YELLOW}[!] The very first request was throttled (HTTP {baseline_status})."
-                  f"{RESET}")
+            print(f"{YELLOW}[!] The very first request was throttled (HTTP {baseline_status}).{RESET}")
             print("[i] Either a limiter is already engaged from earlier testing, or this "
                   "endpoint throttles aggressively. Wait for the window to reset and re-run.")
             return 0
@@ -202,12 +207,18 @@ def main() -> int:
                 time.sleep(args.delay)
             futures[pool.submit(send_once, request, args.timeout, ctx)] = index
         done = 0
+        last_drawn = 0.0
         for future in concurrent.futures.as_completed(futures):
             index = futures[future]
             status, elapsed, retry_after, error = future.result()
             done += 1
-            if done % 25 == 0:
-                print(f"    … {done}/{args.requests} sent")
+            # Redrawn in place with a carriage return rather than one line per
+            # 25 requests.
+            now = time.monotonic()
+            if now - last_drawn >= PROGRESS_INTERVAL or done == args.requests:
+                last_drawn = now
+                print(f"\r{DIM}    {done}/{args.requests} sent{RESET}   ",
+                      end="", flush=True)
             latencies.append(elapsed)
             if error:
                 errors.append(error)
@@ -217,6 +228,7 @@ def main() -> int:
                 retry_after_values.append(retry_after)
             if status in THROTTLE_CODES and (first_throttled_at is None or index < first_throttled_at):
                 first_throttled_at = index
+    print(flush=True)
     duration = time.monotonic() - start_time
 
     # ── Report ───────────────────────────────────────────────────────────
