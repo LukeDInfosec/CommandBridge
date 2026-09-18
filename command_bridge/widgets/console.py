@@ -104,27 +104,72 @@ class EnhancedConsole(QTextEdit):
         except Exception:
             self._auto_scroll = True
 
+    #: Longest partial escape sequence worth holding back before giving up and
+    #: printing it — a real one is a handful of bytes, so anything longer is
+    #: not an escape and should not be buffered indefinitely.
+    _MAX_ANSI_TAIL = 16
+
     def append_ansi(self, text):
-        """Append text with ANSI color code support and smart formatting."""
+        """Append text with ANSI colour support and carriage-return handling."""
         ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+
+        # Output arrives in whatever sized chunks the pipe delivers, so an
+        # escape sequence can be split down the middle. Half a sequence does
+        # not match the pattern above and would be printed as literal "[0m"
+        # rubbish, so an unterminated tail is held back until the rest arrives.
+        tail = getattr(self, '_ansi_tail', '')
+        if tail:
+            text = tail + text
+            self._ansi_tail = ''
+        partial = re.search(r'\x1B\[[0-9;]*$|\x1B$', text)
+        if partial and len(text) - partial.start() <= self._MAX_ANSI_TAIL:
+            self._ansi_tail = text[partial.start():]
+            text = text[:partial.start()]
+            if not text:
+                return
+
         clean_text = ansi_escape.sub('', text)
 
-        colored_text = self._apply_feroxbuster_colors(clean_text)
-
-        cursor = self.textCursor()
-        cursor.movePosition(cursor.MoveOperation.End)
-
-        if colored_text != clean_text:
-            cursor.insertHtml(colored_text)
+        # A lone \r means "go back to the start of this line" — it is how every
+        # command-line tool draws a progress counter in place. Rewriting it to
+        # \n turned one updating line into hundreds of stacked ones, which
+        # buried the actual findings. Progress output is never worth colouring,
+        # so CR text takes the plain path.
+        if '\r' in clean_text.replace('\r\n', '\n'):
+            self._append_with_carriage_returns(clean_text)
         else:
-            normalized = clean_text.replace('\r\n', '\n').replace('\r', '\n')
-            cursor.insertText(normalized)
-
-        self.setTextCursor(cursor)
+            colored_text = self._apply_feroxbuster_colors(clean_text)
+            cursor = self.textCursor()
+            cursor.movePosition(cursor.MoveOperation.End)
+            if colored_text != clean_text:
+                cursor.insertHtml(colored_text)
+            else:
+                cursor.insertText(clean_text.replace('\r\n', '\n'))
+            self.setTextCursor(cursor)
 
         scrollbar = self.verticalScrollBar()
         if getattr(self, "_auto_scroll", True):
             scrollbar.setValue(scrollbar.maximum())
+
+    def _append_with_carriage_returns(self, text: str):
+        """Insert text, treating each \r as a rewrite of the current line.
+
+        Splitting on \r gives the successive states of one line: the first
+        chunk is appended normally and every later chunk replaces whatever is
+        currently on the last line, which is what a terminal does.
+        """
+        cursor = self.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+
+        chunks = text.replace('\r\n', '\n').split('\r')
+        cursor.insertText(chunks[0])
+        for chunk in chunks[1:]:
+            cursor.movePosition(cursor.MoveOperation.End)
+            cursor.movePosition(cursor.MoveOperation.StartOfBlock,
+                                cursor.MoveMode.KeepAnchor)
+            cursor.removeSelectedText()
+            cursor.insertText(chunk)
+        self.setTextCursor(cursor)
 
     def _apply_feroxbuster_colors(self, text):
         """Apply color formatting to tool output lines."""
@@ -363,6 +408,12 @@ class EnhancedConsole(QTextEdit):
             changed = True
 
         result = ''.join(formatted_lines)
+        # Every line gets a trailing <br>, which is right when the text ends on
+        # a newline. When it does not — a chunk that arrived split mid-line,
+        # which QProcess does constantly — that extra break cuts a word in two
+        # and the rest lands on the next line.
+        if result.endswith('<br>') and not text_norm.endswith('\n'):
+            result = result[:-4]
         if changed:
             return result
         return text
