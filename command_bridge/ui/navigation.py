@@ -25,7 +25,9 @@ without hunting for magic numbers.
 from __future__ import annotations
 
 from PyQt6 import QtGui
-from PyQt6.QtCore import Qt, QVariantAnimation, QEasingCurve, QSize, QTimer
+from PyQt6.QtCore import (
+    Qt, QVariantAnimation, QEasingCurve, QSize, QTimer, QObject, QEvent,
+)
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QTabWidget, QFrame, QComboBox, QSizePolicy,
@@ -64,6 +66,35 @@ _SAFE_BUILD_ORDER = [
 # out the theme picker and window controls sitting to its right.
 TARGET_PILL_MIN_WIDTH = 200
 TARGET_PILL_MAX_WIDTH = 620
+
+# Slack added to the measured text width. Font metrics describe where the pen
+# lands, not where the ink stops: an italic or a glyph with a right side
+# bearing can paint a pixel or two past its own advance, and a fractional
+# device pixel ratio rounds the label's usable width down. Without this the
+# final character of a target loses its right-hand edge.
+TARGET_PILL_TEXT_PAD = 10
+
+
+class _HeaderFitWatcher(QObject):
+    """Re-sizes the header target chip when the window is shown or resized.
+
+    This has to be a standalone filter object rather than a ``showEvent`` /
+    ``resizeEvent`` on the mixin: ``QMainWindow`` sits ahead of every mixin in
+    the MRO, so a handler defined on one would simply never be called.
+    """
+
+    def __init__(self, window):
+        super().__init__(window)
+        self._window = window
+
+    def eventFilter(self, obj, event):
+        if event.type() in (QEvent.Type.Show, QEvent.Type.Resize,
+                            QEvent.Type.FontChange, QEvent.Type.StyleChange):
+            try:
+                self._window.refit_target_pill()
+            except Exception:
+                pass
+        return False
 
 # Status states → (palette role, status text)
 _STATUS_STATES = {
@@ -249,6 +280,7 @@ class NavigationMixin:
         label.setObjectName("targetPillLabel")
         label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         text_col.addWidget(label)
+        self._target_pill_caption = label
 
         self.target_pill_value = QLabel("not set")
         self.target_pill_value.setObjectName("targetPillValue")
@@ -258,6 +290,16 @@ class NavigationMixin:
 
         inner.addLayout(text_col)
         self._target_pill = pill
+        self._target_pill_text = "not set"
+
+        # Show and resize both change what will fit, and the first of them
+        # arrives after the stylesheet has been applied — which is the point at
+        # which the chip can finally be measured in the font it will be painted
+        # in rather than the application default.
+        if getattr(self, "_header_fit_watcher", None) is None:
+            self._header_fit_watcher = _HeaderFitWatcher(self)
+            self.installEventFilter(self._header_fit_watcher)
+
         return pill
 
     def update_target_display(self, target: str = None):
@@ -272,6 +314,10 @@ class NavigationMixin:
         value = (target if target is not None else getattr(self, "target", "")) or ""
         value = value.strip()
         shown = value if value else "not set"
+
+        # Kept unabbreviated: every later re-fit measures this, never whatever
+        # elided form happens to be on the label at the time.
+        self._target_pill_text = shown
 
         if hasattr(self, "target_pill_value"):
             self.target_pill_value.setText(shown)
@@ -289,6 +335,37 @@ class NavigationMixin:
             # it always carries the untruncated value.
             self._status_target.setText(shown)
 
+    def refit_target_pill(self):
+        """Re-measure the chip against the text it is actually showing.
+
+        Called on show, on resize and after a theme change, because all three
+        move the goalposts: the stylesheet gives the value label a monospace
+        font that is wider than the application default, and the chip's ceiling
+        scales with the window. Sizing it once during construction — before any
+        stylesheet exists — is what used to leave the last character clipped.
+        """
+        if getattr(self, "_target_pill", None) is None:
+            return
+        self._fit_target_pill(getattr(self, "_target_pill_text", "") or "not set")
+
+    def _text_width(self, label, text: str) -> int:
+        """Width of ``text`` in the font the label will really be painted in."""
+        if label is None or not text:
+            return 0
+        try:
+            # Resolve the stylesheet font first; an unpolished widget still
+            # reports the application default, which is narrower than the
+            # monospace face the chip ends up using.
+            label.ensurePolished()
+            metrics = QtGui.QFontMetrics(label.font())
+            # boundingRect covers ink that spills past the advance width;
+            # horizontalAdvance covers the reverse case. Take whichever is
+            # larger so neither kind of glyph gets shaved.
+            return max(metrics.horizontalAdvance(text),
+                       metrics.boundingRect(text).right() + 1)
+        except Exception:
+            return 0
+
     def _fit_target_pill(self, text: str):
         """Size the header chip to its contents, up to a sane ceiling."""
         pill = getattr(self, "_target_pill", None)
@@ -296,16 +373,14 @@ class NavigationMixin:
         if pill is None or label is None:
             return
 
-        metrics = label.fontMetrics()
-        caption_width = 0
-        try:
-            caption_width = metrics.horizontalAdvance("TARGET")
-        except Exception:
-            pass
+        caption = getattr(self, "_target_pill_caption", None)
+        # The caption is styled separately, so it must be measured in its own
+        # font rather than the value's.
+        caption_width = self._text_width(caption, "TARGET")
 
         # icon + layout margins + spacing around the text column
-        chrome = 12 + 14 + 9 + 14 + 6
-        needed = max(metrics.horizontalAdvance(text), caption_width) + chrome
+        chrome = 12 + 14 + 9 + 14 + 6 + TARGET_PILL_TEXT_PAD
+        needed = max(self._text_width(label, text), caption_width) + chrome
 
         # Scale the ceiling with the window so the chip can take more room on a
         # wide screen without ever squeezing the controls on a narrow one.
@@ -316,8 +391,18 @@ class NavigationMixin:
         if needed > ceiling:
             # Only now do we shorten, and from the middle so both the scheme
             # and the host stay readable.
-            available = ceiling - chrome
-            label.setText(metrics.elidedText(text, Qt.TextElideMode.ElideMiddle, available))
+            available = max(0, ceiling - chrome)
+            try:
+                label.ensurePolished()
+                metrics = QtGui.QFontMetrics(label.font())
+                label.setText(
+                    metrics.elidedText(text, Qt.TextElideMode.ElideMiddle, available)
+                )
+            except Exception:
+                pass
+        elif label.text() != text:
+            # Undo an earlier elision now that the full value fits again.
+            label.setText(text)
 
     def _on_theme_selected(self, name: str):
         if name and name != getattr(self, "current_theme", None):
@@ -356,6 +441,10 @@ class NavigationMixin:
             self.theme_combo.blockSignals(True)
             self.theme_combo.setCurrentText(self.current_theme)
             self.theme_combo.blockSignals(False)
+
+        # A new stylesheet can mean a new font on the chip, so re-measure it —
+        # once the style has actually been applied, not in the middle of it.
+        QTimer.singleShot(0, self.refit_target_pill)
 
     # ══════════════════════════════════════════════════════════════════════════
     #  NAVIGATION RAIL
