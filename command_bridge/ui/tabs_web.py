@@ -379,6 +379,12 @@ class WebTabMixin:
         # Use a small wrapper so any exceptions in the workflow are surfaced
         # to the console / user instead of failing silently.
         self.sqlmap_http_btn.clicked.connect(self.handle_sqlmap_http_click)
+        self.sqlmap_http_btn.setToolTip(
+            "Left-click: the full extensive run — every technique, every "
+            "parameter. Thorough, and slow.\n"
+            "Right-click: a fast confirmation scan, or build your own with "
+            "the depth, enumeration and target parameter you choose."
+        )
         self.sqlmap_http_btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.sqlmap_http_btn.customContextMenuRequested.connect(self.show_sqlmap_http_menu)
         sql_layout.addWidget(self.sqlmap_http_btn)
