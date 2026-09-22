@@ -216,6 +216,32 @@ class SqlmapMixin:
             extra_flags = "--dbs --current-user --current-db --is-dba --hostname --banner"
             outdir = "{SAFE_TARGET}_sqlmap_http_extensive"
 
+        # The quick profiles exist to answer one question fast; stopping to ask
+        # for a level and a risk on the way there defeats the point.
+        if profile == "fast_confirm":
+            from command_bridge.modules import sqlmap_builder as _builder
+
+            fast = _builder.SPEED_PROFILES["fast"]
+            template = _builder.build_command({
+                "profile": "fast",
+                "level": fast["level"],
+                "risk": fast["risk"],
+                "threads": fast["threads"],
+                "techniques": fast["techniques"],
+                "smart": fast["smart"],
+                "request_file": "sql.txt",
+                "output_dir": _builder.default_output_dir("fast"),
+                "force_ssl": _builder.request_is_https(request_text, self.target),
+                "extra": list(fast["extra"]),
+            })
+            found = _builder.extract_parameters(request_text)
+            self.console.append_ansi(
+                f"[i] Fast confirmation scan — {len(found)} parameter(s) in the "
+                "request, no enumeration, no time-based payloads.\n"
+            )
+            self.run_command_template(template, label="SQLMap fast confirmation scan")
+            return
+
         # Allow user to override level/risk interactively after choosing profile
         try:
             from PyQt6.QtWidgets import QInputDialog
@@ -257,6 +283,97 @@ class SqlmapMixin:
         template = base + opts
         self.run_command_template(template)
 
+    # ── Custom scan builder ───────────────────────────────────────────────
+
+    def _sqlmap_builder_settings_path(self):
+        """Where the builder's last settings live."""
+        return Path.home() / ".config" / "CommandBridge" / "sqlmap_builder.json"
+
+    def _load_sqlmap_builder_settings(self) -> dict:
+        try:
+            path = self._sqlmap_builder_settings_path()
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            # Corrupt settings are not worth a dialog; fall back to defaults.
+            pass
+        return {}
+
+    def _save_sqlmap_builder_settings(self, settings: dict):
+        try:
+            path = self._sqlmap_builder_settings_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+        except Exception as e:
+            self.console.append_ansi(
+                f"[i] Could not save SQLMap builder settings: {e}\n"
+            )
+
+    def open_sqlmap_builder(self):
+        """Open the build-your-own-scan dialog for the pasted HTTP request.
+
+        Everything the dialog needs is on screen at once: the request, the
+        options, and the command they produce. Nothing runs until the command
+        in the preview is the one you want.
+        """
+        from command_bridge.modules.sqlmap_builder import SqlmapBuilderDialog
+        from PyQt6.QtWidgets import QDialog
+
+        if not self.target:
+            self.show_themed_message(
+                "No Target",
+                "Please set a target first in the Target Setup tab.",
+                QMessageBox.Icon.Warning,
+            )
+            return
+
+        # Start from the last request that was scanned, so a second pass with
+        # different options does not mean pasting it again.
+        existing = ""
+        try:
+            sql_path = Path(self.output_dir) / "sql.txt"
+            if sql_path.exists():
+                existing = sql_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            existing = ""
+
+        dialog = SqlmapBuilderDialog(
+            self,
+            request_text=existing,
+            target=self.target,
+            remembered=self._load_sqlmap_builder_settings(),
+        )
+        self.apply_theme_to_dialog(dialog)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        request_text = dialog.request_text()
+        if not request_text:
+            self.show_themed_message("No Request", "You must paste a full HTTP request.")
+            return
+
+        command = dialog.command_text()
+        if not command:
+            self.show_themed_message("No Command", "The command is empty — nothing to run.")
+            return
+
+        try:
+            sql_path = Path(self.output_dir) / "sql.txt"
+            sql_path.write_text(request_text + "\n", encoding="utf-8", errors="replace")
+            self.console.append_ansi(f"[i] Saved HTTP request to {sql_path}\n")
+            self.refresh_file_list()
+        except Exception as e:
+            self.show_themed_message(
+                "Error", f"Could not write sql.txt: {e}", QMessageBox.Icon.Critical
+            )
+            return
+
+        self._save_sqlmap_builder_settings(dialog.remembered())
+        self.run_command_template(command, label="SQLMap custom scan")
+
     def show_sqlmap_http_menu(self, pos):
         """Right-click menu for the Extensive SQLMap (HTTP Request) button.
 
@@ -272,6 +389,28 @@ class SqlmapMixin:
             self.apply_theme_to_menu(menu)
 
             actions: dict[object, str] = {}
+
+            # The two entries that answer "is it injectable" without committing
+            # to an exhaustive run. They sit first because they are what you
+            # want on a first pass.
+            hdr_build = menu.addAction("Build the scan")
+            hdr_build.setEnabled(False)
+
+            a_fast = menu.addAction("   ⚡ Fast Confirmation Scan (no enumeration)")
+            a_fast.setToolTip(
+                "Level 1, risk 1, boolean/error/union only, ten threads. Skips "
+                "time-based payloads and every enumeration flag — it answers "
+                "whether the request is injectable, nothing more."
+            )
+            actions[a_fast] = "fast_confirm"
+
+            a_custom = menu.addAction("   ⚙ Custom Scan — choose the options…")
+            a_custom.setToolTip(
+                "Pick the depth, tick what to collect, and target one "
+                "parameter instead of all of them. Shows the command it builds."
+            )
+
+            menu.addSeparator()
 
             # QUICK CHECKS (low-impact, time-boxed)
             hdr_quick = menu.addAction("Quick Checks (Low-Impact / Time-Boxed)")
@@ -362,6 +501,9 @@ class SqlmapMixin:
             actions[a_curr_info] = "current_info"
 
             action = menu.exec(self.sqlmap_http_btn.mapToGlobal(pos))
+            if action is a_custom:
+                self.open_sqlmap_builder()
+                return
             if action and action in actions:
                 profile = actions[action]
                 self.run_sqlmap_from_http_request(profile)
