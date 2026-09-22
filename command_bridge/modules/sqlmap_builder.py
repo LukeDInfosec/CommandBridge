@@ -633,10 +633,28 @@ class SqlmapBuilderDialog(QDialog):
         scroll.setWidget(inner)
         return scroll
 
-    def _group_speed(self) -> QGroupBox:
-        box = QGroupBox("2 · How hard to look")
+    @staticmethod
+    def _card(title: str):
+        """A group box that matches the cards in the main window.
+
+        The shared stylesheet paints a #card's title *inside* its top edge
+        rather than on the border, so the content needs a top margin to clear
+        it — without one the first control is drawn straight over the heading.
+        These are the same margins CardsMixin.create_card uses, for the same
+        reason. The '&&' escape is Qt's: a lone '&' in a group box title is
+        read as a mnemonic and swallowed.
+        """
+        box = QGroupBox(title.upper().replace("&", "&&"))
         box.setObjectName("card")
+        box.setFlat(True)
+        box.setProperty("ampCount", title.count("&"))
         layout = QVBoxLayout(box)
+        layout.setContentsMargins(20, 46, 20, 20)
+        layout.setSpacing(12)
+        return box, layout
+
+    def _group_speed(self) -> QGroupBox:
+        box, layout = self._card("2 · How hard to look")
 
         self.profile_group = QButtonGroup(self)
         self._profile_buttons = {}
@@ -701,9 +719,7 @@ class SqlmapBuilderDialog(QDialog):
         return box
 
     def _group_params(self) -> QGroupBox:
-        box = QGroupBox("3 · Which parameters")
-        box.setObjectName("card")
-        layout = QVBoxLayout(box)
+        box, layout = self._card("3 · Which parameters")
 
         self.param_mode = QButtonGroup(self)
         self.mode_all = QRadioButton("Test every parameter in the request")
@@ -737,9 +753,7 @@ class SqlmapBuilderDialog(QDialog):
         return box
 
     def _group_enum(self) -> QGroupBox:
-        box = QGroupBox("4 · What to collect once something is found")
-        box.setObjectName("card")
-        layout = QVBoxLayout(box)
+        box, layout = self._card("4 · What to collect once something is found")
 
         note = QLabel(
             "None of this runs unless an injection is confirmed. The first "
@@ -762,9 +776,10 @@ class SqlmapBuilderDialog(QDialog):
         return box
 
     def _group_hints(self) -> QGroupBox:
-        box = QGroupBox("5 · Target hints")
-        box.setObjectName("card")
-        form = QFormLayout(box)
+        box, layout = self._card("5 · Target hints")
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        layout.addLayout(form)
 
         self.dbms_combo = QComboBox()
         for value, label in DBMS_CHOICES:
@@ -804,16 +819,14 @@ class SqlmapBuilderDialog(QDialog):
         self.flush_check.toggled.connect(self._refresh)
         form.addRow("", self.flush_check)
 
-        proxy_row = QHBoxLayout()
+        # The checkbox is the row's own label rather than a wrapper widget:
+        # a plain QWidget here picks up the card's panel styling and reads as
+        # a stray box drawn around the proxy field.
         self.proxy_check = QCheckBox("Through a proxy")
         self.proxy_check.toggled.connect(self._refresh)
-        proxy_row.addWidget(self.proxy_check)
         self.proxy_edit = QLineEdit("http://127.0.0.1:8080")
         self.proxy_edit.textChanged.connect(self._refresh)
-        proxy_row.addWidget(self.proxy_edit, 1)
-        holder = QWidget()
-        holder.setLayout(proxy_row)
-        form.addRow("", holder)
+        form.addRow(self.proxy_check, self.proxy_edit)
 
         return box
 
