@@ -7,21 +7,30 @@ Two phases, run in a background QThread so the UI never blocks:
             <script src> and inline .js references, resolve them to absolute
             URLs, and write the unique list to identified_js.txt.
 
-  Phase 2 — Download each JS file and statically analyse it for the 25 finding
-            categories (secrets, credentials, endpoints, source maps, DOM-XSS
-            sinks, cloud storage, GraphQL/WebSocket, JWT logic, etc.). Findings
-            are written to js_analysis_results.txt and printed (colour-coded by
-            severity) to the console, followed by a summary block.
+  Phase 2 — Download each JS file, fetch its source map when one is served,
+            and run the rule engine in js_findings over it. Findings are
+            written to js_analysis_results.txt and printed to the console
+            grouped by category, followed by a summary block.
 
-Wired into CommandBridgeV4 via JsAnalysisMixin. Stdlib only (urllib/ssl/re).
+This module owns the network and the presentation; every detection rule lives
+in js_findings, which has no Qt and no I/O and can therefore be tested on its
+own. The split matters because the rules are where the accuracy lives.
+
+Fetching the source map is done here rather than there because it takes a
+request. It is worth making: with a map, a finding in a one-line bundle is
+reported as "src/admin/Billing.tsx line 142" instead of an offset, and matches
+inside node_modules can be demoted rather than shown to a client.
+
+Wired into CommandBridgeV5 via JsAnalysisMixin. Stdlib only (urllib/ssl/re).
 """
 import os
 import re
 import ssl
 import html
+import base64
 from pathlib import Path
 from urllib import request as _urlrequest
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, unquote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
@@ -29,68 +38,20 @@ from PyQt6.QtWidgets import QMessageBox
 
 
 # ── Severity model ──────────────────────────────────────────────────────────
-SEV_ORDER = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0}
+from command_bridge.modules.js_findings import (
+    SEV_ORDER, CATEGORY_GUIDANCE, SourceMap, analyse as analyse_javascript,
+    merge_findings, is_minified,
+)
+
 SEV_COLORS = {
     "CRITICAL": "#ef4444", "HIGH": "#f97316", "MEDIUM": "#f59e0b",
     "LOW": "#38bdf8", "INFO": "#94a3b8",
 }
 
-# Per-category exploitation / verification guidance — how an attacker would use
-# the finding and how to prove (or disprove) impact for a report.
-CATEGORY_GUIDANCE = {
-    "Exposed Secret": "Treat as live until disproven. PoC: use the key against its API "
-        "(Google key -> call a billable API; AWS AKIA -> `aws sts get-caller-identity`; "
-        "Stripe sk_live -> `curl https://api.stripe.com/v1/balance -u <key>:`). Report the "
-        "location + a benign authenticated call succeeding. Remediation: rotate + restrict.",
-    "Hardcoded Credential": "Try the credential against the login/API it belongs to; screenshot a "
-        "successful low-impact action. If it is a DB/connection string, note it is reachable from "
-        "client code. Remediation: remove from client, rotate.",
-    "Potential DOM XSS Sink": "Trace the sink's input back to a source (location.hash/search, "
-        "postMessage, URL param, localStorage). If attacker-controllable, build a URL that reaches "
-        "it. PoC: innerHTML -> `#<img src=x onerror=alert(document.domain)>`; eval/new Function -> "
-        "inject an expression. Prove with alert(document.domain) and screenshot. If the source is "
-        "NOT attacker-controlled, document why it is not exploitable.",
-    "Client-Side Authorization Logic": "JS-side authz is bypassable. PoC: call the protected API "
-        "directly in Burp as a low-priv user (or flip the flag in devtools) and show the server "
-        "still returns the privileged data/action. If the server re-checks, mark as defence-in-depth.",
-    "Sensitive Browser Storage": "Tokens in local/sessionStorage are readable by any XSS. PoC if an "
-        "XSS exists: `fetch('//collab?c='+localStorage.getItem('token'))`. Otherwise document as an "
-        "XSS impact amplifier; recommend HttpOnly cookies.",
-    "Source Map": "If the .map returned 200, download and reconstruct source. PoC: `curl -s <url>.map` "
-        "and show it reveals server comments/logic/secrets. Remediation: remove maps from prod.",
-    "Potential Redirect Logic": "Check if the redirect target is user-controllable. PoC: supply an "
-        "external URL and confirm off-site navigation -> open redirect; include the exact param.",
-    "Potential SSRF Surface": "If the client-supplied URL is fetched server-side it is SSRF. Pivot to "
-        "Burp, replace with a collaborator or http://169.254.169.254/ and confirm interaction.",
-    "Weak Cryptography": "Only a weakness if used for security (password hashing, token signing, "
-        "integrity). Verify the use; PoC = predictable/forgeable output. Non-security use = informational.",
-    "Cloud Storage Reference": "Test the bucket for public read/list. PoC: `curl <bucket-url>` or "
-        "`aws s3 ls s3://<bucket> --no-sign-request`; screenshot any listing/sensitive object.",
-    "CORS Implementation": "credentials:'include' + a reflected/permissive ACAO is exploitable. PoC: "
-        "from an attacker origin fetch the endpoint with credentials and read the response.",
-    "Sensitive Comment": "Read for leaked endpoints, creds, bypass flags or security TODOs; test "
-        "whatever it reveals and quote it in the report.",
-    "Environment Disclosure": "Test whether the staging/dev/internal host is reachable and less "
-        "hardened. PoC: connect and show it serves the app (often weaker auth).",
-    "Internal IP Reference": "Aids network mapping / SSRF targeting; document the range. Not directly "
-        "exploitable alone.",
-    "Feature Flag / Hidden Functionality": "Flip the flag (devtools/request param) and see if hidden/"
-        "admin features activate without server enforcement.",
-    "File Upload Implementation": "Client validation is bypassable — test server-side checks via Burp "
-        "(see the Web tab File Upload Testing lab). PoC: upload a disallowed type and retrieve/run it.",
-    "WebSocket Usage": "Test handshake auth, Origin checks and per-message authorisation. PoC: connect "
-        "from an attacker origin or replay another user's messages.",
-    "GraphQL Usage": "Test introspection, IDOR via id args, and unauthorised mutations. PoC: run "
-        "`{ __schema { types { name } } }` then request another user's object by id.",
-    "JWT Implementation": "Decode alg/claims; test alg=none, signature stripping, weak HMAC secret and "
-        "whether access control trusts client-visible claims. PoC: forge a claim and show acceptance.",
-    "Third-Party Service": "Check for leaked project keys (Firebase/Sentry DSN) and misconfig. PoC e.g. "
-        "`curl https://<project>.firebaseio.com/.json` for an open Firebase DB.",
-    "Sensitive Endpoint": "Request directly with/without auth and as a low-priv user (use the Request "
-        "Analysis tab). PoC: show it returns data/functions it should not (BOLA/BFLA).",
-    "Debug/Dev Artifact": "Debug code can leak data (console.log of tokens/PII) or enable debug modes. "
-        "Check console output and debug=true behaviour; quote any leak. Usually low severity.",
-    "CORS Reference": "",
+CONFIDENCE_NOTE = {
+    "confirmed": "confirmed by an offline check (checksum, decode or structure)",
+    "firm": "pattern and context both matched",
+    "tentative": "needs manual confirmation before it goes in a report",
 }
 
 _UA = "Mozilla/5.0 (CommandBridge JS-Recon)"
@@ -100,68 +61,43 @@ MAX_JS_FILES = 250      # cap on JS files analysed
 MAX_JS_BYTES = 3_000_000
 
 # ── Precompiled detection patterns ──────────────────────────────────────────
-SECRET_RULES = [
-    ("Google API Key", re.compile(r"AIza[0-9A-Za-z\-_]{35}"), "HIGH"),
-    ("AWS Access Key ID", re.compile(r"AKIA[0-9A-Z]{16}"), "HIGH"),
-    ("Stripe Secret Key", re.compile(r"sk_live_[0-9A-Za-z]{10,}"), "CRITICAL"),
-    ("Stripe Publishable Key", re.compile(r"pk_live_[0-9A-Za-z]{10,}"), "MEDIUM"),
-    ("GitHub Token", re.compile(r"gh[pousr]_[0-9A-Za-z]{20,}"), "HIGH"),
-    ("Slack Token", re.compile(r"xox[baprs]-[0-9A-Za-z\-]{10,}"), "HIGH"),
-    ("JWT Token", re.compile(r"eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}"), "HIGH"),
-    ("Private Key Block", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"), "CRITICAL"),
-    ("Generic Secret Assignment", re.compile(
-        r"(?i)(api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|"
-        r"secret[_-]?key|refresh[_-]?token|private[_-]?key|x-api-key)"
-        r"\s*[:=]\s*['\"][^'\"]{6,}['\"]"), "HIGH"),
-]
-
-CRED_RE = re.compile(
-    r"(?i)\b(password|passwd|pwd|db_pass|db_user|username|user|database|connectionString)\b"
-    r"\s*[:=]\s*['\"][^'\"]{3,}['\"]")
-CRED_CRITICAL = ("password", "passwd", "pwd", "db_pass")
-
-ENDPOINT_RE = re.compile(r"""['"](/[A-Za-z0-9_\-./]{1,120})['"]""")
-FULLURL_RE = re.compile(r"https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]{4,}")
-SENSITIVE_ENDPOINT_KW = ("/admin", "/administrator", "/api", "/internal", "/debug",
-                         "/test", "/staging", "/graphql", "/swagger", "/openapi",
-                         "/actuator", "/backup", "/config", "/private")
-ADMIN_ENDPOINT_KW = ("/admin", "/administrator", "/manage", "/wp-admin", "/actuator")
-
-ENV_RE = re.compile(r"(?i)(localhost|127\.0\.0\.1|0\.0\.0\.0|\bdev\.|\bstaging\.|\buat\.|\btest\.|\binternal\.|[a-z0-9-]+\.local\b)")
-SOURCEMAP_RE = re.compile(r"(?://[#@]\s*sourceMappingURL=(\S+))|([A-Za-z0-9_.\-/]+\.js\.map)")
-DEBUG_RE = re.compile(r"(?i)\b(console\.(log|debug|warn|info)|debugger|debug\s*=\s*true|isDebug|verbose\s*[:=]|devMode)\b")
-AUTHZ_RE = re.compile(r"""(?i)(isAdmin|role\s*===?\s*['"]admin['"]|user\.role|permissions\b|canDelete|canEdit|adminOnly)""")
-STORAGE_RE = re.compile(r"(?i)(localStorage\.setItem|sessionStorage\.setItem|document\.cookie\s*=|indexedDB)")
-XSS_RE = re.compile(r"(?i)(\.innerHTML\s*=|\.outerHTML\s*=|document\.write\s*\(|insertAdjacentHTML|(?<![A-Za-z0-9_])eval\s*\(|new\s+Function\s*\()")
-CORS_RE = re.compile(r"""(?i)(credentials\s*:\s*['"]include['"]|withCredentials|Access-Control-Allow-Origin|mode\s*:\s*['"]cors['"])""")
-CLOUD_RE = re.compile(r"(?i)([A-Za-z0-9.\-]*\.s3[.-][A-Za-z0-9.\-]*amazonaws\.com|s3\.amazonaws\.com[A-Za-z0-9./\-]*|storage\.googleapis\.com[A-Za-z0-9./\-]*|[A-Za-z0-9.\-]*\.blob\.core\.windows\.net|[A-Za-z0-9.\-]*\.firebaseio\.com|firebasestorage\.googleapis\.com[A-Za-z0-9./\-]*|[A-Za-z0-9.\-]*\.digitaloceanspaces\.com)")
-GRAPHQL_RE = re.compile(r"(?i)(/graphql|__schema|__typename|\bmutation\s+\w|\bquery\s+\w)")
-WS_RE = re.compile(r"(?i)(wss?://[A-Za-z0-9._:/?#\-]+|new\s+WebSocket\s*\()")
-COMMENT_RE = re.compile(r"(?i)\b(TODO|FIXME|HACK|XXX|TEMP|BYPASS|DISABLE\s*AUTH|REMOVE\s*BEFORE\s*PROD|PASSWORD|SECRET)\b")
-JWT_IMPL_RE = re.compile(r"(?i)(jwtDecode|decodeJwt|\bjwt\b|Authorization|Bearer|HS256|RS256)")
-FEATUREFLAG_RE = re.compile(r"(?i)(featureFlag|enableAdmin|disabledFeature|experimental|\bbeta\b|hidden\s*[:=]|flags\s*[:=])")
-UPLOAD_RE = re.compile(r"(?i)(multipart/form-data|allowedExtensions|maxFileSize|\.upload\b|file\.type|accept\s*=)")
-INTERNAL_IP_RE = re.compile(r"\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})\b")
-EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
-PARAM_RE = re.compile(r"(?i)\b(userId|accountId|admin|role|redirect|returnUrl|next|callback|token|user_id|account_id)\b\s*[:=]")
-REDIRECT_RE = re.compile(r"(?i)(window\.location\s*=|document\.location\s*=|redirect\s*=|returnUrl\s*=|next\s*=)")
-SSRF_RE = re.compile(r"(?i)(fetch\s*\(\s*[A-Za-z_]\w*\)|axios\.(get|post)\s*\(\s*[A-Za-z_]\w*|targetUrl|callbackUrl|webhook)")
-CRYPTO_RE = re.compile(r"(?i)(CryptoJS\.)?\b(MD5|SHA1|DES|RC4)\b")
-THIRD_PARTY = {
-    "Google Analytics": re.compile(r"(?i)(google-analytics\.com|googletagmanager\.com|gtag\()"),
-    "Firebase": re.compile(r"(?i)firebase"),
-    "Sentry": re.compile(r"(?i)(sentry\.io|Sentry\.init)"),
-    "Datadog": re.compile(r"(?i)(datadoghq|DD_RUM)"),
-    "Mixpanel": re.compile(r"(?i)mixpanel"),
-    "Segment": re.compile(r"(?i)(segment\.com|analytics\.track)"),
-    "Hotjar": re.compile(r"(?i)hotjar"),
-    "Intercom": re.compile(r"(?i)intercom"),
-    "New Relic": re.compile(r"(?i)(newrelic|NREUM)"),
-    "Amplitude": re.compile(r"(?i)amplitude"),
-}
 SCRIPT_SRC_RE = re.compile(r"""<script[^>]+src\s*=\s*['"]([^'"]+)['"]""", re.IGNORECASE)
 JS_REF_RE = re.compile(r"""['"]([^'"]+?\.js(?:\?[^'"]*)?)['"]""", re.IGNORECASE)
 HREF_RE = re.compile(r"""<a[^>]+href\s*=\s*['"]([^'"#]+)['"]""", re.IGNORECASE)
+SOURCEMAP_REF_RE = re.compile(r"//[#@]\s*sourceMappingURL=(\S+)")
+
+
+def _exposed_map_finding(js_url, content, offset, map_info, note):
+    """A source map that is actually served is a finding in its own right.
+
+    The detector in js_findings only sees the reference in the file; whether
+    the map is reachable takes a request, which is this module's job. So the
+    confirmed-exposure finding is built here, where the HTTP status is known.
+    """
+    from command_bridge.modules.js_findings import Finding, Location, excerpt
+
+    offset = max(0, offset)
+    finding = Finding(
+        severity="HIGH" if map_info.get("has_content") else "MEDIUM",
+        category="Source map exposed",
+        title=f"{map_info['url'].rsplit('/', 1)[-1]} is served (HTTP {map_info['status']})",
+        evidence=map_info["url"],
+        detail=f"Returned {note}.",
+        confidence="confirmed",
+        cwe="CWE-540",
+        rec=("Download it and reconstruct the original tree — unwebpack-sourcemap, "
+             "or `npx source-map-explorer` for a fast view of the module layout. "
+             "Then read it for admin components that are never linked, real "
+             "parameter names, the permission model, build-time environment "
+             "variables and original comments. Report the exposure itself, and "
+             "everything it leads to as separate findings."),
+        count=1,
+    )
+    finding.locations.append(Location(
+        file=js_url, line=1, column=1, offset=offset,
+        excerpt=excerpt(content, offset, min(len(content), offset + 60)),
+    ))
+    return finding
 
 
 def _ctx():
@@ -235,122 +171,68 @@ class _JsAnalysisWorker(QObject):
         return cleaned
 
     # ── Phase 2: analyse one JS file ────────────────────────────────────────
+    def _fetch_source_map(self, js_url, content, agg):
+        """Fetch the file's source map, if it declares one and it is served.
+
+        This is worth a request per file because it changes the quality of
+        everything downstream: with a map, a finding at "offset 418,902" can be
+        reported as "src/admin/Billing.tsx line 142", and matches inside
+        node_modules can be demoted instead of wasting the client's time.
+        """
+        m = SOURCEMAP_REF_RE.search(content)
+        if not m:
+            return None, None
+
+        ref = m.group(1).strip()
+        if ref.startswith("data:"):
+            # An inline map costs no request at all.
+            try:
+                payload = ref.split(",", 1)[1]
+                raw = base64.b64decode(payload).decode("utf-8", "replace") \
+                    if ";base64" in ref.split(",", 1)[0] else unquote(payload)
+                agg["sourcemaps"] = agg.get("sourcemaps", 0) + 1
+                return SourceMap(raw), {"url": ref[:60] + "…", "status": "inline"}
+            except Exception:
+                return None, {"url": ref[:60] + "…", "status": "inline (unreadable)"}
+
+        map_url = urljoin(js_url, ref)
+        status, _ct, body = self._get(map_url, max_bytes=MAX_JS_BYTES, timeout=12)
+        if status != 200 or not body:
+            return None, {"url": map_url, "status": status}
+        try:
+            source_map = SourceMap(body)
+        except Exception:
+            return None, {"url": map_url, "status": f"{status} (unparseable)"}
+
+        agg["sourcemaps"] = agg.get("sourcemaps", 0) + 1
+        agg.setdefault("sourcemap_urls", set()).add(map_url)
+        for source in source_map.sources:
+            if "node_modules" not in source:
+                agg.setdefault("original_sources", set()).add(source)
+        return source_map, {
+            "url": map_url,
+            "status": status,
+            "sources": len(source_map.sources),
+            "has_content": any(source_map.sources_content or []),
+        }
+
     def _analyse(self, url, content, agg):
-        findings = []
+        """Run the shared rule engine over one file and return its findings."""
+        source_map, map_info = self._fetch_source_map(url, content, agg)
+        findings = analyse_javascript(url, content, source_map=source_map, agg=agg)
 
-        def add(sev, category, line, match, rec=""):
-            findings.append({"severity": sev, "category": category, "file": url,
-                             "line": line, "match": match[:200], "rec": rec})
+        if map_info and map_info.get("status") in (200, "inline"):
+            first = content.find("sourceMappingURL")
+            scanner_note = (
+                f"{map_info['sources']} original source file(s)"
+                if map_info.get("sources") else "inline map")
+            if map_info.get("has_content"):
+                scanner_note += ", including the full original source text"
+            findings.append(_exposed_map_finding(url, content, first, map_info, scanner_note))
 
-        lines = content.split("\n")
-        for i, line in enumerate(lines, 1):
-            if len(line) > 5000:
-                line = line[:5000]
-
-            for name, rx, sev in SECRET_RULES:
-                m = rx.search(line)
-                if m:
-                    add(sev, "Exposed Secret", i, f"{name}: {m.group(0)}",
-                        "Verify if active; rotate and restrict the key.")
-                    agg["secrets"] += 1
-
-            m = CRED_RE.search(line)
-            if m:
-                key = m.group(1).lower()
-                sev = "CRITICAL" if key in CRED_CRITICAL else "HIGH"
-                add(sev, "Hardcoded Credential", i, m.group(0),
-                    "Remove credentials from client-side code.")
-                if sev == "CRITICAL":
-                    agg["creds"] += 1
-
-            if DEBUG_RE.search(line):
-                add("LOW", "Debug/Dev Artifact", i, DEBUG_RE.search(line).group(0))
-            if AUTHZ_RE.search(line):
-                add("MEDIUM", "Client-Side Authorization Logic", i, AUTHZ_RE.search(line).group(0),
-                    "Authorization must be enforced server-side.")
-            if STORAGE_RE.search(line):
-                add("MEDIUM", "Sensitive Browser Storage", i, STORAGE_RE.search(line).group(0))
-            if XSS_RE.search(line):
-                add("HIGH", "Potential DOM XSS Sink", i, XSS_RE.search(line).group(0).strip(),
-                    "Avoid passing untrusted input to this sink.")
-                agg["xss"] += 1
-            if CORS_RE.search(line):
-                add("INFO", "CORS Implementation", i, CORS_RE.search(line).group(0))
-            if REDIRECT_RE.search(line):
-                add("MEDIUM", "Potential Redirect Logic", i, REDIRECT_RE.search(line).group(0))
-            if SSRF_RE.search(line):
-                add("MEDIUM", "Potential SSRF Surface", i, SSRF_RE.search(line).group(0))
-            if CRYPTO_RE.search(line) and not re.search(r"(?i)sha1[0-9]", line):
-                add("MEDIUM", "Weak Cryptography", i, CRYPTO_RE.search(line).group(0))
-            m = COMMENT_RE.search(line)
-            if m and ("//" in line or "/*" in line or "*" == line.strip()[:1]):
-                add("LOW", "Sensitive Comment", i, line.strip()[:160])
-            for cm in CLOUD_RE.finditer(line):
-                add("MEDIUM", "Cloud Storage Reference", i, cm.group(0))
-                agg["cloud"] += 1
-            for em in EMAIL_RE.finditer(line):
-                agg["emails"].add(em.group(0))
-            for ip in INTERNAL_IP_RE.finditer(line):
-                add("LOW", "Internal IP Reference", i, ip.group(0))
-                agg["internal_ips"].add(ip.group(0))
-            if ENV_RE.search(line):
-                add("LOW", "Environment Disclosure", i, ENV_RE.search(line).group(0))
-            if FEATUREFLAG_RE.search(line):
-                add("LOW", "Feature Flag / Hidden Functionality", i, FEATUREFLAG_RE.search(line).group(0))
-                agg["flags"] += 1
-            if UPLOAD_RE.search(line):
-                add("MEDIUM", "File Upload Implementation", i, UPLOAD_RE.search(line).group(0),
-                    "Confirm server-side validation exists.")
-            for pm in PARAM_RE.finditer(line):
-                agg["params"].add(pm.group(1).lower())
-
-        # whole-file checks
-        low = content.lower()
-        if WS_RE.search(content):
-            for wm in WS_RE.finditer(content):
-                tok = wm.group(0)
-                if tok.lower().startswith("ws"):
-                    agg["ws"].add(tok)
-            add("INFO", "WebSocket Usage", 0, (next(iter(agg["ws"]), "new WebSocket")))
-        if GRAPHQL_RE.search(content):
-            add("INFO", "GraphQL Usage", 0, "GraphQL endpoint/query detected")
-            agg["graphql"] += 1
-        if "eyj" in low and JWT_IMPL_RE.search(content) or re.search(r"(?i)(jwtDecode|decodeJwt|HS256|RS256)", content):
-            add("INFO", "JWT Implementation", 0, "JWT handling logic present")
-            agg["jwt"] += 1
-        for name, rx in THIRD_PARTY.items():
-            if rx.search(content):
-                add("INFO", "Third-Party Service", 0, name)
-                agg["third_party"].add(name)
-
-        # endpoints + subdomains
-        for em in ENDPOINT_RE.finditer(content):
-            ep = em.group(1)
-            if len(ep) < 2 or ep.startswith("//"):
-                continue
-            agg["endpoints"].add(ep)
-            low_ep = ep.lower()
-            if any(k in low_ep for k in SENSITIVE_ENDPOINT_KW):
-                add("MEDIUM", "Sensitive Endpoint", 0, ep, "Verify server-side access controls.")
-            if any(low_ep.startswith(k) or k in low_ep for k in ADMIN_ENDPOINT_KW):
-                agg["admin_endpoints"].add(ep)
-        for um in FULLURL_RE.finditer(content):
-            host = urlparse(um.group(0)).hostname or ""
-            if host and self.base_domain and host.endswith(self.base_domain) and host != self.base_host:
-                agg["subdomains"].add(host)
-
-        # source maps (request + status)
-        for sm in SOURCEMAP_RE.finditer(content):
-            ref = sm.group(1) or sm.group(2)
-            if not ref:
-                continue
-            map_url = urljoin(url, ref)
-            st, _ct, _b = self._get(map_url, max_bytes=2000, timeout=8)
-            exposed = st == 200
-            add("MEDIUM" if exposed else "INFO", "Source Map", 0,
-                f"{ref} (HTTP {st})", "Source maps expose original source; remove from production." if exposed else "")
-            if exposed:
-                agg["sourcemaps"] += 1
+        if is_minified(content):
+            agg["minified_files"] = agg.get("minified_files", 0) + 1
+        agg["bytes"] = agg.get("bytes", 0) + len(content)
         return findings
 
     def run(self):
@@ -365,13 +247,10 @@ class _JsAnalysisWorker(QObject):
                 self.finished.emit(result)
                 return
 
-            agg = {
-                "secrets": 0, "creds": 0, "xss": 0, "cloud": 0, "graphql": 0,
-                "jwt": 0, "sourcemaps": 0, "flags": 0,
-                "endpoints": set(), "subdomains": set(), "admin_endpoints": set(),
-                "emails": set(), "params": set(), "internal_ips": set(),
-                "ws": set(), "third_party": set(),
-            }
+            # Shared across every file in the run: inventories that only mean
+            # something in aggregate (endpoints, GraphQL operations, recovered
+            # source paths) and the counters the summary reports.
+            agg = {"sourcemaps": 0, "bytes": 0, "minified_files": 0}
             findings = []
             targets = js_urls[:MAX_JS_FILES]
             self.progress.emit(f"[*] Phase 2: analysing {len(targets)} JavaScript file(s)…\n")
@@ -389,7 +268,7 @@ class _JsAnalysisWorker(QObject):
                     done += 1
                     try:
                         _u, f = fut.result()
-                        findings.extend(f)
+                        findings = merge_findings(findings, f)
                     except Exception:
                         pass
                     if done % 10 == 0 or done == len(targets):
@@ -403,34 +282,52 @@ class _JsAnalysisWorker(QObject):
 
     @staticmethod
     def _empty_summary(n):
-        return {"files": n, "endpoints": 0, "subdomains": 0, "secrets": 0, "creds": 0,
-                "sourcemaps": 0, "xss": 0, "jwt": 0, "graphql": 0, "ws": 0, "cloud": 0,
-                "flags": 0, "admin_endpoints": 0,
-                "risk": {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}}
+        return {"files": n, "bytes": 0, "minified_files": 0, "endpoints": 0,
+                "sensitive_endpoints": 0, "secrets": 0, "sourcemaps": 0,
+                "original_sources": 0, "emails": 0, "websockets": 0,
+                "graphql_ops": 0, "subdomains": 0,
+                "risk": {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0},
+                "confidence": {"confirmed": 0, "firm": 0, "tentative": 0},
+                "occurrences": 0,
+                "endpoint_list": [], "sensitive_endpoint_list": [],
+                "email_list": [], "websocket_list": [], "graphql_list": [],
+                "subdomain_list": [], "original_source_list": []}
 
     def _build_summary(self, files, findings, agg):
         risk = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+        confidence = {"confirmed": 0, "firm": 0, "tentative": 0}
+        occurrences = 0
         for f in findings:
-            sev = f["severity"] if f["severity"] in risk else "INFO"
-            risk[sev] += 1
+            risk[f.severity if f.severity in risk else "INFO"] += 1
+            confidence[f.confidence if f.confidence in confidence else "firm"] += 1
+            occurrences += f.count
+
+        def listed(key):
+            return sorted(agg.get(key, set()))
+
         return {
             "files": files,
-            "endpoints": len(agg["endpoints"]),
-            "subdomains": len(agg["subdomains"]),
-            "secrets": agg["secrets"],
-            "creds": agg["creds"],
-            "sourcemaps": agg["sourcemaps"],
-            "xss": agg["xss"],
-            "jwt": agg["jwt"],
-            "graphql": agg["graphql"],
-            "ws": len(agg["ws"]),
-            "cloud": agg["cloud"],
-            "flags": agg["flags"],
-            "admin_endpoints": len(agg["admin_endpoints"]),
-            "subdomain_list": sorted(agg["subdomains"]),
-            "endpoint_list": sorted(agg["endpoints"]),
-            "email_list": sorted(agg["emails"]),
+            "bytes": agg.get("bytes", 0),
+            "minified_files": agg.get("minified_files", 0),
+            "endpoints": len(agg.get("endpoints", set())),
+            "sensitive_endpoints": len(agg.get("sensitive_endpoints", set())),
+            "secrets": sum(1 for f in findings if f.category == "Exposed Credential"),
+            "sourcemaps": agg.get("sourcemaps", 0),
+            "original_sources": len(agg.get("original_sources", set())),
+            "emails": len(agg.get("emails", set())),
+            "websockets": len(agg.get("websockets", set())),
+            "graphql_ops": len(agg.get("graphql_ops", set())),
+            "subdomains": len(agg.get("subdomains", set())),
             "risk": risk,
+            "confidence": confidence,
+            "occurrences": occurrences,
+            "endpoint_list": listed("endpoints"),
+            "sensitive_endpoint_list": listed("sensitive_endpoints"),
+            "email_list": listed("emails"),
+            "websocket_list": listed("websockets"),
+            "graphql_list": listed("graphql_ops"),
+            "subdomain_list": listed("subdomains"),
+            "original_source_list": listed("original_sources"),
         }
 
 
@@ -449,6 +346,42 @@ class _LocalJsAnalysisWorker(_JsAnalysisWorker):
     def __init__(self, target, output_dir, js_dir):
         super().__init__(target or "http://local", output_dir)
         self.js_dir = Path(js_dir)
+
+    def _fetch_source_map(self, js_path, content, agg):
+        """Look for the map next to the file on disk instead of over HTTP.
+
+        Files pulled down with wget keep their layout, so a map that was
+        downloaded alongside its bundle is right there — and it is worth as
+        much here as it is online, because it is what turns an offset into an
+        original filename and line.
+        """
+        m = SOURCEMAP_REF_RE.search(content)
+        if not m:
+            return None, None
+        ref = m.group(1).strip()
+        if ref.startswith("data:"):
+            return super()._fetch_source_map(js_path, content, agg)
+
+        candidate = (Path(js_path).parent / ref.split("?")[0]).resolve()
+        if not candidate.is_file():
+            candidate = Path(str(js_path) + ".map")
+        if not candidate.is_file():
+            return None, {"url": ref, "status": "not present locally"}
+        try:
+            source_map = SourceMap(candidate.read_text(errors="replace"))
+        except Exception:
+            return None, {"url": str(candidate), "status": "unparseable"}
+
+        agg["sourcemaps"] = agg.get("sourcemaps", 0) + 1
+        for source in source_map.sources:
+            if "node_modules" not in source:
+                agg.setdefault("original_sources", set()).add(source)
+        return source_map, {
+            "url": str(candidate),
+            "status": 200,
+            "sources": len(source_map.sources),
+            "has_content": any(source_map.sources_content or []),
+        }
 
     def run(self):
         result = {"js_urls": [], "findings": [], "summary": {}, "error": ""}
@@ -476,13 +409,10 @@ class _LocalJsAnalysisWorker(_JsAnalysisWorker):
                 self.finished.emit(result)
                 return
 
-            agg = {
-                "secrets": 0, "creds": 0, "xss": 0, "cloud": 0, "graphql": 0,
-                "jwt": 0, "sourcemaps": 0, "flags": 0,
-                "endpoints": set(), "subdomains": set(), "admin_endpoints": set(),
-                "emails": set(), "params": set(), "internal_ips": set(),
-                "ws": set(), "third_party": set(),
-            }
+            # Shared across every file in the run: inventories that only mean
+            # something in aggregate (endpoints, GraphQL operations, recovered
+            # source paths) and the counters the summary reports.
+            agg = {"sourcemaps": 0, "bytes": 0, "minified_files": 0}
             findings = []
             targets = files[:MAX_JS_FILES]
             self.progress.emit(f"[*] Analysing {len(targets)} file(s)…\n")
@@ -493,7 +423,7 @@ class _LocalJsAnalysisWorker(_JsAnalysisWorker):
                 except Exception as exc:
                     self.progress.emit(f"    [skip] {path.name}: {exc}\n")
                     continue
-                findings.extend(self._analyse(str(path), content, agg))
+                findings = merge_findings(findings, self._analyse(str(path), content, agg))
                 if index % 10 == 0 or index == len(targets):
                     self.progress.emit(f"    analysed {index}/{len(targets)}\n")
 
@@ -612,89 +542,217 @@ class JsAnalysisMixin:
         if result.get("error"):
             self.console.append_ansi(f"[!] JS analysis error: {result['error']}\n")
 
-        # Write identified_js.txt
         js_urls = result.get("js_urls", [])
         try:
             Path(self.output_dir, "identified_js.txt").write_text(
-                "\n".join(js_urls) + ("\n" if js_urls else ""), encoding="utf-8", errors="replace")
+                "\n".join(js_urls) + ("\n" if js_urls else ""),
+                encoding="utf-8", errors="replace")
             self.console.append_ansi(f"[i] Wrote identified_js.txt ({len(js_urls)} files)\n")
         except Exception as e:
             self.console.append_ansi(f"[i] Could not write identified_js.txt: {e}\n")
 
         findings = result.get("findings", [])
+        summary = result.get("summary", {})
 
-        # Console output grouped by category, each with how-to-test / PoC guidance
-        # so the tester knows how to prove (or disprove) impact for a report.
         if findings:
-            self.console.append_ansi("\n=== JavaScript Findings ===\n")
-            by_cat = {}
-            for f in findings:
-                by_cat.setdefault(f["category"], []).append(f)
+            self._print_js_findings(findings, summary)
 
-            def _cat_sev(c):
-                return max(SEV_ORDER.get(x["severity"], 0) for x in by_cat[c])
-
-            for cat in sorted(by_cat, key=lambda c: -_cat_sev(c)):
-                items = by_cat[cat]
-                sev = max(items, key=lambda x: SEV_ORDER.get(x["severity"], 0))["severity"]
-                color = SEV_COLORS.get(sev, "#94a3b8")
-                self.console.append_html(
-                    f'<br><span style="color:{color};font-weight:bold;">[{html.escape(sev)}] '
-                    f'{html.escape(cat)} ({len(items)})</span><br>'
-                )
-                guidance = CATEGORY_GUIDANCE.get(cat)
-                if guidance:
-                    self.console.append_html(
-                        f'&nbsp;&nbsp;<span style="color:#38bdf8;font-weight:bold;">How to test / PoC:</span> '
-                        f'<span style="color:#9aa6b2;">{html.escape(guidance)}</span><br>'
-                    )
-                for f in items[:40]:
-                    loc = f"{f['file']}" + (f" : line {f['line']}" if f.get("line") else "")
-                    self.console.append_html(
-                        f'&nbsp;&nbsp;<span style="color:#cbd5e1;">{html.escape(f["match"])}</span> '
-                        f'<span style="color:#64748b;">— {html.escape(loc)}</span><br>'
-                    )
-                if len(items) > 40:
-                    self.console.append_html(
-                        f'&nbsp;&nbsp;<span style="color:#64748b;">… +{len(items) - 40} more '
-                        f'(see js_analysis_results.txt)</span><br>'
-                    )
-
-        # Write js_analysis_results.txt
         self._write_js_report(result, findings)
-
-        # Summary block
-        self._print_js_summary(result.get("summary", {}))
+        self._print_js_summary(summary)
 
         try:
             self.refresh_file_list()
         except Exception:
             pass
 
-    def _write_js_report(self, result, findings):
-        s = result.get("summary", {})
-        lines = ["JavaScript Static Analysis Results", "=" * 50, ""]
+    # ── Console rendering ───────────────────────────────────────────────────
+
+    def _print_js_findings(self, findings, summary):
+        """Print findings grouped by category, worst first.
+
+        Each finding shows where it is precisely enough to be found again —
+        original file and line when a source map was available, otherwise the
+        module, line, column and character offset — plus a window of the
+        surrounding code with the match marked, because in a minified bundle
+        the line number alone tells a reader nothing.
+        """
+        minified = summary.get("minified_files", 0)
+        if minified:
+            self.console.append_html(
+                f'<br><span style="color:#94a3b8;">{minified} of '
+                f'{summary.get("files", 0)} file(s) are minified, so positions are '
+                f'given as line:column with a character offset'
+                + (' and resolved through the source map where one was served'
+                   if summary.get("sourcemaps") else '')
+                + '.</span><br>')
+
+        self.console.append_ansi("\n=== JavaScript Findings ===\n")
+
         by_cat = {}
         for f in findings:
-            by_cat.setdefault(f["category"], []).append(f)
-        for cat in sorted(by_cat, key=lambda c: -SEV_ORDER.get(by_cat[c][0]["severity"], 0)):
-            lines.append(f"\n### {cat} ({len(by_cat[cat])}) ###")
-            g = CATEGORY_GUIDANCE.get(cat)
-            if g:
-                lines.append(f"How to test / PoC: {g}")
-            for f in by_cat[cat]:
-                loc = f"{f['file']}" + (f":{f['line']}" if f.get("line") else "")
-                lines.append(f"  [{f['severity']}] {f['match']}")
-                lines.append(f"      {loc}")
-                if f.get("rec"):
-                    lines.append(f"      -> {f['rec']}")
-        if s.get("subdomain_list"):
-            lines += ["", "Subdomains discovered:", *(f"  {d}" for d in s["subdomain_list"])]
-        if s.get("email_list"):
-            lines += ["", "Email addresses:", *(f"  {e}" for e in s["email_list"])]
-        if s.get("endpoint_list"):
-            lines += ["", f"Endpoints ({len(s['endpoint_list'])}):",
-                      *(f"  {e}" for e in s["endpoint_list"][:500])]
+            by_cat.setdefault(f.category, []).append(f)
+
+        def cat_rank(name):
+            return max(SEV_ORDER.get(x.severity, 0) for x in by_cat[name])
+
+        for cat in sorted(by_cat, key=lambda c: (-cat_rank(c), c)):
+            items = sorted(by_cat[cat],
+                           key=lambda x: (-SEV_ORDER.get(x.severity, 0), x.title))
+            top = items[0].severity
+            colour = SEV_COLORS.get(top, "#94a3b8")
+            occurrences = sum(x.count for x in items)
+            heading = f"{cat} — {len(items)} finding(s)"
+            if occurrences > len(items):
+                heading += f", {occurrences} occurrence(s)"
+            self.console.append_html(
+                f'<br><span style="color:{colour};font-weight:bold;">[{html.escape(top)}] '
+                f'{html.escape(heading)}</span><br>')
+
+            guidance = CATEGORY_GUIDANCE.get(cat)
+            if guidance:
+                for line in guidance.split("\n"):
+                    label, _, rest = line.partition(": ")
+                    if label.isupper() and rest:
+                        self.console.append_html(
+                            f'&nbsp;&nbsp;<span style="color:#38bdf8;font-weight:bold;">'
+                            f'{html.escape(label)}:</span> '
+                            f'<span style="color:#9aa6b2;">{html.escape(rest)}</span><br>')
+                    else:
+                        self.console.append_html(
+                            f'&nbsp;&nbsp;<span style="color:#9aa6b2;">'
+                            f'{html.escape(line)}</span><br>')
+
+            for f in items[:25]:
+                self._print_one_finding(f)
+            if len(items) > 25:
+                self.console.append_html(
+                    f'&nbsp;&nbsp;<span style="color:#64748b;">… +{len(items) - 25} more '
+                    f'in js_analysis_results.txt</span><br>')
+
+    def _print_one_finding(self, f):
+        colour = SEV_COLORS.get(f.severity, "#94a3b8")
+        header = f.title
+        if f.count > 1:
+            header += f"   ×{f.count}"
+        self.console.append_html(
+            f'<br>&nbsp;&nbsp;<span style="color:{colour};font-weight:bold;">'
+            f'{html.escape(f.severity)}</span> '
+            f'<span style="color:#e2e8f0;font-weight:bold;">{html.escape(header)}</span>'
+            + (f' <span style="color:#64748b;">[{html.escape(f.cwe)}]</span>' if f.cwe else '')
+            + '<br>')
+        if f.evidence:
+            self.console.append_html(
+                f'&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:#94a3b8;">evidence:</span> '
+                f'<span style="color:#cbd5e1;">{html.escape(str(f.evidence)[:200])}</span><br>')
+        if f.detail:
+            self.console.append_html(
+                f'&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:#9aa6b2;">'
+                f'{html.escape(f.detail[:400])}</span><br>')
+        note = CONFIDENCE_NOTE.get(f.confidence, "")
+        if note:
+            self.console.append_html(
+                f'&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:#94a3b8;">confidence:</span> '
+                f'<span style="color:#cbd5e1;">{html.escape(f.confidence)}</span> '
+                f'<span style="color:#64748b;">— {html.escape(note)}</span><br>')
+
+        for loc in f.locations:
+            self.console.append_html(
+                f'&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:#64748b;">'
+                f'{html.escape(loc.file)}</span><br>'
+                f'&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:#64748b;">'
+                f'{html.escape(loc.describe())}</span><br>')
+            if loc.excerpt:
+                self.console.append_html(
+                    f'&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;'
+                    f'<span style="color:#7f8ea3;font-family:monospace;">'
+                    f'{html.escape(loc.excerpt[:260])}</span><br>')
+        if f.count > len(f.locations):
+            self.console.append_html(
+                f'&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:#64748b;">'
+                f'(+{f.count - len(f.locations)} further occurrence(s) — the report '
+                f'lists the same exemplars)</span><br>')
+        if f.rec:
+            self.console.append_html(
+                f'&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:#22d3ee;">next step:</span> '
+                f'<span style="color:#9aa6b2;">{html.escape(f.rec[:400])}</span><br>')
+
+    # ── Written report ──────────────────────────────────────────────────────
+
+    def _write_js_report(self, result, findings):
+        s = result.get("summary", {})
+        lines = [
+            "JavaScript Static Analysis",
+            "=" * 72,
+            "",
+            f"Files analysed        : {s.get('files', 0)}  "
+            f"({s.get('bytes', 0):,} bytes, {s.get('minified_files', 0)} minified)",
+            f"Findings              : {len(findings)} distinct, "
+            f"{s.get('occurrences', 0)} occurrences",
+            f"Source maps served    : {s.get('sourcemaps', 0)}"
+            + (f"  ({s.get('original_sources', 0)} original source files recovered)"
+               if s.get("original_sources") else ""),
+            "",
+            "Positions are given as line:column with a character offset, because a "
+            "production bundle is a single line and a line number alone identifies "
+            "nothing. Where a source map was served, the original file and line are "
+            "given first and the minified position follows in brackets.",
+            "",
+        ]
+
+        by_cat = {}
+        for f in findings:
+            by_cat.setdefault(f.category, []).append(f)
+
+        def cat_rank(name):
+            return max(SEV_ORDER.get(x.severity, 0) for x in by_cat[name])
+
+        for cat in sorted(by_cat, key=lambda c: (-cat_rank(c), c)):
+            items = sorted(by_cat[cat],
+                           key=lambda x: (-SEV_ORDER.get(x.severity, 0), x.title))
+            lines += ["", "=" * 72, f"{cat.upper()}  ({len(items)} finding(s))", "=" * 72]
+            guidance = CATEGORY_GUIDANCE.get(cat)
+            if guidance:
+                lines += ["", *guidance.split("\n"), ""]
+            for f in items:
+                lines.append("-" * 72)
+                lines.append(f"[{f.severity}] {f.title}"
+                             + (f"   (x{f.count})" if f.count > 1 else "")
+                             + (f"   {f.cwe}" if f.cwe else ""))
+                if f.evidence:
+                    lines.append(f"  evidence   : {f.evidence}")
+                if f.detail:
+                    lines.append(f"  detail     : {f.detail}")
+                lines.append(f"  confidence : {f.confidence} — "
+                             f"{CONFIDENCE_NOTE.get(f.confidence, '')}")
+                for loc in f.locations:
+                    lines.append(f"  location   : {loc.file}")
+                    lines.append(f"               {loc.describe()}")
+                    if loc.excerpt:
+                        lines.append(f"               {loc.excerpt}")
+                if f.count > len(f.locations):
+                    lines.append(f"               (+{f.count - len(f.locations)} "
+                                 f"further occurrence(s))")
+                if f.rec:
+                    lines.append(f"  next step  : {f.rec}")
+
+        def block(title, values, limit=400):
+            if not values:
+                return []
+            out = ["", "=" * 72, f"{title}  ({len(values)})", "=" * 72]
+            out += [f"  {v}" for v in values[:limit]]
+            if len(values) > limit:
+                out.append(f"  … +{len(values) - limit} more")
+            return out
+
+        lines += block("SENSITIVE ENDPOINTS", s.get("sensitive_endpoint_list", []))
+        lines += block("ALL ENDPOINTS REFERENCED", s.get("endpoint_list", []))
+        lines += block("ORIGINAL SOURCE FILES (from source maps)",
+                       s.get("original_source_list", []))
+        lines += block("GRAPHQL OPERATIONS", s.get("graphql_list", []))
+        lines += block("WEBSOCKET ENDPOINTS", s.get("websocket_list", []))
+        lines += block("SUBDOMAINS", s.get("subdomain_list", []))
+        lines += block("EMAIL ADDRESSES", s.get("email_list", []))
+
         try:
             Path(self.output_dir, "js_analysis_results.txt").write_text(
                 "\n".join(lines) + "\n", encoding="utf-8", errors="replace")
@@ -706,40 +764,46 @@ class JsAnalysisMixin:
         if not s:
             return
         risk = s.get("risk", {})
+        confidence = s.get("confidence", {})
         rows = [
-            ("Files Analysed", s.get("files", 0)),
-            ("Unique Endpoints Identified", s.get("endpoints", 0)),
-            ("Subdomains Identified", s.get("subdomains", 0)),
-            ("Potential Secrets Found", s.get("secrets", 0)),
-            ("Hardcoded Credentials", s.get("creds", 0)),
-            ("Source Maps Exposed", s.get("sourcemaps", 0)),
-            ("Potential XSS Sinks", s.get("xss", 0)),
-            ("JWT Implementations", s.get("jwt", 0)),
-            ("GraphQL Endpoints", s.get("graphql", 0)),
-            ("WebSocket Endpoints", s.get("ws", 0)),
-            ("Cloud Storage References", s.get("cloud", 0)),
-            ("Feature Flags", s.get("flags", 0)),
-            ("Hidden Admin Endpoints", s.get("admin_endpoints", 0)),
+            ("Files Analysed", f"{s.get('files', 0)}  ({s.get('bytes', 0):,} bytes)"),
+            ("Minified Bundles", s.get("minified_files", 0)),
+            ("Distinct Findings", sum(risk.values())),
+            ("Total Occurrences", s.get("occurrences", 0)),
+            ("Exposed Credentials", s.get("secrets", 0)),
+            ("Source Maps Served", s.get("sourcemaps", 0)),
+            ("Original Sources Recovered", s.get("original_sources", 0)),
+            ("Endpoints Referenced", s.get("endpoints", 0)),
+            ("Sensitive Endpoints", s.get("sensitive_endpoints", 0)),
+            ("GraphQL Operations", s.get("graphql_ops", 0)),
+            ("WebSocket Endpoints", s.get("websockets", 0)),
+            ("Email Addresses", s.get("emails", 0)),
         ]
-        bar = "═" * 50
+        bar = "═" * 56
         self.console.append_html(
             f'<br><span style="color:#22d3ee;font-weight:bold;">{bar}</span><br>'
             f'<span style="color:#22d3ee;font-weight:bold;">  JS ANALYSIS COMPLETE</span><br>'
-            f'<span style="color:#22d3ee;font-weight:bold;">{bar}</span><br>'
-        )
+            f'<span style="color:#22d3ee;font-weight:bold;">{bar}</span><br>')
         for label, val in rows:
             self.console.append_html(
                 f'&nbsp;&nbsp;<span style="color:#94a3b8;">{html.escape(label)}:</span> '
-                f'<span style="color:#e2e8f0;font-weight:bold;">{val}</span><br>'
-            )
-        self.console.append_html('&nbsp;&nbsp;<span style="color:#94a3b8;">Risk Summary:</span><br>')
+                f'<span style="color:#e2e8f0;font-weight:bold;">{html.escape(str(val))}</span><br>')
+
+        self.console.append_html('&nbsp;&nbsp;<span style="color:#94a3b8;">By severity:</span><br>')
         for sev in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"):
             self.console.append_html(
                 f'&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:{SEV_COLORS[sev]};font-weight:bold;">'
-                f'{sev.title()}: {risk.get(sev, 0)}</span><br>'
-            )
+                f'{sev.title()}: {risk.get(sev, 0)}</span><br>')
+
         self.console.append_html(
-            f'&nbsp;&nbsp;<span style="color:#94a3b8;">Detailed results written to:</span> '
+            '&nbsp;&nbsp;<span style="color:#94a3b8;">By confidence:</span><br>'
+            f'&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:#e2e8f0;">'
+            f'Confirmed: {confidence.get("confirmed", 0)}'
+            f' &nbsp; Firm: {confidence.get("firm", 0)}'
+            f' &nbsp; Needs manual triage: {confidence.get("tentative", 0)}</span><br>')
+
+        self.console.append_html(
+            f'&nbsp;&nbsp;<span style="color:#94a3b8;">Full detail with positions and '
+            f'code context:</span> '
             f'<span style="color:#e2e8f0;">js_analysis_results.txt</span><br>'
-            f'<span style="color:#22d3ee;font-weight:bold;">{bar}</span><br>'
-        )
+            f'<span style="color:#22d3ee;font-weight:bold;">{bar}</span><br>')
