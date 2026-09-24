@@ -640,6 +640,10 @@ handle_tool "sqlmap"      sqlmap      _i_sqlmap
 handle_tool "nuclei"      nuclei      _i_nuclei
 handle_tool "whatweb"     whatweb     _i_whatweb
 handle_tool "testssl"     testssl     _i_testssl
+# Kali ships the binary as testssl.sh and _i_testssl symlinks it to the
+# bare name. Coffee Break calls both spellings, so both are declared
+# here — a machine where the symlink did not take still gets covered.
+handle_tool "testssl.sh" testssl.sh  _i_testssl
 handle_tool "arjun"       arjun       _i_arjun
 handle_tool "wpscan"      wpscan      _i_wpscan
 handle_tool "droopescan"  droopescan  _i_droopescan
