@@ -191,7 +191,9 @@ class CoffeeBreakTabMixin:
         self.cb_filter = QComboBox()
         self.cb_filter.addItem("Everything", "")
         for severity in SEVERITIES:
-            self.cb_filter.addItem(severity.title() + " and above", severity)
+            # "Critical and above" is nonsense when Critical is the top of
+            # the scale. "Critical+" reads as a floor, which is what it is.
+            self.cb_filter.addItem(severity.title() + "+", severity)
         self.cb_filter.currentIndexChanged.connect(self._cb_apply_filter)
         controls.addWidget(self.cb_filter)
         controls.addStretch()
