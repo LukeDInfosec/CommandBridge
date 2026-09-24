@@ -378,6 +378,20 @@ class SmartFuzz:
         sep = f"{C.BLUE}{'═' * 68}{C.END}"
 
         # ── Phase 0: Header fingerprinting ────────────────────────────────────
+        #
+        # Fingerprinting decides what the *second* pass will use. It no longer
+        # decides whether the first pass happens.
+        #
+        # It used to: if the headers named IIS, the generic scan was skipped and
+        # only IIS.txt was tried; if a path matched a signature mid-scan, the
+        # generic scan was killed on the spot. Both made the tool faster and
+        # both threw away the rest of the target — every endpoint the broad
+        # list would have found after the signature hit was simply never
+        # requested. A content discovery tool that stops early because it has
+        # guessed the web server is answering the wrong question.
+        #
+        # So: enumerate the whole target with the broad wordlist, then go
+        # deeper with whatever the server turned out to be.
         print(sep)
         print(f"{C.BOLD}  PHASE 0 — Server Fingerprinting{C.END}")
         print(sep)
@@ -390,43 +404,46 @@ class SmartFuzz:
                 f"{detected_tech.upper()}{C.END}  (from response headers)"
             )
             print(
-                f"  {C.YELLOW}[→] Skipping generic scan — jumping straight to "
-                f"{detected_tech.upper()}-specific wordlist{C.END}\n"
+                f"  {C.CYAN}[→] Noted for the deep scan. The generic sweep runs "
+                f"first regardless, so nothing outside the "
+                f"{detected_tech.upper()} wordlist is missed.{C.END}\n"
             )
-            phase1_results: list[tuple[str, str]] = []
         else:
-            print(f"\n  {C.YELLOW}[!] Server type not identified from headers — starting generic discovery{C.END}\n")
+            print(f"\n  {C.YELLOW}[!] Server type not identified from headers — "
+                  f"the generic sweep will infer it from what it finds{C.END}\n")
 
-            # ── Phase 1: Generic scan with real-time detection ─────────────────
-            print(sep)
-            print(f"{C.BOLD}  PHASE 1 — Generic Discovery  (stops on first signature match){C.END}")
-            print(sep)
+        # ── Phase 1: Full generic sweep, start to finish ──────────────────────
+        print(sep)
+        print(f"{C.BOLD}  PHASE 1 — Generic Discovery  (runs to completion){C.END}")
+        print(sep)
 
-            phase1_results, detected_tech = self._run_ffuf(
-                self.initial_wordlist,
-                "Generic broad scan",
-                stop_on_detect=True,
-            )
-            self.scanned_with.add(self.initial_wordlist)
+        phase1_results, _early = self._run_ffuf(
+            self.initial_wordlist,
+            "Generic broad scan",
+            stop_on_detect=False,          # never cut the sweep short
+        )
+        self.scanned_with.add(self.initial_wordlist)
 
-            if not detected_tech:
-                # No real-time signature found; check path patterns in bulk
-                if phase1_results:
-                    detected_map = self._analyse_paths(phase1_results)
-                    if detected_map:
-                        best = max(detected_map.items(), key=lambda x: x[1]['priority'])
-                        detected_tech = best[0]
-                        print(
-                            f"\n  {C.GREEN}[✓] Technology inferred from paths: "
-                            f"{detected_tech.upper()}{C.END}"
-                        )
-                    else:
-                        print(
-                            f"\n  {C.YELLOW}[!] No technology signature detected — "
-                            f"results saved as-is{C.END}"
-                        )
-                else:
-                    print(f"\n  {C.YELLOW}[!] No endpoints found in generic scan{C.END}")
+        # Whatever the headers said, the paths that actually exist are better
+        # evidence. A signature found here overrides a header guess.
+        if phase1_results:
+            detected_map = self._analyse_paths(phase1_results)
+            if detected_map:
+                best = max(detected_map.items(), key=lambda x: x[1]['priority'])
+                inferred = best[0]
+                if inferred != detected_tech:
+                    print(
+                        f"\n  {C.GREEN}[✓] Technology inferred from discovered "
+                        f"paths: {inferred.upper()}{C.END}"
+                    )
+                detected_tech = inferred
+            elif not detected_tech:
+                print(
+                    f"\n  {C.YELLOW}[!] No technology signature detected — "
+                    f"results saved as-is{C.END}"
+                )
+        elif not detected_tech:
+            print(f"\n  {C.YELLOW}[!] No endpoints found in generic scan{C.END}")
 
         # ── Phase 2: Technology-specific deep scan ─────────────────────────────
         if detected_tech:

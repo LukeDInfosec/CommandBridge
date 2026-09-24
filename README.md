@@ -7,6 +7,34 @@ templates and per-engagement output directories.
 
 ---
 
+## Coffee Break
+
+One button at the top of the Web Application page runs every active check in
+the application, in an order where each step teaches the next one something:
+
+```
+nmap (service, all ports, UDP) → testssl → HTTP and security headers → Nikto
+→ nuclei → JavaScript → unvalidated redirects → WordPress → SmartFuzz
+→ parameter discovery → path traversal → 403 bypass
+```
+
+The handovers are the point. The headers stage decides whether the WordPress
+scan runs at all. SmartFuzz banks every endpoint that answered 401 or 403 and
+the bypass stage tries eighteen techniques against each of them. Parameter
+discovery feeds the traversal stage, which replaces each parameter's value in
+turn — keeping the others — and only reports a finding when the response
+actually contains a file it should not.
+
+Progress, the stage list and the findings live on the **Coffee Break** tab:
+severity-sorted, worst first, each with where it was, the evidence, and the
+fix. **Export findings** writes it out as Markdown, including the table of
+every bypass technique tried and what it returned.
+
+It sends real payloads. It is an active scan, and it is for targets you are
+authorised to test.
+
+---
+
 ## Running it
 
 ```bash

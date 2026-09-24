@@ -1,7 +1,7 @@
 ================================================================================
  COMMAND BRIDGE v4 — PROJECT REFERENCE & CHANGELOG
  (Reference doc for Claude / future sessions. Keep this updated after changes.)
- Last updated: 2026-09-15
+ Last updated: 2026-09-24
 ================================================================================
 
 HOW TO USE THIS FILE
@@ -18,6 +18,68 @@ HOW TO USE THIS FILE
 ================================================================================
  CHANGELOG (most recent first)
 ================================================================================
+
+## 2026-09-24 — COFFEE BREAK: one button, the whole active-scan chain
+NEW FILE modules/coffee_break.py (CoffeeBreakMixin + CBFinding + probes):
+  14 stages run in sequence, each starting only when the last finishes, with
+  artefacts handed forward: nmap quick/full/UDP -> testssl -> HTTP & security
+  headers -> nikto -> nuclei (-jsonl, parsed) -> JavaScript (downloads the
+  page's scripts and runs modules/js_findings.JsScanner over them) ->
+  unvalidated redirects -> wpscan (gated on WordPress actually being detected)
+  -> SmartFuzz -> parameter discovery -> path traversal -> 403 bypass.
+  - Shell stages advance from core/output.py on_command_finished (same single
+    QProcess as Auto Scan / Externals — one process at a time, always).
+  - Python stages run on a QThread via _CBWorker so the window never freezes.
+  - Artefact handover: nmap -> open_ports; headers -> tech (gates wpscan);
+    SmartFuzz -> endpoints + every 401/403 (feeds the bypass stage);
+    params -> param_urls (feeds the traversal stage).
+  - probe_traversal REPLACES the parameter's value (it does not append) and
+    only reports on a real file-read signature (root:x:0:0, [fonts] in
+    win.ini), so a page that merely echoes the payload is not a finding.
+  - probe_403_bypass tries 18 techniques and records every attempt, so the
+    report contains the table of what was tried, not only what worked.
+  - coffee_break_report() renders Markdown: findings by severity with
+    evidence and remediation, plus the bypass attempts table.
+NEW FILE ui/tabs_coffee.py (CoffeeBreakTabMixin): run header with progress and
+  elapsed, live stage list, severity-sorted findings table (_SeverityItem
+  sorts by severity, not alphabetically), detail pane, severity filter, and
+  Export findings. New tab key "coffee" (TABS, _TAB_BUILDERS,
+  _SAFE_BUILD_ORDER, window.py bases).
+ui/tabs_web.py: "Coffee Break" primary button added at the top of the Web
+  Application page (above the first card).
+REMOVED: Request Analysis and Response Analysis tabs — ui/tabs_request_analysis
+  .py, ui/tabs_response_analysis.py, modules/request_analysis.py,
+  modules/response_analysis.py, plus their TABS rows, builders, imports and
+  base classes. RAIL_SECTIONS lost "ANALYSE" (it had no tabs left).
+  NOTE modules/http_request.py is NOT part of this and stays — rate_limit_check
+  imports ParsedRequest/parse_any from it.
+REMOVED: everything below "Extensive SQLMap (HTTP Request)" in the SQL
+  Injection card (ui/tabs_web.py) — Basic scans, Tamper scripts and Advanced
+  techniques grids (18 buttons). All of it is already on the headline button's
+  right-click menu (modules/sqlmap.py show_sqlmap_http_menu).
+smartfuzz.py run(): the generic sweep now ALWAYS runs to completion before any
+  technology-specific wordlist. Previously a header match skipped the generic
+  scan entirely and a path signature killed it mid-run (proc.kill()), so every
+  endpoint the broad list would have found after that point was never
+  requested. Header detection now only informs phase 2; discovered paths
+  override the header guess.
+install_tools.sh: declares testssl.sh alongside testssl (Coffee Break calls
+  both spellings; _i_testssl already installs and symlinks).
+TESTS (new tests/ directory, all passing):
+  tests/test_coffee_break.py  — 50 checks, probes and parsers against a local
+    HTTP server: header findings, tech detection, open redirect (and that a
+    safe redirect parameter is NOT reported), traversal (and that an echoing
+    parameter is NOT reported, and that the tested parameter loses its value
+    while the others keep theirs), 403 bypass, nmap/nuclei/nikto/fuzz/param
+    parsers, dedup, Markdown report.
+  tests/test_gui_smoke.py     — 37 checks offscreen: the tab registry agrees
+    with itself, the window builds all tabs, Coffee Break is present, the
+    analysis tabs and the 18 SQL buttons are gone, findings render and sort
+    worst-first, the severity filter works, stage progress advances.
+  tests/test_coffee_chain.py  — 13 checks driving the real window and runner:
+    stages run in order, each starts only after the previous finished, a gated
+    stage is skipped without running, artefacts reach the stage that needs
+    them, findings land, state is clean afterwards.
 
 ## 2026-09-15 (c) — Soft-404/wildcard filtering for all 4 directory fuzzers
 VERSION: constants.py APP_VERSION 4.4.0 -> 4.5.0.
