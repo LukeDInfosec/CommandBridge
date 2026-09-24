@@ -288,6 +288,14 @@ class OutputMixin:
 
     def on_command_output(self, text):
         """Handle command output"""
+        # Coffee Break parses each stage's output after it finishes, so every
+        # line is teed into the current stage's buffer first. Done before any
+        # of the per-tool routing below, because some of those return early.
+        try:
+            if getattr(self, "_cb_active", False):
+                self._cb_capture_output(text)
+        except Exception:
+            pass
         try:
             cmd = self.current_command or ""
             if "sqlmap" in cmd:
@@ -623,6 +631,15 @@ class OutputMixin:
                 self._auto_scan_commands = []
                 self._auto_scan_output_dir = None
                 self._auto_scan_index = 0
+
+        # If Coffee Break is running, hand the finished stage to its engine:
+        # it parses what the stage printed, records any findings, and starts
+        # the next one.
+        try:
+            if getattr(self, "_cb_active", False):
+                self._cb_on_command_finished(exit_code)
+        except Exception as e:
+            self.console.append_ansi(f"[i] Coffee Break error: {e}\n")
 
         # If Externals workflow is active, advance its state machine
         try:
