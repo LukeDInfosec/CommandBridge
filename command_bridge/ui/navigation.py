@@ -767,12 +767,23 @@ class NavigationMixin:
         self.tab_widget.tabBar().hide()
 
         # Build first (safe order), insert second (display order).
+        #
+        # Each builder is guarded. A tab that raises while being constructed
+        # used to take the whole window with it — the application simply did
+        # not open, with the traceback going to a log the user had no reason
+        # to look in. One broken tab should cost you that tab, not the
+        # engagement, so the failure is caught, shown in its place, and the
+        # other eight tabs still work.
         built = {}
         for key in _SAFE_BUILD_ORDER:
             builder = getattr(self, _TAB_BUILDERS[key], None)
             if builder is None:
                 continue
-            built[key] = builder()
+            try:
+                built[key] = builder()
+            except Exception:
+                import traceback
+                built[key] = self._broken_tab(key, traceback.format_exc())
 
         self._tab_index = {}
         self._tab_meta = {}
@@ -786,6 +797,59 @@ class NavigationMixin:
 
         self.tab_widget.currentChanged.connect(self._on_tab_index_changed)
         return self.tab_widget
+
+    def _broken_tab(self, key: str, trace: str):
+        """Stand-in for a tab whose builder raised, showing why.
+
+        Deliberately built from the plainest widgets available: whatever broke
+        might be the very thing this would otherwise depend on.
+        """
+        from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QLabel, QTextEdit,
+                                     QPushButton, QApplication)
+
+        page = QWidget()
+        box = QVBoxLayout(page)
+        box.setContentsMargins(30, 30, 30, 30)
+        box.setSpacing(12)
+
+        title = QLabel(f"The {key} tab could not be built")
+        title.setStyleSheet("font-size: 17px; font-weight: 600; color: #ff6b6b;")
+        box.addWidget(title)
+
+        blurb = QLabel(
+            "The rest of the application is unaffected. This is the error, "
+            "which is also in ~/.config/CommandBridge/errors.log — send it on "
+            "and it can be fixed.")
+        blurb.setWordWrap(True)
+        blurb.setStyleSheet("color: palette(mid);")
+        box.addWidget(blurb)
+
+        detail = QTextEdit()
+        detail.setReadOnly(True)
+        detail.setPlainText(trace)
+        detail.setStyleSheet("font-family: monospace; font-size: 12px;")
+        box.addWidget(detail, 1)
+
+        copy = QPushButton("Copy the error")
+        copy.clicked.connect(
+            lambda: QApplication.clipboard().setText(trace))
+        box.addWidget(copy)
+
+        # And to stderr, so a terminal launch shows it without clicking about.
+        import sys
+        sys.stderr.write(f"\n[Command Bridge] the {key} tab failed to "
+                         f"build:\n{trace}\n")
+        try:
+            from pathlib import Path
+            from datetime import datetime
+            log = Path.home() / ".config" / "CommandBridge" / "errors.log"
+            log.parent.mkdir(parents=True, exist_ok=True)
+            with open(log, "a", encoding="utf-8") as handle:
+                handle.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} "
+                             f"tab '{key}' failed to build =====\n{trace}")
+        except Exception:
+            pass
+        return page
 
     def _on_tab_index_changed(self, index: int):
         self._nav_activate(index, init=True)
