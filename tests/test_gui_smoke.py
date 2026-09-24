@@ -29,7 +29,7 @@ def check(label, got, want=True):
 
 
 def main():
-    from PyQt6.QtWidgets import QApplication, QPushButton
+    from PyQt6.QtWidgets import QApplication, QPushButton, QLabel
     from command_bridge.constants import TABS, RAIL_SECTIONS
     from command_bridge.ui.navigation import _TAB_BUILDERS, _SAFE_BUILD_ORDER
     from command_bridge.ui.window import CommandBridgeV5
@@ -131,6 +131,39 @@ def main():
           window.cb_progress.value(), 100)
 
     window.close()
+
+    print("\n\033[1mA broken tab does not take the window with it\033[0m")
+    # Before this guard, a builder that raised meant the application simply
+    # did not open — no window, and the traceback in a log file the user had
+    # no reason to look in.
+    import command_bridge.ui.tabs_coffee as coffee_module
+    original = coffee_module.CoffeeBreakTabMixin.create_coffee_break_tab
+
+    def broken(self):
+        raise RuntimeError("deliberate failure for the test")
+
+    coffee_module.CoffeeBreakTabMixin.create_coffee_break_tab = broken
+    try:
+        from PyQt6.QtWidgets import QTextEdit
+        hurt = CommandBridgeV5()
+        check("the window still builds", hurt is not None)
+        check("every tab is still present", hurt.tab_widget.count(), len(TABS))
+        hurt.goto_tab("coffee")
+        labels = [l.text() for l in
+                  hurt.tab_widget.currentWidget().findChildren(QLabel)]
+        check("the broken tab says so",
+              any("could not be built" in text for text in labels))
+        traces = [t.toPlainText() for t in
+                  hurt.tab_widget.currentWidget().findChildren(QTextEdit)]
+        check("and shows the traceback",
+              any("deliberate failure" in text for text in traces))
+        hurt.goto_tab("web")
+        check("the other tabs still work",
+              hurt.tab_widget.currentIndex(), hurt.tab_index("web"))
+        hurt.close()
+    finally:
+        coffee_module.CoffeeBreakTabMixin.create_coffee_break_tab = original
+
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 
