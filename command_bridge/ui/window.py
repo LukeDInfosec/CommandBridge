@@ -52,6 +52,7 @@ from command_bridge.modules.coffee_break import CoffeeBreakMixin
 from command_bridge.modules.file_upload_lab import FileUploadLabMixin
 from command_bridge.modules.graphql_tools import GraphqlToolsMixin
 from command_bridge.modules.tool_setup import ToolSetupMixin
+from command_bridge.modules.api_testing import ApiTestingMixin
 
 
 class CommandBridgeV5(
@@ -89,6 +90,7 @@ class CommandBridgeV5(
     FileUploadLabMixin,
     GraphqlToolsMixin,
     ToolSetupMixin,
+    ApiTestingMixin,
 ):
     """Main application window — Command Bridge v5."""
 
@@ -143,6 +145,10 @@ class CommandBridgeV5(
 
         self.init_ui()
         self.apply_theme(self.current_theme)
+
+        # Surface any saved commands that are not the shipped versions — an
+        # invisible stale override is how a fixed command keeps looking broken.
+        QTimer.singleShot(0, self.report_command_overrides)
 
         self.load_target_and_headers()
         self.load_window_geometry()
