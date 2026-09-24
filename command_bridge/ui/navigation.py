@@ -48,8 +48,7 @@ _TAB_BUILDERS = {
     "externals": "create_externals_tab",
     "web":       "create_web_testing_tab",
     "api":       "create_api_testing_tab",
-    "request":   "create_request_analysis_tab",
-    "response":  "create_response_analysis_tab",
+    "coffee":    "create_coffee_break_tab",
     "console":   "create_console_tab",
     "bounty":    "create_methodology_tab",
 }
@@ -59,7 +58,7 @@ _TAB_BUILDERS = {
 # the console into existence.
 _SAFE_BUILD_ORDER = [
     "target", "console", "recon", "externals", "web", "api",
-    "request", "response", "bounty",
+    "coffee", "bounty",
 ]
 
 # Header target chip: grows with the target, but never so far that it crowds
@@ -141,7 +140,7 @@ class NavigationMixin:
             "Injections": "bounty", "Bug Bounty": "bounty",
             "Console": "console", "Results": "console",
             "Externals": "externals", "External Infra": "externals",
-            "Request Analysis": "request", "Response Analysis": "response",
+            "Coffee Break": "coffee", "Active Scan": "coffee",
         }
         self.goto_tab(aliases.get(category, category))
 

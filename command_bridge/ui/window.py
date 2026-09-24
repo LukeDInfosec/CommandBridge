@@ -28,8 +28,7 @@ from command_bridge.ui.tabs_api import ApiTabMixin
 from command_bridge.ui.tabs_methodology import MethodologyTabMixin
 from command_bridge.ui.tabs_console import ConsoleTabMixin
 from command_bridge.ui.tabs_externals_ui import ExternalsTabUIMixin
-from command_bridge.ui.tabs_request_analysis import RequestAnalysisTabMixin
-from command_bridge.ui.tabs_response_analysis import ResponseAnalysisTabMixin
+from command_bridge.ui.tabs_coffee import CoffeeBreakTabMixin
 from command_bridge.ui.cards import CardsMixin
 from command_bridge.ui.theme import ThemeMixin
 
@@ -49,12 +48,10 @@ from command_bridge.modules.externals import ExternalsMixin
 from command_bridge.modules.externals_reporting import ExternalsReportingMixin
 from command_bridge.modules.network_scan import NetworkScanMixin
 from command_bridge.modules.js_analysis import JsAnalysisMixin
-from command_bridge.modules.request_analysis import RequestAnalysisMixin
-from command_bridge.modules.response_analysis import ResponseAnalysisMixin
+from command_bridge.modules.coffee_break import CoffeeBreakMixin
 from command_bridge.modules.file_upload_lab import FileUploadLabMixin
 from command_bridge.modules.graphql_tools import GraphqlToolsMixin
 from command_bridge.modules.tool_setup import ToolSetupMixin
-from command_bridge.modules.api_testing import ApiTestingMixin
 
 
 class CommandBridgeV5(
@@ -70,8 +67,7 @@ class CommandBridgeV5(
     MethodologyTabMixin,
     ConsoleTabMixin,
     ExternalsTabUIMixin,
-    RequestAnalysisTabMixin,
-    ResponseAnalysisTabMixin,
+    CoffeeBreakTabMixin,
     CardsMixin,
     ThemeMixin,
     # Core
@@ -89,12 +85,10 @@ class CommandBridgeV5(
     ExternalsReportingMixin,
     NetworkScanMixin,
     JsAnalysisMixin,
-    RequestAnalysisMixin,
-    ResponseAnalysisMixin,
+    CoffeeBreakMixin,
     FileUploadLabMixin,
     GraphqlToolsMixin,
     ToolSetupMixin,
-    ApiTestingMixin,
 ):
     """Main application window — Command Bridge v5."""
 
@@ -113,6 +107,9 @@ class CommandBridgeV5(
         self._auto_scan_commands: list[str] = []
         self._auto_scan_index: int = 0
         self._auto_scan_output_dir: str | None = None
+
+        # Coffee Break chain state (see modules/coffee_break.py)
+        self._cb_reset()
 
         # Externals workflow state
         self._externals_active: bool = False
@@ -146,10 +143,6 @@ class CommandBridgeV5(
 
         self.init_ui()
         self.apply_theme(self.current_theme)
-
-        # Surface any saved commands that are not the shipped versions — an
-        # invisible stale override is how a fixed command keeps looking broken.
-        QTimer.singleShot(0, self.report_command_overrides)
 
         self.load_target_and_headers()
         self.load_window_geometry()

@@ -34,7 +34,26 @@ class WebTabMixin:
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(25, 25, 25, 25)
         layout.setSpacing(20)
-        
+
+        # ── Coffee Break ────────────────────────────────────────────────
+        # The headline action of the whole tab: every active check below,
+        # run in an order where each step feeds the next, reporting into
+        # its own screen. Sits above the cards because it is the thing you
+        # press when you do not yet know what you are looking for.
+        coffee_btn = QPushButton("☕  Coffee Break  —  run every active check")
+        coffee_btn.setObjectName("primaryButton")
+        coffee_btn.setMinimumHeight(52)
+        coffee_btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        coffee_btn.setToolTip(
+            "Nmap (service, full port, UDP) → TLS → headers → Nikto → nuclei "
+            "→ JavaScript → redirects → WordPress → SmartFuzz → parameters "
+            "→ path traversal → 403 bypass.\n\n"
+            "Each stage starts when the last one finishes. Findings appear on "
+            "the Coffee Break tab as they land, with evidence and a fix."
+        )
+        coffee_btn.clicked.connect(self.start_coffee_break)
+        layout.addWidget(coffee_btn)
+
         # Web Scraping Card (collapsible)
         scraping_card = self.create_card("🕸️ Web Scraping")
         self._init_collapsible_groupbox(scraping_card, "web_scraping_card")
@@ -389,77 +408,11 @@ class WebTabMixin:
         self.sqlmap_http_btn.customContextMenuRequested.connect(self.show_sqlmap_http_menu)
         sql_layout.addWidget(self.sqlmap_http_btn)
 
-        # Basic SQL Injection section
-        sql_basic_label = QLabel("🛡️ Basic SQL Injection Scans")
-        sql_basic_label.setObjectName("sectionDivider")
-        sql_layout.addWidget(sql_basic_label)
-        
-        sql_basic_grid = QGridLayout()
-        sql_basic_grid.setSpacing(12)
-        
-        sql_basic_tools = [
-            ("SQLMap Auto", "web_sqlmap_auto", "sqlmap -u {TARGET} --batch --level=3 --output-dir={SAFE_TARGET}_sqlmap"),
-            # ghauri has no --log flag; it rejects the command outright. Tee the
-            # session output instead so the run is still captured to disk.
-            ("Ghauri Scan", "web_ghauri",
-             "ghauri -u {TARGET} --batch --dbs 2>&1 | tee {SAFE_TARGET}_ghauri.log"),
-            ("SQLi Filter", "web_sqli_filter", "gf sqli | uro | tee {SAFE_TARGET}_sqli_urls.txt"),
-            ("Error-Based Scan", "web_sqlmap_error", "sqlmap -u {TARGET} --batch --technique=E --output-dir={SAFE_TARGET}_sqlmap_error"),
-            ("Boolean-Based Blind", "web_sqlmap_boolean", "sqlmap -u {TARGET} --batch --technique=B --level=5 --output-dir={SAFE_TARGET}_sqlmap_boolean"),
-            ("Time-Based Blind", "web_sqlmap_time", "sqlmap -u {TARGET} --batch --technique=T --level=5 --risk=3 --output-dir={SAFE_TARGET}_sqlmap_time"),
-        ]
-        
-        for i, (name, btn_id, cmd) in enumerate(sql_basic_tools):
-            btn = self.create_editable_button(name, btn_id, cmd)
-            sql_basic_grid.addWidget(btn, i // 2, i % 2)
-        
-        sql_layout.addLayout(sql_basic_grid)
-        
-        # WAF Bypass / Tamper Scripts section
-        sql_tamper_label = QLabel("🔥 WAF Bypass & Tamper Scripts")
-        sql_tamper_label.setObjectName("sectionDivider")
-        sql_layout.addWidget(sql_tamper_label)
-        
-        sql_tamper_grid = QGridLayout()
-        sql_tamper_grid.setSpacing(12)
-        
-        sql_tamper_tools = [
-            ("Space2Comment", "web_tamper_space2comment", "sqlmap -u {TARGET} --batch --tamper=space2comment --level=3 --output-dir={SAFE_TARGET}_tamper_s2c"),
-            ("Between + Random Case", "web_tamper_between", "sqlmap -u {TARGET} --batch --tamper=between,randomcase --level=3 --output-dir={SAFE_TARGET}_tamper_between"),
-            ("Charencode", "web_tamper_charencode", "sqlmap -u {TARGET} --batch --tamper=charencode --level=3 --output-dir={SAFE_TARGET}_tamper_char"),
-            ("Base64 Encode", "web_tamper_base64", "sqlmap -u {TARGET} --batch --tamper=base64encode --level=3 --output-dir={SAFE_TARGET}_tamper_b64"),
-            ("Unicode Escape", "web_tamper_unicode", "sqlmap -u {TARGET} --batch --tamper=chardoubleencode,charunicodeencode --level=3 --output-dir={SAFE_TARGET}_tamper_unicode"),
-            ("Custom WAF Bypass", "web_tamper_custom", "sqlmap -u {TARGET} --batch --tamper=space2comment,between,randomcase,charencode --level=5 --risk=3 --output-dir={SAFE_TARGET}_tamper_custom"),
-        ]
-        
-        for i, (name, btn_id, cmd) in enumerate(sql_tamper_tools):
-            btn = self.create_editable_button(name, btn_id, cmd)
-            sql_tamper_grid.addWidget(btn, i // 2, i % 2)
-        
-        sql_layout.addLayout(sql_tamper_grid)
-        
-        # Advanced SQL Injection section
-        sql_advanced_label = QLabel("⚡ Advanced Techniques")
-        sql_advanced_label.setObjectName("sectionDivider")
-        sql_layout.addWidget(sql_advanced_label)
-        
-        sql_advanced_grid = QGridLayout()
-        sql_advanced_grid.setSpacing(12)
-        
-        sql_advanced_tools = [
-            ("Union-Based", "web_sqlmap_union", "sqlmap -u {TARGET} --batch --technique=U --level=5 --risk=3 --output-dir={SAFE_TARGET}_sqlmap_union"),
-            ("Stacked Queries", "web_sqlmap_stacked", "sqlmap -u {TARGET} --batch --technique=S --level=5 --risk=3 --output-dir={SAFE_TARGET}_sqlmap_stacked"),
-            ("Second Order SQLi", "web_sqlmap_secondorder", "sqlmap -u {TARGET} --batch --second-order=http://secondorder.url --output-dir={SAFE_TARGET}_sqlmap_2ndorder"),
-            ("DBMS Fingerprint", "web_sqlmap_fingerprint", "sqlmap -u {TARGET} --batch --fingerprint --output-dir={SAFE_TARGET}_sqlmap_fingerprint"),
-            ("Full DB Dump", "web_sqlmap_dump", "sqlmap -u {TARGET} --batch --dump-all --exclude-sysdbs --output-dir={SAFE_TARGET}_sqlmap_dump"),
-            ("OS Shell Attempt", "web_sqlmap_osshell", "sqlmap -u {TARGET} --batch --os-shell --output-dir={SAFE_TARGET}_sqlmap_osshell"),
-        ]
-        
-        for i, (name, btn_id, cmd) in enumerate(sql_advanced_tools):
-            btn = self.create_editable_button(name, btn_id, cmd)
-            sql_advanced_grid.addWidget(btn, i // 2, i % 2)
-        
-        sql_layout.addLayout(sql_advanced_grid)
+        # Everything that used to sit below this button — the basic
+        # scans, the tamper scripts, the advanced techniques — is now a
+        # right-click option on the button itself, so the card is the
+        # headline action and its menu rather than three grids of the
+        # same commands under different names.
 
         sql_card.layout().addLayout(sql_layout)
         layout.addWidget(sql_card)
