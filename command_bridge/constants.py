@@ -33,7 +33,7 @@ Palette roles
 from pathlib import Path
 
 APP_TITLE = "Command Bridge"
-APP_VERSION = "5.0.0"
+APP_VERSION = "5.1.0"
 BASE_DIR = Path(__file__).resolve().parent.parent  # Project root (Test26/)
 DEFAULT_OUTPUT_DIR = Path.cwd()
 
@@ -84,13 +84,12 @@ TABS = [
     ("externals", "External", "External Infra",      "Bulk hosts, ports, TLS and services",       "nodes",     "DISCOVER"),
     ("web",       "Web",      "Web Application",     "Fuzzing, injection and access control",     "globe",     "TEST"),
     ("api",       "API",      "API Testing",         "Endpoints, schemas and GraphQL",            "braces",    "TEST"),
-    ("request",   "Request",  "Request Analysis",    "Break down a captured HTTP request",        "arrow_in",  "ANALYSE"),
-    ("response",  "Response", "Response Analysis",   "Inspect headers, body and behaviour",       "arrow_out", "ANALYSE"),
+    ("coffee",    "Coffee",   "Coffee Break",        "One button, the whole active-scan chain",   "bolt",      "TEST"),
     ("console",   "Console",  "Console & Results",   "Live output and captured artefacts",        "terminal",  "PINNED"),
     ("bounty",    "Bounty",   "Bug Bounty",          "Mass recon methodology workflows",          "flag",      "PINNED"),
 ]
 
-RAIL_SECTIONS = ["ENGAGE", "DISCOVER", "TEST", "ANALYSE"]
+RAIL_SECTIONS = ["ENGAGE", "DISCOVER", "TEST"]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
