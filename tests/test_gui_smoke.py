@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 PASS = FAIL = 0
+DIM = RESET = ""
 
 
 def check(label, got, want=True):
@@ -53,6 +54,45 @@ def main():
     check("the window class has the builder",
           hasattr(CommandBridgeV5, "create_coffee_break_tab"))
     check("and the engine", hasattr(CommandBridgeV5, "start_coffee_break"))
+
+    print("\n\033[1mNo mixin has been dropped from the window\033[0m")
+    # The regression this exists for: window.py was replaced with a copy built
+    # from an older tree, which silently dropped ApiTestingMixin from the base
+    # list. Nothing failed until a tab tried to connect a button to a method
+    # that mixin provided, at which point the application would not open at
+    # all. Every mixin the package defines should be in the window's MRO.
+    import pkgutil
+    import importlib
+    import command_bridge
+
+    in_mro = {base.__name__ for base in CommandBridgeV5.__mro__}
+    #: Mixins that are deliberately not mixed in (they belong to a dialog, or
+    #: are a base class for other mixins rather than for the window).
+    NOT_EXPECTED = set()
+    defined, absent = {}, []
+    for finder, name, _is_pkg in pkgutil.walk_packages(
+            command_bridge.__path__, "command_bridge."):
+        if ".widgets" in name:
+            continue
+        try:
+            module = importlib.import_module(name)
+        except Exception:
+            absent.append(name)
+            continue
+        for attribute in dir(module):
+            if not attribute.endswith("Mixin"):
+                continue
+            cls = getattr(module, attribute)
+            if isinstance(cls, type) and cls.__module__ == name:
+                defined[attribute] = name
+
+    dropped = sorted(n for n in defined
+                     if n not in in_mro and n not in NOT_EXPECTED)
+    check(f"every mixin the package defines is mixed in "
+          f"({len(defined)} checked)", dropped, [])
+    if absent:
+        print(f"      {DIM if False else ''}(could not import: "
+              f"{', '.join(absent)}){RESET if False else ''}")
 
     print("\n\033[1mThe analysis tabs are gone\033[0m")
     check("no request tab", "request" in keys, False)
