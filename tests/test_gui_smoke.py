@@ -146,9 +146,13 @@ def main():
     check("the tally names the severities",
           "critical" in window.cb_tally.text().lower())
 
+    check("the filter reads as a floor, not a range",
+          [window.cb_filter.itemText(i)
+           for i in range(window.cb_filter.count())],
+          ["Everything", "Critical+", "High+", "Medium+", "Low+", "Info+"])
     window.cb_filter.setCurrentIndex(
         window.cb_filter.findData("HIGH"))
-    check("filtering to high and above hides the low one",
+    check("filtering to High+ hides the low one",
           window.cb_table.rowCount(), 1)
     window.cb_filter.setCurrentIndex(0)
     check("clearing the filter brings it back", window.cb_table.rowCount(), 2)
