@@ -19,6 +19,53 @@ HOW TO USE THIS FILE
  CHANGELOG (most recent first)
 ================================================================================
 
+## 2026-09-25 — COFFEE BREAK: named issues, consolidation, less noise (5.1.1)
+The screen was printing everything every tool called "Info", one row per
+sighting, with titles cut at a fixed offset. Burp's scanner does none of those
+three things, and now neither does this.
+
+NEW FILE modules/cb_issues.py — the issue library. ~25 named issues (Lucky 13,
+  BEAST, POODLE, Sweet32, ROBOT, Heartbleed, CCS, Ticketbleed, DROWN, FREAK,
+  Logjam, CRIME, BREACH, RC4, renegotiation, fallback, obsolete protocols, the
+  five certificate issues, weak ciphers), each with a settled title, severity,
+  explanation, fix, CWE and references.
+  - for_testssl(record) maps a testssl JSON record onto one, and returns
+    (None, None) for records whose severity is OK/INFO or whose text says "not
+    vulnerable" — which is most of them, and was most of the old noise.
+  - clean_title() cuts on a word boundary with an ellipsis, strips ANSI, and
+    never truncates mid-word. Full text always survives in .detail.
+  - NUCLEI_FINGERPRINT / NIKTO_NOISE: the checks that describe the stack
+    rather than a fault in it.
+
+modules/coffee_break.py:
+  - CBFinding gains cwe, references and instances; .count, .locations() and
+    .add_instance(). _cb_record() now consolidates by (title, stage): one
+    issue across four hundred pages is one finding with four hundred
+    locations, not four hundred rows.
+  - _cb_issue(key, …) builds a finding from the library so the same problem
+    always reads the same way whichever tool found it.
+  - _cb_parse_testssl() REWRITTEN: reads the JSON testssl already writes
+    (stage gains artefact_file), groups by issue, and falls back to the
+    console text in the same record shape. CBC suites now report as
+    "Lucky 13" with the printed ciphers as the evidence.
+  - _cb_parse_nuclei(): fingerprinting templates and remediation-less info
+    matches fold into one "Technology fingerprint" entry; CWE and references
+    carried from the template's classification block.
+  - _cb_parse_nikto(): inventory lines fold into one "Server inventory
+    observed by Nikto"; the rest keep their full text in .detail.
+  - coffee_break_report(): instances, CWE and references included.
+
+ui/tabs_coffee.py:
+  - Severity and Confidence cells are CENTRED, both columns fixed-width
+    (108 / 104) so the text is not pressed against the cell border.
+  - Findings filter defaults to Low+; the count on the right says how many
+    are hidden.
+  - _cb_ui_refresh(finding) updates a row in place when another instance
+    arrives; Where reads "url  (+N more)"; full title on hover; the detail
+    pane lists the other locations, the CWE and the references.
+
+tests: test_coffee_break.py 50 → 72, test_gui_smoke.py 44 → 52.
+
 ## 2026-09-24 — COFFEE BREAK: one button, the whole active-scan chain
 NEW FILE modules/coffee_break.py (CoffeeBreakMixin + CBFinding + probes):
   14 stages run in sequence, each starting only when the last finishes, with
