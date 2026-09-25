@@ -151,17 +151,28 @@ def main():
         check("a missing HSTS is reported",
               any("Strict-Transport-Security" in t for t in titles))
         check("the server banner is reported",
-              any("Version disclosure in server" in t for t in titles))
+              any("version disclosed in server" in t.lower() for t in titles))
         check("X-Powered-By is reported",
               any("x-powered-by" in t for t in titles))
         check("a cookie without Secure is reported",
-              any("without" in t and "session" in t for t in titles))
+              any("without the Secure flag" in t for t in titles))
+        check("and the cookie it belongs to is named in the location",
+              any("session" in f.where for f in found
+                  if "Secure flag" in f.title))
+        check("the missing HttpOnly flag is its own issue, as in Burp",
+              any("HttpOnly" in t for t in titles))
         check("WordPress is detected from the body",
               "wordpress" in artefacts["tech"])
         check("nginx is detected from the header",
               "nginx" in artefacts["tech"])
-        check("nothing is reported above medium for headers alone",
-              max(SEV_ORDER[f.severity] for f in found) <= SEV_ORDER["MEDIUM"])
+        # The test server is plain HTTP, so that finding is correct and is
+        # the only one above medium a header pass should ever produce.
+        check("plain HTTP is reported",
+              any("Unencrypted" in t for t in titles))
+        check("and nothing else exceeds medium",
+              max([SEV_ORDER[f.severity] for f in found
+                   if "Unencrypted" not in f.title] or [0]),
+              SEV_ORDER["MEDIUM"])
 
         print("\n\033[1mOpen redirect\033[0m")
         found, _ = probe_redirects(context, noop)
@@ -274,8 +285,18 @@ def main():
         check("and it names what was detected",
               "Nginx detected" in [f for f in engine._cb_findings
                                    if f.severity == "INFO"][0].evidence)
-        check("the remediation comes with it",
-              any(f.remediation == "Patch it." for f in engine._cb_findings))
+        # A template that names a known bug class is renamed onto the library
+        # entry, so the advice is the library's settled wording and nuclei's
+        # own text is kept in the detail.
+        critical = [f for f in engine._cb_findings if f.severity == "CRITICAL"][0]
+        check("a known bug class is renamed onto the library",
+              critical.title, "OS command injection")
+        check("with the library's remediation",
+              "shell" in critical.remediation)
+        check("and nuclei's own wording kept in the detail",
+              "Remote code execution" in critical.detail)
+        check("and a classification",
+              critical.cwe.startswith("CWE-"))
 
         engine = Engine(base)
         fuzz = ("/admin                  [Status: 403, Size: 120]\n"
@@ -307,6 +328,51 @@ def main():
         check("banner lines are not findings", produced, 2)
         check("nikto findings are marked tentative",
               all(f.confidence == "tentative" for f in engine._cb_findings))
+
+        print("\n\033[1mThe issue library\033[0m")
+        from command_bridge.modules import cb_issues
+        library = cb_issues.ISSUES
+        check("it is a library, not a handful", len(library) >= 100)
+        check("every entry has a severity the table can sort",
+              sorted({i["severity"] for i in library.values()} - set(SEVERITIES)),
+              [])
+        check("every entry explains itself",
+              [k for k, i in library.items() if len(i["detail"]) < 40], [])
+        check("every entry says how to fix it",
+              [k for k, i in library.items() if len(i["remediation"]) < 15], [])
+        check("every entry carries a classification",
+              [k for k, i in library.items()
+               if not str(i["cwe"]).startswith("CWE-")], [])
+        check("no two entries share a title",
+              len({i["title"] for i in library.values()}), len(library))
+
+        # The point of the mapping layer: three tools, three vocabularies, one
+        # finding. Each of these is the wording a real tool actually emits.
+        for text, expected in (
+                ("Directory indexing found", "directory_listing"),
+                ("/.git/config file found", "vcs_exposed"),
+                ("phpinfo() page exposed", "info_page_exposed"),
+                ("wp-config.php.bak", "backup_file"),
+                ("Blind SQL injection in parameter id", "sqli"),
+                ("JWT none algorithm accepted", "jwt_none"),
+                ("Apache 2.4.49 path traversal", "traversal"),
+                ("Server-side template injection", "ssti"),
+                ("AWS access key disclosure", "cloud_key_disclosed"),
+                ("Swagger UI exposed", "api_spec_exposed")):
+            check(f"{text!r} is named", cb_issues.for_text(text)[0], expected)
+        check("a line the library does not know is left alone",
+              cb_issues.for_text("the quick brown fox")[0], None)
+        check("a CVE template with no bug class falls back to the CVE entry",
+              cb_issues.for_nuclei("CVE-2024-9999", "Some product flaw")[0],
+              "known_cve")
+        check("a fingerprint template is not an issue at all",
+              cb_issues.for_nuclei("tech-detect", "Nginx detected")[0], None)
+        check("nmap services map to the right kind of problem",
+              (cb_issues.NMAP_SERVICES.get("redis"),
+               cb_issues.NMAP_SERVICES.get("telnet"),
+               cb_issues.NMAP_SERVICES.get("ms-wbt-server")),
+              ("exposed_datastore", "cleartext_service",
+               "remote_access_exposed"))
 
         print("\n\033[1mtestssl becomes named issues\033[0m")
         # The JSON testssl writes, in the shape it writes it. Three of these
