@@ -29,6 +29,7 @@ from command_bridge.ui.tabs_methodology import MethodologyTabMixin
 from command_bridge.ui.tabs_console import ConsoleTabMixin
 from command_bridge.ui.tabs_externals_ui import ExternalsTabUIMixin
 from command_bridge.ui.tabs_coffee import CoffeeBreakTabMixin
+from command_bridge.ui.tabs_scan import ActiveScanTabMixin
 from command_bridge.ui.cards import CardsMixin
 from command_bridge.ui.theme import ThemeMixin
 
@@ -69,6 +70,7 @@ class CommandBridgeV5(
     ConsoleTabMixin,
     ExternalsTabUIMixin,
     CoffeeBreakTabMixin,
+    ActiveScanTabMixin,
     CardsMixin,
     ThemeMixin,
     # Core

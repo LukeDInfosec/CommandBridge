@@ -49,6 +49,7 @@ _TAB_BUILDERS = {
     "web":       "create_web_testing_tab",
     "api":       "create_api_testing_tab",
     "coffee":    "create_coffee_break_tab",
+    "scan":      "create_active_scan_tab",
     "console":   "create_console_tab",
     "bounty":    "create_methodology_tab",
 }
@@ -57,7 +58,7 @@ _TAB_BUILDERS = {
 # bar, so a tab that touches self.console while constructing can never race
 # the console into existence.
 _SAFE_BUILD_ORDER = [
-    "target", "console", "recon", "externals", "web", "api",
+    "target", "console", "recon", "externals", "web", "api", "scan",
     "coffee", "bounty",
 ]
 
