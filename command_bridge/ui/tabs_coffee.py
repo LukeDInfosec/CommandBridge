@@ -194,6 +194,12 @@ class CoffeeBreakTabMixin:
             # "Critical and above" is nonsense when Critical is the top of
             # the scale. "Critical+" reads as a floor, which is what it is.
             self.cb_filter.addItem(severity.title() + "+", severity)
+        # Start at Low+ rather than Everything. Every scanner in the chain
+        # emits informational material — what the stack is, which headers were
+        # seen — and showing it by default buries the four findings that
+        # actually need acting on. It is one click away, and the count on the
+        # right says how much is being held back.
+        self.cb_filter.setCurrentIndex(self.cb_filter.findData("LOW"))
         self.cb_filter.currentIndexChanged.connect(self._cb_apply_filter)
         controls.addWidget(self.cb_filter)
         controls.addStretch()
@@ -222,11 +228,16 @@ class CoffeeBreakTabMixin:
         self.cb_table.setSortingEnabled(True)
         self.cb_table.sortByColumn(0, Qt.SortOrder.DescendingOrder)
         header = self.cb_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        # A fixed, generous severity column. Sized to contents it hugged the
+        # word so tightly that the text sat against the cell border; given room
+        # and centred, the column reads as a column.
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.cb_table.setColumnWidth(0, 108)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        self.cb_table.setColumnWidth(4, 104)
         self.cb_table.itemSelectionChanged.connect(self._cb_show_detail)
         self.cb_table.setMinimumHeight(300)
         splitter.addWidget(self.cb_table)
@@ -342,18 +353,44 @@ class CoffeeBreakTabMixin:
         font = severity.font()
         font.setBold(True)
         severity.setFont(font)
+        severity.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        cells = [severity,
-                 QTableWidgetItem(finding.title),
-                 QTableWidgetItem(finding.where),
-                 QTableWidgetItem(finding.stage),
-                 QTableWidgetItem(finding.confidence)]
+        title = QTableWidgetItem(finding.title)
+        # The column can be narrower than the title on a small window, so the
+        # full text is always one hover away.
+        title.setToolTip(finding.title)
+        where = QTableWidgetItem(_where_text(finding))
+        where.setToolTip("\n".join(finding.locations()[:40]))
+        confidence = QTableWidgetItem(finding.confidence)
+        confidence.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        cells = [severity, title, where,
+                 QTableWidgetItem(finding.stage), confidence]
         for column, item in enumerate(cells):
             item.setData(Qt.ItemDataRole.UserRole + 1, len(self._cb_rows))
             self.cb_table.setItem(row, column, item)
         self.cb_table.setSortingEnabled(True)
         self._cb_rows.append((row, finding))
         self._cb_update_count()
+
+    def _cb_ui_refresh(self, finding):
+        """Another instance of a finding already on the table."""
+        index = next((i for i, f in enumerate(self._cb_ui_finding_list)
+                      if f is finding), None)
+        if index is None:
+            return
+        for row in range(self.cb_table.rowCount()):
+            item = self.cb_table.item(row, 0)
+            if item is None:
+                continue
+            if item.data(Qt.ItemDataRole.UserRole + 1) != index:
+                continue
+            cell = self.cb_table.item(row, 2)
+            if cell is not None:
+                cell.setText(_where_text(finding))
+                cell.setToolTip("\n".join(finding.locations()[:40]))
+            break
+        self._cb_show_detail()
 
     def _cb_apply_filter(self):
         findings = list(self._cb_ui_finding_list)
@@ -366,8 +403,17 @@ class CoffeeBreakTabMixin:
     def _cb_update_count(self):
         shown = self.cb_table.rowCount()
         total = len(self._cb_ui_finding_list)
-        self.cb_count_label.setText(
-            f"{shown} of {total} shown" if shown != total else f"{total} finding(s)")
+        instances = sum(getattr(f, "count", 1)
+                        for f in self._cb_ui_finding_list)
+        extra = ""
+        if instances > total:
+            extra = f" · {instances} location(s)"
+        if shown != total:
+            self.cb_count_label.setText(
+                f"{shown} of {total} shown — {total - shown} hidden by the "
+                f"filter{extra}")
+        else:
+            self.cb_count_label.setText(f"{total} finding(s){extra}")
 
     def _cb_update_tally(self):
         counts = {}
@@ -401,13 +447,28 @@ class CoffeeBreakTabMixin:
             f"{_esc(finding.stage)} · {_esc(finding.confidence)} confidence</span></div>",
             f"<p><b>Where:</b> <code>{_esc(finding.where)}</code></p>",
         ]
+        instances = list(getattr(finding, "instances", []) or [])
+        if instances:
+            shown = "".join(f"<li><code>{_esc(u)}</code></li>"
+                            for u in instances[:30])
+            more = (f"<li>… and {len(instances) - 30} more</li>"
+                    if len(instances) > 30 else "")
+            html.append(f"<p><b>Also affects {len(instances)} other "
+                        f"location(s)</b></p><ul>{shown}{more}</ul>")
         if finding.detail:
-            html.append(f"<p>{_esc(finding.detail)}</p>")
+            html.append("".join(f"<p>{_esc(para)}</p>"
+                                for para in str(finding.detail).split("\n\n")))
         if finding.evidence:
             html.append("<p><b>Evidence</b></p>"
                         f"<pre style='white-space:pre-wrap'>{_esc(finding.evidence)}</pre>")
         if finding.remediation:
             html.append(f"<p><b>Fix:</b> {_esc(finding.remediation)}</p>")
+        if getattr(finding, "cwe", ""):
+            html.append(f"<p><b>Classification:</b> {_esc(finding.cwe)}</p>")
+        references = list(getattr(finding, "references", []) or [])
+        if references:
+            html.append("<p><b>References:</b> "
+                        + ", ".join(_esc(r) for r in references[:8]) + "</p>")
         self.cb_detail.setHtml("".join(html))
 
     # ── misc ─────────────────────────────────────────────────────────────
@@ -441,6 +502,12 @@ class CoffeeBreakTabMixin:
                                      QMessageBox.Icon.Warning)
             return
         self.console.append_ansi(f"\n[✓] Coffee Break findings written to {path}\n")
+
+
+def _where_text(finding):
+    """One location, or one location and a count of the rest."""
+    extra = len(getattr(finding, "instances", []) or [])
+    return f"{finding.where}  (+{extra} more)" if extra else finding.where
 
 
 def _esc(text):
