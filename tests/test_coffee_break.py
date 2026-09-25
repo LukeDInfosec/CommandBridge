@@ -262,10 +262,18 @@ def main():
                       "description": "It is bad.", "remediation": "Patch it."}},
         ])
         produced = engine._cb_parse_nuclei({"key": "nuclei"}, nuclei)
-        check("both matches are read", produced, 2)
+        # A fingerprinting template is not a finding. It is still kept, but as
+        # one collapsed entry rather than a row of its own.
+        check("only the real issue counts as a finding", produced, 1)
         check("nuclei severities are carried over",
               sorted(f.severity for f in engine._cb_findings),
               ["CRITICAL", "INFO"])
+        check("the fingerprint was folded into one entry",
+              [f.title for f in engine._cb_findings
+               if f.severity == "INFO"], ["Technology fingerprint"])
+        check("and it names what was detected",
+              "Nginx detected" in [f for f in engine._cb_findings
+                                   if f.severity == "INFO"][0].evidence)
         check("the remediation comes with it",
               any(f.remediation == "Patch it." for f in engine._cb_findings))
 
@@ -300,11 +308,94 @@ def main():
         check("nikto findings are marked tentative",
               all(f.confidence == "tentative" for f in engine._cb_findings))
 
-        print("\n\033[1mDeduplication\033[0m")
+        print("\n\033[1mtestssl becomes named issues\033[0m")
+        # The JSON testssl writes, in the shape it writes it. Three of these
+        # four records are the scanner saying the host is *fine*, which is what
+        # used to fill the findings screen.
+        engine = Engine(base)
+        records = [
+            {"id": "LUCKY13", "severity": "LOW", "cve": "CVE-2013-0169",
+             "cwe": "CWE-310",
+             "finding": "potentially vulnerable, uses TLS CBC ciphers"},
+            {"id": "cbc_tls1_2", "severity": "MEDIUM", "cve": "", "cwe": "",
+             "finding": "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384, "
+                        "TLS_RSA_WITH_AES_128_CBC_SHA"},
+            {"id": "DROWN", "severity": "OK", "cve": "CVE-2016-0800",
+             "cwe": "CWE-310", "finding": "not vulnerable to DROWN"},
+            {"id": "cipher_order", "severity": "INFO", "cve": "", "cwe": "",
+             "finding": "server order honoured"},
+        ]
+        json_path = engine.output_dir / "x_testssl.json"
+        json_path.write_text(json.dumps(records))
+        stage = {"key": "testssl", "artefact_file": str(json_path)}
+        produced = engine._cb_parse_testssl(stage, "")
+        titles = [f.title for f in engine._cb_findings]
+        check("CBC ciphers are reported as Lucky 13",
+              any(t.startswith("Lucky 13") for t in titles))
+        check("the title is not cut off mid-word",
+              all(not t.endswith(("…", " ")) for t in titles))
+        check("the printed ciphers are the proof",
+              any("AES_256_CBC_SHA384" in f.evidence
+                  for f in engine._cb_findings))
+        check("both CBC records folded into the one issue", produced, 1)
+        check("a clean result is not a finding",
+              any("DROWN" in t for t in titles), False)
+        check("and neither is an informational one",
+              any("order" in t.lower() for t in titles), False)
+        check("the CVE is carried as a reference",
+              "CVE-2013-0169" in engine._cb_findings[0].references)
+        check("so is the classification",
+              engine._cb_findings[0].cwe, "CWE-203")
+        check("the explanation is the library's, not the scanner's line",
+              "padding" in engine._cb_findings[0].detail.lower())
+
+        engine = Engine(base)
+        text = ("Heartbleed (CVE-2014-0160)   CRITICAL: vulnerable, can read "
+                "64k of memory\n")
+        check("the console fallback still works when there is no JSON",
+              engine._cb_parse_testssl({"key": "testssl"}, text), 1)
+        check("and it is the named issue",
+              engine._cb_findings[0].title.startswith("Heartbleed"))
+        check("at the library's severity",
+              engine._cb_findings[0].severity, "CRITICAL")
+
+        print("\n\033[1mConsolidation\033[0m")
         engine = Engine(base)
         for _ in range(3):
             engine._cb_record(CBFinding("HIGH", "same", "same place"))
-        check("the same finding is kept once", len(engine._cb_findings), 1)
+        check("the same finding in the same place is kept once",
+              len(engine._cb_findings), 1)
+
+        engine = Engine(base)
+        for page in ("/", "/about", "/contact", "/shop"):
+            engine._cb_record(CBFinding(
+                "MEDIUM", "Content-Security-Policy is missing",
+                base + page, stage="headers"))
+        check("one issue across four pages is one row",
+              len(engine._cb_findings), 1)
+        check("and the other three are instances",
+              engine._cb_findings[0].count, 4)
+        check("every location is kept",
+              len(engine._cb_findings[0].locations()), 4)
+        check("a different issue is still its own row",
+              (engine._cb_record(CBFinding("LOW", "other", base,
+                                           stage="headers")),
+               len(engine._cb_findings))[1], 2)
+
+        print("\n\033[1mTitles\033[0m")
+        from command_bridge.modules.cb_issues import clean_title
+        long_one = ("Deserialization of untrusted data in the session handler "
+                    "leading to remote code execution on the application "
+                    "server without authentication")
+        short = clean_title(long_one)
+        check("a long title is cut on a word boundary",
+              short.rstrip("…").split()[-1] in long_one.split())
+        check("and says it was cut", short.endswith("…"))
+        check("a short title is left alone",
+              clean_title("Directory indexing found"),
+              "Directory indexing found")
+        check("colour codes are stripped",
+              clean_title("\x1b[31mRC4 ciphers\x1b[0m"), "RC4 ciphers")
 
         print("\n\033[1mThe report\033[0m")
         engine = Engine(base)

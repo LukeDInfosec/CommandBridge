@@ -30,6 +30,7 @@ def check(label, got, want=True):
 
 
 def main():
+    from PyQt6.QtCore import Qt
     from PyQt6.QtWidgets import QApplication, QPushButton, QLabel
     from command_bridge.constants import TABS, RAIL_SECTIONS
     from command_bridge.ui.navigation import _TAB_BUILDERS, _SAFE_BUILD_ORDER
@@ -137,6 +138,8 @@ def main():
         [{"key": "headers", "name": "HTTP and security headers"},
          {"key": "nuclei", "name": "Nuclei templates"}], "example.com")
     check("the stage list was drawn", len(window._cb_stage_rows), 2)
+    check("the filter starts at Low+, so info does not bury the rest",
+          window.cb_filter.currentData(), "LOW")
     window._cb_ui_finding(CBFinding("CRITICAL", "Path traversal via 'file'",
                                     "http://x/download?file=..",
                                     "reads files", "root:x:0:0", "", "traversal"))
@@ -156,6 +159,38 @@ def main():
           window.cb_table.rowCount(), 1)
     window.cb_filter.setCurrentIndex(0)
     check("clearing the filter brings it back", window.cb_table.rowCount(), 2)
+
+    check("the severity is centred in its cell",
+          window.cb_table.item(0, 0).textAlignment()
+          & int(Qt.AlignmentFlag.AlignHCenter.value) != 0)
+    check("the severity column has room to be centred in",
+          window.cb_table.columnWidth(0) > 80)
+
+    window.cb_filter.setCurrentIndex(window.cb_filter.findData("LOW"))
+    window._cb_ui_finding(CBFinding("INFO", "Technology fingerprint",
+                                    "http://x/", "what the stack is", "",
+                                    "", "nuclei"))
+    check("an informational finding is held back by default",
+          window.cb_table.rowCount(), 2)
+    check("but it is counted, and the count says so",
+          "hidden by the filter" in window.cb_count_label.text())
+    window.cb_filter.setCurrentIndex(0)
+    check("showing everything brings it in", window.cb_table.rowCount(), 3)
+
+    print("\n\033[1mRepeats of one issue share a row\033[0m")
+    repeated = CBFinding("MEDIUM", "Content-Security-Policy is missing",
+                         "http://x/", "no CSP", "", "", "headers")
+    window._cb_ui_finding(repeated)
+    rows_before = window.cb_table.rowCount()
+    repeated.add_instance("http://x/about")
+    repeated.add_instance("http://x/contact")
+    window._cb_ui_refresh(repeated)
+    check("no new row is added", window.cb_table.rowCount(), rows_before)
+    wheres = [window.cb_table.item(r, 2).text()
+              for r in range(window.cb_table.rowCount())]
+    check("the row says how many other places it was seen",
+          any("(+2 more)" in w for w in wheres))
+
 
     check("the worst finding sorts to the top",
           window.cb_table.item(0, 0).text(), "CRITICAL")
