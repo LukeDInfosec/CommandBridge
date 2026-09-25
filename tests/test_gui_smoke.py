@@ -95,6 +95,16 @@ def main():
         print(f"      {DIM if False else ''}(could not import: "
               f"{', '.join(absent)}){RESET if False else ''}")
 
+    print("\n\033[1mActive Scan is registered\033[0m")
+    check("it is in TABS", "scan" in keys)
+    check("its builder is named", _TAB_BUILDERS.get("scan"),
+          "create_active_scan_tab")
+    check("the window class has the builder",
+          hasattr(CommandBridgeV5, "create_active_scan_tab"))
+    check("and the engine", hasattr(CommandBridgeV5, "start_active_scan"))
+    check("and a way to stop it",
+          hasattr(CommandBridgeV5, "stop_active_scan"))
+
     print("\n\033[1mThe analysis tabs are gone\033[0m")
     check("no request tab", "request" in keys, False)
     check("no response tab", "response" in keys, False)
@@ -119,6 +129,61 @@ def main():
           window.tab_widget.currentIndex(), window.tab_index("coffee"))
     check("its findings table exists", window.cb_table.columnCount(), 5)
     check("it starts empty", window.cb_table.rowCount(), 0)
+
+    print("\n\033[1mThe Active Scan tab builds and is usable\033[0m")
+    window.goto_tab("scan")
+    check("it can be shown",
+          window.tab_widget.currentIndex(), window.tab_index("scan"))
+    check("its findings table exists", window.as_table.columnCount(), 5)
+    check("it starts empty", window.as_table.rowCount(), 0)
+    check("the severity column is centred and roomy",
+          window.as_table.columnWidth(0) > 80)
+    check("every authentication method is offered",
+          [window.as_auth_mode.itemData(i)
+           for i in range(window.as_auth_mode.count())],
+          ["none", "form", "browser", "static", "bearer"])
+    check("all three profiles are offered",
+          [window.as_profile.itemData(i)
+           for i in range(window.as_profile.count())],
+          ["safe", "standard", "full"])
+    check("standard is the default", window.as_profile.currentData(),
+          "standard")
+    check("the second-account option is there for IDOR testing",
+          window.as_second_user.isChecked(), False)
+    # Choosing a login method should enable the credential fields, and
+    # choosing none should not.
+    window.as_auth_mode.setCurrentIndex(
+        [window.as_auth_mode.itemData(i)
+         for i in range(window.as_auth_mode.count())].index("form"))
+    check("picking form login enables the password box",
+          window.as_password.isEnabled())
+    window.as_auth_mode.setCurrentIndex(0)
+    check("and picking none disables it", window.as_password.isEnabled(),
+          False)
+
+    from command_bridge.modules.scanner import ScanFinding, Evidence
+    window._as_findings = []
+    window._as_on_finding(ScanFinding(
+        issue="sqli", where="http://x/item?id=1",
+        point="query parameter 'id'", confidence="confirmed",
+        evidence=[Evidence(label="true", request="GET /item?id=1 AND 1=1")],
+        detail_extra="confirmed by differential"))
+    window._as_on_finding(ScanFinding(
+        issue="open_redirect", where="http://x/go?next=/a",
+        point="query parameter 'next'", confidence="confirmed"))
+    check("findings render into the table", window.as_table.rowCount(), 2)
+    check("the worst sorts to the top",
+          window.as_table.item(0, 0).text(), "CRITICAL")
+    window.as_table.selectRow(0)
+    check("selecting one shows its evidence",
+          "AND 1=1" in window.as_detail.toPlainText())
+    window.as_filter.setCurrentIndex(
+        [window.as_filter.itemData(i)
+         for i in range(window.as_filter.count())].index("HIGH"))
+    check("filtering to High+ hides the medium one",
+          window.as_table.rowCount(), 1)
+    window.as_filter.setCurrentIndex(0)
+    check("clearing it brings the finding back", window.as_table.rowCount(), 2)
 
     print("\n\033[1mThe Coffee Break button is on the Web page\033[0m")
     buttons = [b.text() for b in window.findChildren(QPushButton)]
