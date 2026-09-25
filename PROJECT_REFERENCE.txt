@@ -19,6 +19,64 @@ HOW TO USE THIS FILE
  CHANGELOG (most recent first)
 ================================================================================
 
+## 2026-09-25 — COFFEE BREAK: the issue library, 25 → 113 entries (5.2.0)
+Burp's scanner ships 183 issue definitions. 25 was not a library, it was a
+start. cb_issues.ISSUES now holds 113, covering the ground Coffee Break's own
+tools actually produce evidence for:
+
+  transport and TLS (25)    cleartext HTTP, mixed content, cacheable HTTPS,
+                            plus the named TLS attacks already there
+  response headers (11)     CSP missing / unsafe-inline / no frame-ancestors /
+                            no form-action / report-only, HSTS, XFO, nosniff,
+                            Referrer-Policy, Permissions-Policy, content type
+  cookies (6)               Secure, HttpOnly, SameSite, parent-domain scope,
+                            session token in URL, password in cookie
+  cross-origin (7)          CORS arbitrary / null / subdomains / insecure
+                            origin, crossdomain.xml, cross-domain script
+                            include, Referer leakage
+  injection (24)            SQLi, OS command, code, SSTI, deserialisation,
+                            SSRF, XXE, LDAP, XPath, SSI, CRLF, smuggling,
+                            cache poisoning, host header, XSS ×3, prototype
+                            pollution, CSRF, traversal, file inclusion, file
+                            upload, open redirect, GraphQL ×2
+  tokens and secrets (9)    JWT unverified / none / weak secret / key
+                            injection, private key, credentials, cloud key,
+                            connection string, cleartext password
+  exposure (18)             source code, backup, .git, .env, config, listing,
+                            debug, phpinfo-class pages, verbose errors,
+                            version, outdated, vulnerable JS dependency, CVE,
+                            emails, internal IPs, user enumeration, API spec,
+                            robots
+  access and methods (7)    broken access control, edge bypass, default
+                            credentials, admin exposed, PUT, unsafe methods,
+                            TRACE
+  network services (3)      exposed datastore, cleartext service, remote
+                            access exposed
+
+NEW MAPPING LAYER — the part that makes the library do any work:
+  - for_text(text) matches ~65 patterns of tool wording onto a library entry,
+    so Nikto's "Directory indexing found", nuclei's "Directory listing" and
+    wpscan's version of it are ONE finding with ONE title.
+  - for_nuclei(id, name, description) — a CVE-named template is classified by
+    its bug class first and falls back to "known CVE".
+  - NMAP_SERVICES / NMAP_SEVERITY replace the old flat risky-service dict:
+    redis is an exposed datastore, telnet is a cleartext service, RDP is
+    remote access — three different findings, not one severity lookup.
+  - Every parser now routes through it: nmap, testssl, nikto, nuclei, wpscan,
+    the header probe, the redirect probe, the traversal probe and the 403
+    bypass. Unmatched output keeps the tool's own wording rather than being
+    forced into an issue it is not.
+
+probe_headers also gained: CSP-present-but-weak checks (unsafe-inline /
+eval / wildcard script-src, no frame-ancestors, no form-action, report-only),
+plain-HTTP detection, and per-attribute cookie issues (Secure, HttpOnly,
+SameSite, parent-domain scope, password-named cookie) instead of one merged
+row.
+
+tests: test_coffee_break.py 72 → 98, including a check that every library
+entry has a valid severity, an explanation, a remediation, a CWE and a unique
+title.
+
 ## 2026-09-25 — COFFEE BREAK: named issues, consolidation, less noise (5.1.1)
 The screen was printing everything every tool called "Info", one row per
 sighting, with titles cut at a fixed offset. Burp's scanner does none of those
