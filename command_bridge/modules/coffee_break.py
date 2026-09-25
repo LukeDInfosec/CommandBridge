@@ -45,6 +45,8 @@ from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QMessageBox
 
 from command_bridge.constants import BASE_DIR
+from command_bridge.modules import cb_issues
+from command_bridge.modules.cb_issues import ISSUES, clean_title
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Findings
@@ -71,9 +73,33 @@ class CBFinding:
     stage: str = ""
     confidence: str = "firm"   # firm | tentative
     seen_at: float = field(default_factory=time.time)
+    cwe: str = ""
+    references: list = field(default_factory=list)
+    #: Every other place the same issue was seen. Burp calls these instances,
+    #: and keeping them on one finding is the difference between "the site is
+    #: missing a CSP" and four hundred identical rows.
+    instances: list = field(default_factory=list)
 
     def sort_key(self):
         return (-SEV_ORDER.get(self.severity, 0), self.title.lower())
+
+    @property
+    def count(self):
+        return 1 + len(self.instances)
+
+    def locations(self):
+        return [self.where] + list(self.instances)
+
+    def add_instance(self, where, evidence=""):
+        """Record another sighting. Returns True when it was new."""
+        if not where or where == self.where or where in self.instances:
+            return False
+        self.instances.append(where)
+        # Keep a little more proof, but not an unbounded amount of it: the
+        # detail pane has to stay readable.
+        if evidence and len(self.evidence) < 1200:
+            self.evidence = (self.evidence.rstrip() + "\n" + evidence).strip()
+        return True
 
     def as_dict(self):
         return asdict(self)
@@ -588,7 +614,8 @@ class CoffeeBreakMixin:
                      f"{out}/{safe}_testssl.json {host} 2>&1; "
                      f"else echo '[i] testssl is not installed — skipping. "
                      f"Install: sudo apt install testssl'; fi"),
-                 parser="_cb_parse_testssl"),
+                 parser="_cb_parse_testssl",
+                 artefact_file=f"{out}/{safe}_testssl.json"),
             dict(key="headers", name="HTTP and security headers", kind="python",
                  probe=probe_headers),
             dict(key="nikto", name="Nikto", kind="shell",
@@ -874,16 +901,44 @@ class CoffeeBreakMixin:
         return headers
 
     def _cb_record(self, finding):
-        """Keep a finding, unless it is one we already have."""
-        signature = (finding.severity, finding.title, finding.where)
-        if any((f.severity, f.title, f.where) == signature
-               for f in self._cb_findings):
+        """Keep a finding — or, if we already have this issue, another instance.
+
+        The old behaviour was one row per sighting, which is how a scan of a
+        site with two hundred pages produced two hundred rows saying the same
+        thing. Burp consolidates by issue type and lists the affected locations
+        underneath, and so does this now.
+        """
+        for existing in self._cb_findings:
+            if (existing.title, existing.stage) != (finding.title, finding.stage):
+                continue
+            if existing.add_instance(finding.where, finding.evidence):
+                # A repeat of a firm finding is firmer than a single tentative
+                # one, but a repeat never makes a tentative finding firm.
+                self._cb_ui_call("_cb_ui_refresh", existing)
             return
+
         self._cb_findings.append(finding)
         self._cb_ui_call("_cb_ui_finding", finding)
         self.console.append_ansi(
             f"    {SEV_TAG.get(finding.severity, '[INFO]')} "
             f"{finding.title} — {finding.where}\n")
+
+    def _cb_issue(self, key, where, evidence="", stage="", **override):
+        """Build a finding from the named-issue library.
+
+        Everything the library knows — the settled title, the severity, the
+        explanation, the fix, the CWE — comes from one place, so the same
+        problem reads the same way whichever tool happened to spot it.
+        """
+        issue = ISSUES.get(key) or ISSUES["tls_generic"]
+        fields = dict(
+            severity=issue["severity"], title=issue["title"],
+            where=where, detail=issue["detail"],
+            remediation=issue["remediation"], cwe=issue["cwe"],
+            references=list(issue["references"]), evidence=evidence,
+            stage=stage)
+        fields.update({k: v for k, v in override.items() if v})
+        return CBFinding(**fields)
 
     def _cb_note_status(self, url, status):
         """Remember anything that answered 401/403 so the bypass stage has work."""
@@ -930,55 +985,160 @@ class CoffeeBreakMixin:
         return produced
 
     def _cb_parse_testssl(self, stage, text):
-        produced = 0
-        for line in text.splitlines():
-            clean = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
-            severity = None
-            if re.search(r"\b(CRITICAL)\b", clean):
-                severity = "CRITICAL"
-            elif re.search(r"\b(HIGH)\b", clean):
-                severity = "HIGH"
-            elif re.search(r"\b(MEDIUM)\b", clean):
-                severity = "MEDIUM"
-            elif re.search(r"\b(LOW)\b", clean):
-                severity = "LOW"
-            if not severity or len(clean) < 12:
+        """Read testssl's JSON, and report named issues rather than its prose.
+
+        testssl writes one record per check with a stable ``id``, a severity and
+        a CVE. Those records are mapped onto the issue library, so a host that
+        offers CBC suites produces one finding called **Lucky 13** carrying the
+        suites as evidence — instead of, as before, one row per line that
+        happened to contain the word MEDIUM, with the title cut at ninety
+        characters somewhere in the middle of a word.
+
+        Records testssl marks OK or INFO are what "not vulnerable" looks like;
+        they are not findings and are not reported.
+        """
+        records = self._cb_testssl_records(stage, text)
+        if not records:
+            return 0
+
+        #: key → (severity, [evidence lines], [cves])
+        grouped = {}
+        for record in records:
+            key, issue = cb_issues.for_testssl(record)
+            if not key:
                 continue
-            title = re.split(r"\s{2,}", clean)[0][:90] or clean[:90]
-            self._cb_record(CBFinding(
-                severity=severity, title=f"TLS: {title}",
-                where=self.get_scanner_target(),
-                detail="Reported by testssl against the TLS configuration.",
-                evidence=clean[:400], stage=stage["key"]))
+            severity = str(record.get("severity", "")).upper()
+            severity = cb_issues.worst(issue["severity"],
+                                       severity if severity in SEVERITIES else "")
+            line = clean_title(record.get("finding", ""), 300)
+            identifier = str(record.get("id", ""))
+            bucket = grouped.setdefault(key, {"severity": severity,
+                                              "lines": [], "cves": []})
+            bucket["severity"] = cb_issues.worst(bucket["severity"], severity)
+            entry = f"{identifier}: {line}" if identifier else line
+            if entry not in bucket["lines"]:
+                bucket["lines"].append(entry)
+            for cve in str(record.get("cve", "")).split():
+                if cve and cve not in bucket["cves"]:
+                    bucket["cves"].append(cve)
+
+        produced = 0
+        host = self.get_scanner_target()
+        for key, bucket in grouped.items():
+            evidence = "\n".join(bucket["lines"][:14])
+            if len(bucket["lines"]) > 14:
+                evidence += f"\n… and {len(bucket['lines']) - 14} more"
+            finding = self._cb_issue(key, host, evidence, stage["key"],
+                                     severity=bucket["severity"])
+            for cve in bucket["cves"]:
+                if cve not in finding.references:
+                    finding.references.append(cve)
+            self._cb_record(finding)
             produced += 1
+        self.console.append_ansi(
+            f"    {len(records)} TLS check(s) read; {produced} issue(s) worth "
+            f"reporting\n")
         return produced
 
+    def _cb_testssl_records(self, stage, text):
+        """testssl's JSON if it wrote any, otherwise its console output.
+
+        The text fallback rebuilds records of the same shape so that everything
+        downstream — the library lookup, the grouping — does not need to know
+        which of the two it is reading.
+        """
+        safe = self.sanitize_target_for_filename(self.target)
+        path = stage.get("artefact_file") or \
+            str(Path(self.output_dir) / f"{safe}_testssl.json")
+        if path and Path(path).is_file():
+            try:
+                blob = json.loads(Path(path).read_text(errors="replace"))
+            except Exception:
+                blob = None
+            if isinstance(blob, dict):
+                blob = blob.get("scanResult") or blob.get("findings") or []
+                if blob and isinstance(blob[0], dict) and "findings" not in blob[0]:
+                    pass
+            if isinstance(blob, list) and blob:
+                flat = []
+                for item in blob:
+                    if not isinstance(item, dict):
+                        continue
+                    if "id" in item:
+                        flat.append(item)
+                        continue
+                    # testssl --jsonfile-pretty nests by section.
+                    for value in item.values():
+                        if isinstance(value, list):
+                            flat.extend(v for v in value
+                                        if isinstance(v, dict) and "id" in v)
+                if flat:
+                    return flat
+
+        records = []
+        for line in text.splitlines():
+            clean = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
+            if len(clean) < 12:
+                continue
+            severity = next((s for s in ("CRITICAL", "HIGH", "MEDIUM", "LOW")
+                             if re.search(rf"\b{s}\b", clean)), None)
+            if not severity:
+                continue
+            parts = re.split(r"\s{2,}", clean, maxsplit=1)
+            records.append({"id": parts[0].strip(),
+                            "severity": severity,
+                            "finding": (parts[1] if len(parts) > 1
+                                        else clean).strip(),
+                            "cve": " ".join(re.findall(r"CVE-\d{4}-\d+", clean))})
+        return records
+
     def _cb_parse_nikto(self, stage, text):
+        """Nikto's '+' lines, minus the inventory.
+
+        Most of what Nikto prints is a description of the server, not a problem
+        with it — the headers it did and did not see, the methods allowed, the
+        banner. Those go into one collapsed observation; the rest become
+        findings, still marked tentative because Nikto matches signatures and
+        does not confirm anything.
+        """
         produced = 0
+        observations = []
         for line in text.splitlines():
             clean = line.strip()
             if not clean.startswith("+ ") or len(clean) < 12:
                 continue
-            body = clean[2:]
-            if body.startswith(("Target ", "Start Time", "End Time",
-                                "Server:", "Root page", "No CGI", "Scan terminated",
-                                "host(s) tested", "SSL Info", "Allowed HTTP")):
+            body = clean[2:].strip()
+            if cb_issues.is_nikto_noise(body):
+                if len(observations) < 40 and body not in observations:
+                    observations.append(body)
                 continue
-            severity = "LOW"
             lowered = body.lower()
+            severity = "LOW"
             if any(w in lowered for w in ("osvdb", "cve-", "vulnerab",
                                           "traversal", "injection")):
                 severity = "MEDIUM"
             if any(w in lowered for w in ("remote code", "shell", "backdoor")):
                 severity = "HIGH"
             self._cb_record(CBFinding(
-                severity=severity, title=body[:110],
+                severity=severity, title=clean_title(body),
                 where=self._cb_target_url(),
-                detail="Reported by Nikto. Confirm by hand before reporting — "
-                       "Nikto is signature-driven and does not verify.",
+                detail="Reported by Nikto.\n\n" + body + "\n\nNikto is "
+                       "signature-driven and does not verify what it matches; "
+                       "confirm this by hand before it goes in a report.",
                 evidence=body[:500], confidence="tentative",
                 stage=stage["key"]))
             produced += 1
+
+        if observations:
+            self._cb_record(CBFinding(
+                severity="INFO",
+                title="Server inventory observed by Nikto",
+                where=self._cb_target_url(),
+                detail="Descriptive output from Nikto, collapsed into one "
+                       "entry. None of it is a finding on its own; it is here "
+                       "because it is useful context for the ones that are.",
+                evidence="\n".join(observations),
+                confidence="tentative", stage=stage["key"]))
         return produced
 
     def _cb_parse_nuclei(self, stage, text):
@@ -989,6 +1149,7 @@ class CoffeeBreakMixin:
             lines = Path(path).read_text(errors="replace").splitlines()
         else:
             lines = [l for l in text.splitlines() if l.strip().startswith("{")]
+        fingerprints = []
         for line in lines:
             line = line.strip()
             if not line.startswith("{"):
@@ -1000,26 +1161,63 @@ class CoffeeBreakMixin:
             info = row.get("info") or {}
             severity = str(info.get("severity", "info")).upper()
             matched = row.get("matched-at") or row.get("host") or self.target
+            template = row.get("template-id", "")
+            name = info.get("name") or template or "nuclei match"
+
+            # Fingerprinting templates say what the stack is. There are dozens
+            # of them on any real site and not one of them is a finding.
+            if cb_issues.is_fingerprint(template) or (
+                    severity == "INFO" and not info.get("remediation")):
+                entry = f"{name} — {matched}"
+                if entry not in fingerprints:
+                    fingerprints.append(entry)
+                continue
+
+            references = [r for r in (info.get("reference") or []) if r][:6] \
+                if isinstance(info.get("reference"), list) else []
             self._cb_record(CBFinding(
                 severity=severity if severity in SEVERITIES else "INFO",
-                title=info.get("name") or row.get("template-id", "nuclei match"),
+                title=clean_title(name),
                 where=matched,
-                detail=(info.get("description") or "").strip()
-                       or "Matched a nuclei template.",
+                detail=(" ".join((info.get("description") or "").split())
+                        or "Matched a nuclei template.")
+                       + (f"\n\nTemplate: {template}" if template else ""),
                 evidence=(row.get("extracted-results") and
                           ", ".join(row["extracted-results"])[:400])
                          or row.get("matcher-name", "") or line[:300],
                 remediation=" ".join(info.get("remediation", "").split())[:600],
+                references=references,
+                cwe=self._cb_cwe_from(info),
                 stage=stage["key"]))
             produced += 1
+
+        if fingerprints:
+            self._cb_record(CBFinding(
+                severity="INFO",
+                title="Technology fingerprint",
+                where=self._cb_target_url(),
+                detail="Everything nuclei recognised about the stack, in one "
+                       "entry rather than one row each. Useful for choosing "
+                       "what to test next; not a finding in itself.",
+                evidence="\n".join(fingerprints[:60]),
+                stage=stage["key"]))
         return produced
+
+    @staticmethod
+    def _cb_cwe_from(info):
+        """nuclei's classification block, when the template carries one."""
+        classification = info.get("classification") or {}
+        cwe = classification.get("cwe-id") or ""
+        if isinstance(cwe, list):
+            cwe = ", ".join(str(c) for c in cwe[:3])
+        return str(cwe).upper()
 
     def _cb_parse_wpscan(self, stage, text):
         produced = 0
         for match in re.finditer(r"\|\s*\[!\]\s*Title:\s*(.+)", text):
             title = match.group(1).strip()
             self._cb_record(CBFinding(
-                severity="MEDIUM", title=f"WordPress: {title}"[:120],
+                severity="MEDIUM", title=clean_title(f"WordPress: {title}"),
                 where=self._cb_target_url(),
                 detail="Reported by wpscan against the WordPress install, its "
                        "plugins or its themes.",
@@ -1102,8 +1300,21 @@ class CoffeeBreakMixin:
             for finding in group:
                 lines.append(f"### {finding.title}")
                 lines.append(f"- **Where:** {finding.where}")
+                if finding.instances:
+                    lines.append(f"- **Also at:** {len(finding.instances)} "
+                                 f"other location(s)")
+                    for extra in finding.instances[:25]:
+                        lines.append(f"    - {extra}")
+                    if len(finding.instances) > 25:
+                        lines.append(f"    - … and "
+                                     f"{len(finding.instances) - 25} more")
                 lines.append(f"- **Stage:** {finding.stage}")
                 lines.append(f"- **Confidence:** {finding.confidence}")
+                if finding.cwe:
+                    lines.append(f"- **Classification:** {finding.cwe}")
+                if finding.references:
+                    lines.append("- **References:** "
+                                 + ", ".join(str(r) for r in finding.references))
                 if finding.detail:
                     lines.append(f"\n{finding.detail}\n")
                 if finding.evidence:
