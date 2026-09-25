@@ -137,38 +137,42 @@ class _CBWorker(QObject):
 #  Probes — plain functions so they can run on a thread and be tested alone
 # ─────────────────────────────────────────────────────────────────────────────
 
+#: header name → the issue in the library that its absence is. Keeping the
+#: wording in one place means the header check and nuclei's own
+#: missing-header template produce the same finding rather than two.
 SECURITY_HEADERS = {
-    "content-security-policy": (
-        "MEDIUM", "Content-Security-Policy is missing",
-        "Without a CSP, an injected script runs with the full privileges of the "
-        "page. It is the single most effective mitigation against XSS.",
-        "Set a policy that names the sources you actually use; start in "
-        "report-only mode if you need to find them."),
-    "strict-transport-security": (
-        "MEDIUM", "Strict-Transport-Security is missing",
-        "A browser that has never seen the HTTPS site will try HTTP first, "
-        "which is where an attacker on the path strips the redirect.",
-        "Send 'max-age=31536000; includeSubDomains' over HTTPS."),
-    "x-frame-options": (
-        "LOW", "No framing protection",
-        "The page can be embedded in a frame on another origin, which is what "
-        "clickjacking needs.",
-        "Send 'X-Frame-Options: DENY' or a CSP frame-ancestors directive."),
-    "x-content-type-options": (
-        "LOW", "X-Content-Type-Options is missing",
-        "Browsers may sniff a response's type, so an upload served as text can "
-        "be executed as script.",
-        "Send 'X-Content-Type-Options: nosniff'."),
-    "referrer-policy": (
-        "INFO", "Referrer-Policy is missing",
-        "Full URLs — including anything sensitive in the path or query — are "
-        "sent to third parties in the Referer header.",
-        "Send 'Referrer-Policy: strict-origin-when-cross-origin'."),
-    "permissions-policy": (
-        "INFO", "Permissions-Policy is missing",
-        "Embedded content inherits access to camera, microphone and location.",
-        "Send a Permissions-Policy naming only the features the page uses."),
+    "content-security-policy": "csp_missing",
+    "strict-transport-security": "hsts_missing",
+    "x-frame-options": "xfo_missing",
+    "x-content-type-options": "nosniff_missing",
+    "referrer-policy": "referrer_policy",
+    "permissions-policy": "permissions_policy",
 }
+
+#: CSP directives that make the header present but ineffective. Burp reports
+#: each of these separately, and they do mean different things.
+CSP_WEAKNESSES = (
+    (re.compile(r"script-src[^;]*('unsafe-inline'|'unsafe-eval'|\*)"),
+     "csp_unsafe_script"),
+    (re.compile(r"^(?!.*frame-ancestors)", re.S), "csp_clickjacking"),
+    (re.compile(r"^(?!.*form-action)", re.S), "csp_form_hijack"),
+)
+
+
+def _finding_from(key, where, evidence="", stage="", **override):
+    """A CBFinding built from the library — the free-function form.
+
+    The mixin has its own ``_cb_issue``; probes run on a worker thread with no
+    access to it, so they use this.
+    """
+    issue = ISSUES.get(key) or ISSUES["tls_generic"]
+    fields = dict(severity=issue["severity"], title=issue["title"],
+                  where=where, detail=issue["detail"],
+                  remediation=issue["remediation"], cwe=issue["cwe"],
+                  references=list(issue["references"]), evidence=evidence,
+                  stage=stage)
+    fields.update({k: v for k, v in override.items() if v})
+    return CBFinding(**fields)
 
 #: Headers that say more about the server than the operator meant to.
 LEAKY_HEADERS = ("server", "x-powered-by", "x-aspnet-version",
@@ -213,44 +217,67 @@ def probe_headers(context, report):
     report(f"{response.status_code} {response.reason} — "
            f"{len(response.content)} bytes, {len(headers)} headers")
 
-    for header, (severity, title, detail, fix) in SECURITY_HEADERS.items():
+    seen_headers = "Response headers: " + ", ".join(sorted(headers))[:400]
+    for header, key in SECURITY_HEADERS.items():
         if header not in headers:
-            findings.append(CBFinding(
-                severity=severity, title=title, where=response.url,
-                detail=detail, remediation=fix,
-                evidence="Response headers: " + ", ".join(sorted(headers)) [:400],
-                stage="headers"))
+            findings.append(_finding_from(key, response.url, seen_headers,
+                                          "headers"))
+
+    # A CSP that is present but permits what it exists to prevent is its own
+    # finding — and a more interesting one than a missing header, because the
+    # operator believes they are covered.
+    policy = headers.get("content-security-policy", "")
+    if policy:
+        for pattern, key in CSP_WEAKNESSES:
+            if pattern.search(policy):
+                findings.append(_finding_from(
+                    key, response.url, f"Content-Security-Policy: {policy[:400]}",
+                    "headers"))
+    if headers.get("content-security-policy-report-only") and not policy:
+        findings.append(_finding_from(
+            "csp_report_only", response.url,
+            "Content-Security-Policy-Report-Only: "
+            + headers["content-security-policy-report-only"][:300], "headers"))
+
+    if response.url.startswith("http://"):
+        findings.append(_finding_from(
+            "cleartext_http", response.url,
+            f"Final URL after redirects: {response.url}", "headers"))
 
     for header in LEAKY_HEADERS:
         if header in headers and headers[header].strip():
-            findings.append(CBFinding(
-                severity="INFO",
-                title=f"Version disclosure in {header}",
-                where=response.url,
-                detail="The response names the software and often its version, "
-                       "which turns 'find a vulnerability' into 'look up a CVE'.",
-                evidence=f"{header}: {headers[header]}",
-                remediation="Suppress or flatten the header at the proxy.",
-                stage="headers"))
+            findings.append(_finding_from(
+                "version_disclosure", response.url,
+                f"{header}: {headers[header]}", "headers",
+                title=f"Software version disclosed in {header}"))
 
     # Cookies are part of the response, and the flags are the whole game.
+    # Each missing cookie attribute is its own issue, because each one is a
+    # different attack. Consolidation then groups them across cookies.
+    raw_cookies = " ".join(v for k, v in response.headers.items()
+                           if k.lower() == "set-cookie")
+    host = urllib.parse.urlparse(response.url).hostname or ""
     for cookie in response.cookies:
-        problems = []
+        where = f"{response.url} — cookie '{cookie.name}'"
+        proof = f"Set-Cookie: {cookie.name}=…"
         if not cookie.secure:
-            problems.append("no Secure flag")
-        if not cookie.has_nonstandard_attr("HttpOnly") and \
-                not cookie.has_nonstandard_attr("httponly"):
-            problems.append("no HttpOnly flag")
-        if problems:
-            findings.append(CBFinding(
-                severity="LOW" if "no Secure flag" in problems else "INFO",
-                title=f"Cookie {cookie.name} set without {' and '.join(problems)}",
-                where=response.url,
-                detail="A cookie without Secure can be sent over plain HTTP; "
-                       "one without HttpOnly can be read by injected script.",
-                evidence=f"Set-Cookie: {cookie.name}=…",
-                remediation="Set Secure, HttpOnly and an explicit SameSite.",
-                stage="headers"))
+            findings.append(_finding_from("cookie_no_secure", where, proof,
+                                          "headers"))
+        if not (cookie.has_nonstandard_attr("HttpOnly")
+                or cookie.has_nonstandard_attr("httponly")):
+            findings.append(_finding_from("cookie_no_httponly", where, proof,
+                                          "headers"))
+        if "samesite" not in raw_cookies.lower():
+            findings.append(_finding_from("cookie_no_samesite", where, proof,
+                                          "headers"))
+        domain = (cookie.domain or "").lstrip(".")
+        if domain and host.endswith(domain) and domain != host:
+            findings.append(_finding_from(
+                "cookie_parent_domain", where,
+                f"{proof}; Domain={cookie.domain} (host is {host})", "headers"))
+        if re.search(r"pass(word|wd)?|pwd", cookie.name, re.I):
+            findings.append(_finding_from("password_in_cookie", where, proof,
+                                          "headers"))
 
     # What the stack is, so later stages can skip what does not apply.
     tech = []
@@ -293,18 +320,11 @@ def probe_redirects(context, report):
                 continue
             location = response.headers.get("Location", "")
             if 300 <= response.status_code < 400 and "cb-canary.example" in location:
-                findings.append(CBFinding(
-                    severity="MEDIUM",
-                    title=f"Open redirect via '{param}'",
-                    where=probe,
-                    detail="The application sends the browser to a location it "
-                           "took from the query string without checking it. "
-                           "Useful for phishing, and for stealing OAuth codes "
-                           "when the parameter feeds a redirect_uri.",
-                    evidence=f"HTTP {response.status_code}\nLocation: {location}",
-                    remediation="Allow-list the destinations, or map an opaque "
-                                "key to a destination server-side.",
-                    stage="redirect"))
+                findings.append(_finding_from(
+                    "open_redirect", probe, stage="redirect",
+                    title=f"Open redirection via '{param}'",
+                    evidence=f"HTTP {response.status_code}\n"
+                             f"Location: {location}"))
                 break          # one proof per parameter is enough
     report(f"tried {tried} redirect probes")
     return findings, {"redirect_params_tested": tried}
@@ -446,20 +466,11 @@ def probe_traversal(context, report):
                 body = response.text or ""
                 for pattern, what in TRAVERSAL_PROOF:
                     if pattern.search(body):
-                        findings.append(CBFinding(
-                            severity="CRITICAL",
+                        findings.append(_finding_from(
+                            "traversal", probe, stage="traversal",
                             title=f"Path traversal via '{name}'",
-                            where=probe,
-                            detail="The parameter is used to build a file path "
-                                   "and the application returned the contents "
-                                   "of a file outside the web root.",
                             evidence=f"Proof: {what}\n"
-                                     + "\n".join(body.splitlines()[:6])[:600],
-                            remediation="Do not build paths from user input. "
-                                        "Map an identifier to a known file, or "
-                                        "resolve and confirm the path stays "
-                                        "inside the intended directory.",
-                            stage="traversal"))
+                                     + "\n".join(body.splitlines()[:6])[:600]))
                         break
                 else:
                     continue
@@ -531,21 +542,13 @@ def probe_403_bypass(context, report):
                    "baseline": base_status, "bypassed": bool(worked)}
             table.append(row)
             if worked:
-                findings.append(CBFinding(
-                    severity="HIGH",
-                    title=f"403 bypassed with {label}",
-                    where=url,
-                    detail="The access control is enforced at the edge and can "
-                           "be stepped around, so whatever it was protecting is "
-                           "reachable.",
+                findings.append(_finding_from(
+                    "edge_bypass", url, stage="bypass",
+                    title=f"Access restriction bypassed with {label}",
                     evidence=f"{method} {probe}\n"
                              + "\n".join(f"{k}: {v}" for k, v in headers.items())
                              + f"\n→ HTTP {response.status_code} ({length} bytes); "
-                               f"baseline was {base_status}",
-                    remediation="Enforce authorisation in the application, not "
-                                "only in the proxy, and normalise the path "
-                                "before the rule is applied.",
-                    stage="bypass"))
+                               f"baseline was {base_status}"))
     report(f"{len(table)} attempt(s) across {len(blocked[:25])} endpoint(s); "
            f"{sum(1 for r in table if r['bypassed'])} got through")
     return findings, {"bypass_table": table}
@@ -960,25 +963,18 @@ class CoffeeBreakMixin:
             entry = f"{port}/{proto} {service}"
             if entry not in ports:
                 ports.append(entry)
-            banner = (version or "").strip()
-            risky = {"telnet": "HIGH", "ftp": "MEDIUM", "rlogin": "HIGH",
-                     "rsh": "HIGH", "vnc": "MEDIUM", "rdp": "MEDIUM",
-                     "smb": "MEDIUM", "microsoft-ds": "MEDIUM",
-                     "mysql": "MEDIUM", "postgresql": "MEDIUM",
-                     "redis": "HIGH", "mongodb": "HIGH", "memcached": "HIGH",
-                     "elasticsearch": "HIGH"}
-            severity = risky.get(service.lower())
-            if severity:
-                self._cb_record(CBFinding(
-                    severity=severity,
-                    title=f"{service} reachable on {port}/{proto}",
-                    where=f"{self.get_scanner_target()}:{port}",
-                    detail="A service that is rarely meant to face the internet "
-                           "is answering. Check whether it should be reachable "
-                           "at all before testing it.",
-                    evidence=line.strip(),
-                    remediation="Restrict it to the networks that need it.",
-                    stage=stage["key"]))
+            name = service.lower()
+            key = cb_issues.NMAP_SERVICES.get(name)
+            if key:
+                banner = (version or "").strip()
+                self._cb_record(self._cb_issue(
+                    key, f"{self.get_scanner_target()}:{port}",
+                    line.strip(), stage["key"],
+                    severity=cb_issues.NMAP_SEVERITY.get(name),
+                    title=f"{ISSUES[key]['title']} — {service} on "
+                          f"{port}/{proto}",
+                    detail=ISSUES[key]["detail"]
+                           + (f"\n\nBanner: {banner}" if banner else "")))
                 produced += 1
         if ports:
             self.console.append_ansi(f"    open: {', '.join(ports)}\n")
@@ -1112,21 +1108,27 @@ class CoffeeBreakMixin:
                 if len(observations) < 40 and body not in observations:
                     observations.append(body)
                 continue
-            lowered = body.lower()
-            severity = "LOW"
-            if any(w in lowered for w in ("osvdb", "cve-", "vulnerab",
-                                          "traversal", "injection")):
-                severity = "MEDIUM"
-            if any(w in lowered for w in ("remote code", "shell", "backdoor")):
-                severity = "HIGH"
-            self._cb_record(CBFinding(
-                severity=severity, title=clean_title(body),
-                where=self._cb_target_url(),
-                detail="Reported by Nikto.\n\n" + body + "\n\nNikto is "
-                       "signature-driven and does not verify what it matches; "
-                       "confirm this by hand before it goes in a report.",
-                evidence=body[:500], confidence="tentative",
-                stage=stage["key"]))
+            key, issue = cb_issues.for_text(body)
+            if key:
+                self._cb_record(self._cb_issue(
+                    key, self._cb_target_url(), body[:500], stage["key"],
+                    confidence="tentative",
+                    detail=issue["detail"] + f"\n\nNikto reported: {body}\n\n"
+                           "Nikto matches signatures and does not confirm what "
+                           "it finds; verify before this goes in a report."))
+            else:
+                lowered = body.lower()
+                severity = "LOW"
+                if any(w in lowered for w in ("osvdb", "cve-", "vulnerab")):
+                    severity = "MEDIUM"
+                self._cb_record(CBFinding(
+                    severity=severity, title=clean_title(body),
+                    where=self._cb_target_url(),
+                    detail="Reported by Nikto.\n\n" + body + "\n\nNikto is "
+                           "signature-driven and does not verify what it "
+                           "matches; confirm this by hand before reporting it.",
+                    evidence=body[:500], confidence="tentative",
+                    stage=stage["key"]))
             produced += 1
 
         if observations:
@@ -1175,20 +1177,39 @@ class CoffeeBreakMixin:
 
             references = [r for r in (info.get("reference") or []) if r][:6] \
                 if isinstance(info.get("reference"), list) else []
-            self._cb_record(CBFinding(
-                severity=severity if severity in SEVERITIES else "INFO",
-                title=clean_title(name),
-                where=matched,
-                detail=(" ".join((info.get("description") or "").split())
-                        or "Matched a nuclei template.")
-                       + (f"\n\nTemplate: {template}" if template else ""),
-                evidence=(row.get("extracted-results") and
-                          ", ".join(row["extracted-results"])[:400])
-                         or row.get("matcher-name", "") or line[:300],
-                remediation=" ".join(info.get("remediation", "").split())[:600],
-                references=references,
-                cwe=self._cb_cwe_from(info),
-                stage=stage["key"]))
+            description = " ".join((info.get("description") or "").split())
+            evidence = ((row.get("extracted-results") and
+                         ", ".join(row["extracted-results"])[:400])
+                        or row.get("matcher-name", "") or line[:300])
+            if template:
+                evidence = f"nuclei template: {template}\n{evidence}"
+
+            # Name it from the library when the template describes something
+            # the library knows; keep nuclei's own wording when it does not.
+            key, issue = cb_issues.for_nuclei(template, name, description)
+            if key:
+                finding = self._cb_issue(
+                    key, matched, evidence, stage["key"],
+                    severity=(severity if severity in SEVERITIES else None),
+                    detail=issue["detail"] + (f"\n\nnuclei: {name}"
+                                              if name else ""))
+                for reference in references:
+                    if reference not in finding.references:
+                        finding.references.append(reference)
+                self._cb_record(finding)
+            else:
+                self._cb_record(CBFinding(
+                    severity=severity if severity in SEVERITIES else "INFO",
+                    title=clean_title(name),
+                    where=matched,
+                    detail=(description or "Matched a nuclei template.")
+                           + (f"\n\nTemplate: {template}" if template else ""),
+                    evidence=evidence,
+                    remediation=" ".join(
+                        info.get("remediation", "").split())[:600],
+                    references=references,
+                    cwe=self._cb_cwe_from(info),
+                    stage=stage["key"]))
             produced += 1
 
         if fingerprints:
@@ -1216,21 +1237,27 @@ class CoffeeBreakMixin:
         produced = 0
         for match in re.finditer(r"\|\s*\[!\]\s*Title:\s*(.+)", text):
             title = match.group(1).strip()
-            self._cb_record(CBFinding(
-                severity="MEDIUM", title=clean_title(f"WordPress: {title}"),
-                where=self._cb_target_url(),
-                detail="Reported by wpscan against the WordPress install, its "
-                       "plugins or its themes.",
-                evidence=title[:400], stage=stage["key"]))
+            key, issue = cb_issues.for_text(title)
+            if key:
+                self._cb_record(self._cb_issue(
+                    key, self._cb_target_url(), title[:400], stage["key"],
+                    title=clean_title(f"WordPress: {ISSUES[key]['title']}"),
+                    detail=issue["detail"] + f"\n\nwpscan reported: {title}"))
+            else:
+                self._cb_record(CBFinding(
+                    severity="MEDIUM", title=clean_title(f"WordPress: {title}"),
+                    where=self._cb_target_url(),
+                    detail="Reported by wpscan against the WordPress install, "
+                           "its plugins or its themes.",
+                    evidence=title[:400], stage=stage["key"]))
             produced += 1
         if re.search(r"User\(s\) Identified", text):
             users = re.findall(r"\|\s*\[i\]\s*(\S+)$", text, re.M)
             if users:
-                self._cb_record(CBFinding(
-                    severity="LOW", title="WordPress usernames enumerable",
-                    where=self._cb_target_url(),
-                    detail="Valid usernames make password attacks cheaper.",
-                    evidence=", ".join(users[:12]), stage=stage["key"]))
+                self._cb_record(self._cb_issue(
+                    "user_enumeration", self._cb_target_url(),
+                    ", ".join(users[:12]), stage["key"],
+                    title="WordPress usernames enumerable"))
                 produced += 1
         return produced
 
