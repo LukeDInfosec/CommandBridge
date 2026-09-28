@@ -307,11 +307,23 @@ class StatusMixin:
                 self.update_status_elapsed(time_str)
 
     def stop_progress_animation(self):
-        """Stop the progress animation"""
+        """Stop the progress animation.
+
+        The clock is NOT zeroed while a chain is running. This runs at the end
+        of every step, so during Coffee Break it used to reset the status
+        bar's timer to 00:00 fourteen times — and because the Python stages
+        never started the animation at all, the clock read 00:00 for the whole
+        scan. The chain keeps its own elapsed time and writes it every second.
+        """
         if self.status_animation_timer:
             self.status_animation_timer.stop()
             self.status_animation_timer = None
         self.command_start_time = None
+        chain_running = (getattr(self, "_cb_active", False)
+                         or getattr(self, "_auto_scan_active", False)
+                         or getattr(self, "_externals_active", False))
+        if chain_running:
+            return
         if hasattr(self, "update_status_elapsed"):
             self.update_status_elapsed("00:00")
         if hasattr(self, "console_elapsed_label"):
