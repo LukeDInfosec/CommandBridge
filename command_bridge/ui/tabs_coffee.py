@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame,
     QScrollArea, QProgressBar, QTableWidget, QTableWidgetItem, QSplitter,
     QTextEdit, QHeaderView, QAbstractItemView, QComboBox, QFileDialog,
-    QMessageBox, QSizePolicy,
+    QMessageBox, QSizePolicy, QMenu, QApplication,
 )
 
 from command_bridge.modules.coffee_break import SEVERITIES, SEV_ORDER
@@ -112,6 +112,17 @@ class CoffeeBreakTabMixin:
         self.cb_start_btn.clicked.connect(self.start_coffee_break)
         row.addWidget(self.cb_start_btn)
 
+        self.cb_pause_btn = QPushButton("Pause")
+        self.cb_pause_btn.setObjectName("secondaryButton")
+        self.cb_pause_btn.setMinimumHeight(42)
+        self.cb_pause_btn.setEnabled(False)
+        self.cb_pause_btn.setToolTip(
+            "Suspends the step that is running and holds the chain. The "
+            "running tool is stopped rather than killed, so a long scan is "
+            "not thrown away — leave the house, come back, press Resume.")
+        self.cb_pause_btn.clicked.connect(self._cb_toggle_pause)
+        row.addWidget(self.cb_pause_btn)
+
         self.cb_skip_btn = QPushButton("Skip this step")
         self.cb_skip_btn.setObjectName("secondaryButton")
         self.cb_skip_btn.setMinimumHeight(42)
@@ -152,6 +163,19 @@ class CoffeeBreakTabMixin:
         self.cb_progress.setFormat("idle")
         self.cb_progress.setMinimumHeight(22)
         box.addWidget(self.cb_progress)
+
+        # What is actually running. A progress bar that says "4 of 14" does
+        # not tell you whether it is the nmap that takes forty minutes or the
+        # header check that takes two seconds.
+        self.cb_command = QLabel("")
+        self.cb_command.setWordWrap(False)
+        self.cb_command.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.cb_command.setStyleSheet(
+            "color: palette(mid); font-size: 11px; "
+            "font-family: ui-monospace, Menlo, Consolas, monospace;")
+        self.cb_command.setMinimumHeight(16)
+        box.addWidget(self.cb_command)
 
         self.cb_tally = QLabel("")
         self.cb_tally.setStyleSheet("font-size: 12px;")
@@ -239,6 +263,9 @@ class CoffeeBreakTabMixin:
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
         self.cb_table.setColumnWidth(4, 104)
         self.cb_table.itemSelectionChanged.connect(self._cb_show_detail)
+        self.cb_table.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        self.cb_table.customContextMenuRequested.connect(self._cb_menu)
         self.cb_table.setMinimumHeight(300)
         splitter.addWidget(self.cb_table)
 
@@ -292,6 +319,9 @@ class CoffeeBreakTabMixin:
         self.cb_start_btn.setEnabled(False)
         self.cb_skip_btn.setEnabled(True)
         self.cb_stop_btn.setEnabled(True)
+        self.cb_pause_btn.setEnabled(True)
+        self.cb_pause_btn.setText("Pause")
+        self.cb_command.setText("")
         self._cb_elapsed_timer.start()
 
     def _cb_ui_stage(self, key, status, note):
@@ -316,6 +346,23 @@ class CoffeeBreakTabMixin:
             self.cb_progress.setFormat(
                 f"{done + 1} of {total} — {label[1].text() if label else key}")
 
+    def _cb_ui_command(self, command):
+        """Show the command the current stage is running."""
+        text = " ".join(str(command or "").split())
+        self.cb_command.setToolTip(text)
+        if len(text) > 200:
+            text = text[:197] + "…"
+        self.cb_command.setText(text)
+
+    def _cb_ui_paused(self, paused):
+        self.cb_pause_btn.setText("Resume" if paused else "Pause")
+        if paused:
+            self.cb_progress.setFormat("paused")
+            self.cb_elapsed_label.setText("paused")
+
+    def _cb_toggle_pause(self):
+        self.pause_coffee_break()
+
     def _cb_ui_finding(self, finding):
         self._cb_ui_finding_list.append(finding)
         self._cb_add_row(finding)
@@ -326,6 +373,9 @@ class CoffeeBreakTabMixin:
         self.cb_start_btn.setEnabled(True)
         self.cb_skip_btn.setEnabled(False)
         self.cb_stop_btn.setEnabled(False)
+        self.cb_pause_btn.setEnabled(False)
+        self.cb_pause_btn.setText("Pause")
+        self.cb_command.setText("")
         if how == "completed":
             self.cb_progress.setValue(100)
             self.cb_progress.setFormat("finished")
@@ -447,6 +497,14 @@ class CoffeeBreakTabMixin:
             f"{_esc(finding.stage)} · {_esc(finding.confidence)} confidence</span></div>",
             f"<p><b>Where:</b> <code>{_esc(finding.where)}</code></p>",
         ]
+        sources = [s for s in (getattr(finding, "sources", []) or
+                               [finding.stage]) if s]
+        if len(sources) > 1:
+            html.append(
+                f"<p><b>Detected by {len(sources)} tools:</b> "
+                f"{_esc(', '.join(sources))} — independent agreement, which "
+                f"is why this is worth more than a single signature match."
+                f"</p>")
         instances = list(getattr(finding, "instances", []) or [])
         if instances:
             shown = "".join(f"<li><code>{_esc(u)}</code></li>"
@@ -470,6 +528,112 @@ class CoffeeBreakTabMixin:
             html.append("<p><b>References:</b> "
                         + ", ".join(_esc(r) for r in references[:8]) + "</p>")
         self.cb_detail.setHtml("".join(html))
+
+    # ── right-click ──────────────────────────────────────────────────────
+    def _cb_finding_at(self, row):
+        item = self.cb_table.item(row, 0)
+        if item is None:
+            return None
+        index = item.data(Qt.ItemDataRole.UserRole + 1)
+        findings = getattr(self, "_cb_ui_finding_list", [])
+        if index is None or index >= len(findings):
+            return None
+        return findings[index]
+
+    def _cb_menu(self, position):
+        """Delete a finding, delete its whole type, or mute it for good.
+
+        Every team has issues it does not report — the one that prompted this
+        was BREACH. Deleting the row covers this scan; muting the type covers
+        every scan after it, which is the difference between a fix and a
+        chore you repeat.
+        """
+        row = self.cb_table.rowAt(position.y())
+        finding = self._cb_finding_at(row)
+        if finding is None:
+            return
+
+        menu = QMenu(self)
+        title = finding.title
+        key = getattr(finding, "key", "") or ""
+
+        delete_one = menu.addAction("Delete this finding")
+        delete_kind = menu.addAction(
+            f"Delete every finding of this type "
+            f"({self._cb_count_of(finding)})")
+        menu.addSeparator()
+        mute = menu.addAction("Never report this issue type again")
+        mute.setEnabled(bool(key))
+        mute.setToolTip(
+            "Removes it from this scan and stops it being reported in future "
+            "ones. Stored in ~/.config/CommandBridge/muted_issues.json."
+            if key else "This finding has no issue type to mute.")
+        menu.addSeparator()
+        copy_one = menu.addAction("Copy this finding")
+        copy_all = menu.addAction("Copy every finding as Markdown")
+
+        chosen = menu.exec(self.cb_table.viewport().mapToGlobal(position))
+        if chosen is None:
+            return
+
+        if chosen is delete_one:
+            self._cb_drop([finding])
+        elif chosen is delete_kind:
+            self._cb_drop(self._cb_same_type(finding))
+        elif chosen is mute:
+            self.mute_issue_type(key, True)
+            dropped = self._cb_drop(self._cb_same_type(finding))
+            self.console.append_ansi(
+                f"\n[i] '{title}' muted — {dropped} finding(s) removed, and "
+                f"it will not be reported in future scans. Undo by editing "
+                f"~/.config/CommandBridge/muted_issues.json.\n")
+        elif chosen is copy_one:
+            QApplication.clipboard().setText(self._cb_as_text(finding))
+            self.flash_status("finding copied")
+        elif chosen is copy_all:
+            QApplication.clipboard().setText(self.coffee_break_report())
+            self.flash_status("report copied")
+
+    def _cb_same_type(self, finding):
+        key = getattr(finding, "key", "") or ""
+        return [f for f in self._cb_ui_finding_list
+                if (key and getattr(f, "key", "") == key)
+                or (not key and f.title == finding.title)]
+
+    def _cb_count_of(self, finding):
+        return len(self._cb_same_type(finding))
+
+    def _cb_drop(self, findings):
+        """Remove findings from the screen and from the exported report."""
+        doomed = {id(f) for f in findings}
+        self._cb_ui_finding_list = [f for f in self._cb_ui_finding_list
+                                    if id(f) not in doomed]
+        engine_list = getattr(self, "_cb_findings", None)
+        if isinstance(engine_list, list):
+            self._cb_findings = [f for f in engine_list if id(f) not in doomed]
+        self._cb_apply_filter()
+        self._cb_update_tally()
+        self.cb_detail.clear()
+        return len(doomed)
+
+    @staticmethod
+    def _cb_as_text(finding):
+        parts = [f"## [{finding.severity}] {finding.title}",
+                 f"Where: {finding.where}"]
+        for extra in (getattr(finding, "instances", []) or [])[:20]:
+            parts.append(f"  also: {extra}")
+        sources = getattr(finding, "sources", []) or [finding.stage]
+        parts.append(f"Detected by: {', '.join(s for s in sources if s)}")
+        parts.append(f"Confidence: {finding.confidence}")
+        if getattr(finding, "cwe", ""):
+            parts.append(f"Classification: {finding.cwe}")
+        if finding.detail:
+            parts.append("\n" + finding.detail)
+        if finding.evidence:
+            parts.append("\nEvidence:\n" + finding.evidence)
+        if finding.remediation:
+            parts.append("\nFix: " + finding.remediation)
+        return "\n".join(parts)
 
     # ── misc ─────────────────────────────────────────────────────────────
     def _cb_tick(self):
