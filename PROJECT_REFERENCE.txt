@@ -19,6 +19,179 @@ HOW TO USE THIS FILE
  CHANGELOG (most recent first)
 ================================================================================
 
+## 2026-09-28 — FOUR FIXES FROM A REAL ENGAGEMENT (6.1.1)
+
+BROKEN ACCESS CONTROL ON AN UNAUTHENTICATED SCAN — every page reported, all
+false. Both halves of that check are comparisons against a logged-in session.
+With no session, ctx.auth IS the anonymous identity, so the "authorised" and
+"anonymous" requests are the same request, every response is 100% identical,
+and every page reads as broken access control.
+  - AccessControlCheck.authenticated(ctx) gates the whole check: it needs a
+    strategy other than 'none' AND logged_in.
+  - _forced_browsing re-confirms the session with verify_session(force=True)
+    before reporting, so a session that lapsed mid-scan cannot produce the
+    same false positive.
+  - engine.py skips the pass entirely when unauthenticated and puts a note in
+    the report saying so — silence would read as "tested, nothing found".
+
+RIGHT-CLICK DID NOTHING. customContextMenuRequested reports a position in the
+widget's coordinates; rowAt() wants the viewport's. The difference is the
+horizontal header's height, so the first row resolved to -1 and the menu
+never opened. New _cb_row_at() maps through viewport().mapFrom(), falls back
+to indexAt() and then to the current selection. Right-clicking now also
+selects the row, and Delete removes the selected finding — a keyboard route
+that cannot be defeated by a coordinate bug.
+
+THE CLOCK READ 00:00 ALL SCAN. stop_progress_animation() runs at the end of
+every step and zeroed the status bar's timer — fourteen times in one chain —
+and the Python stages never started the animation at all. It now leaves the
+clock alone while a chain is active, and _cb_tick() writes the chain's own
+elapsed time to the status bar every second.
+
+THE CHECKLIST IS BACK, AND CROSSES OFF. Marks changed to ✓ done, ▶ running,
+○ outstanding, ⊘ skipped, ✕ failed. Done and skipped steps are struck through
+and dimmed, the running one is bold in the accent colour, outstanding steps
+stay plain. A summary line reads "3 done · 1 skipped · 10 to go", the card is
+forced open when a run starts however it was left last time, and progress
+counts finished steps rather than successes.
+
+NEW "SCAN OPTIONS" CARD, collapsed by default, at the top of the tab:
+  - a checkbox per stage (CB_STAGE_CATALOGUE, new in coffee_break.py, so the
+    panel can list them before a target exists), with All / None / Quick
+    presets. _cb_stage_list() filters on the selection, so turning a step off
+    removes it from the checklist rather than skipping it silently.
+  - the muted issue types, named, with one button to start reporting them
+    again — muting was previously only undoable by editing JSON by hand.
+
+tests: test_gui_smoke.py 90 → 118, test_scanner.py 98 → 104.
+
+## 2026-09-28 — COFFEE BREAK: severity discipline, cross-tool merging, Pause (6.1.0)
+Everything here came from one real scan's output.
+
+THE STATUS BAR SAID IDLE WHILE THE SCAN RAN. core/output.py's
+on_command_finished set the chip to idle as each command ended AND scheduled
+another idle three seconds later — which landed on top of the next stage. Both
+are now skipped while a chain (Coffee Break, Auto Scan, Externals) is active,
+and every stage boundary calls the new _cb_assert_running().
+
+THE COMMAND BEING RUN is shown under the progress bar (cb_command, monospace,
+elided at 200 characters with the whole thing on hover). "4 of 14" does not
+tell you whether this is the forty-minute nmap or the two-second header check.
+
+PAUSE. pause_coffee_break() SIGSTOPs the running process — so a long scan is
+suspended rather than thrown away — and holds the chain at _cb_advance until
+Resume, which picks up from exactly that point. Leave the house, come back.
+
+SEVERITY DISCIPLINE (cb_issues.NOT_A_FINDING / OBSERVATION_ONLY):
+  - "1 host(s) tested", "8299 requests: 0 errors", "ERROR: Failed to check for
+    updates: 403", "Platform: Unknown" and the rest of a scanner's own
+    bookkeeping are NOT REPORTED AT ALL. Reporting them at Low teaches the
+    reader that Low means nothing.
+  - A weakness is LOW or above; an observation is INFO. Nothing in between.
+  - Nikto's flat rating is no longer trusted: a recognised issue takes the
+    library's severity, an observation is collected as INFO, and the rest is
+    rated on its own wording.
+  - "Umbraco Login Panel found" is now login_panel_exposed at MEDIUM (new
+    entry) and carries the path — /umbraco/ — not just the host.
+
+ONE ISSUE, HOWEVER MANY TOOLS FIND IT. CBFinding gains .key (the library key)
+and .sources (the stages that found it). _cb_record merges on the key, so
+Nikto's "the Content-Encoding header is set to deflate" and testssl's BREACH
+are ONE finding listing both tools. Corroboration raises confidence, never
+severity. The detail pane says "Detected by 2 tools".
+
+TESTSSL STOPPED INVENTING WEAKNESSES. TESTSSL_INFORMATIONAL suppresses the
+records that describe the configuration rather than fault it (FS_*,
+DNS_CAArecord, cipher_order, cert_serialNumber, …) — these were the whole of
+the "TLS configuration weakness / Reported by testssl" noise. Two are named
+properly instead: tls_weak_signature_alg (new, LOW, only when SHA-1 is
+actually in the list, and it explains that SHA-1 collisions have been
+practical since 2017) and caa_missing (new, INFO). A record that is
+informational by id keeps the library's severity — testssl rates a missing
+CAA record LOW and it is not. The generic tls_generic entry now names the
+checks that failed instead of saying "reported by testssl".
+
+ROBOTS.TXT is only reported when it has content: _cb_robots_worth_reporting()
+fetches it and looks for real Disallow entries, and both the Nikto and nuclei
+paths go through it. A 200 on an empty file is not a finding, and it was being
+reported twice.
+
+RIGHT-CLICK A FINDING: delete it, delete every finding of that type, never
+report this issue type again (persisted in
+~/.config/CommandBridge/muted_issues.json and honoured by _cb_record on every
+future scan), copy one, copy the lot as Markdown. Built because BREACH is not
+reported where Luke works and deleting it after every scan is a chore, not a
+fix.
+
+tests: test_coffee_break.py 98 → 123, test_gui_smoke.py 72 → 90.
+
+## 2026-09-25 — ACTIVE SCANNER: Command Bridge's own engine (6.0.0)
+Coffee Break runs other people's tools and reads their output. This is a
+scanner of its own: it logs in, crawls the application, finds every place data
+can be put, attacks each one, and reports only what it could prove.
+
+NEW PACKAGE command_bridge/modules/scanner/
+  model.py     Request / InsertionPoint / Evidence / ScanFinding. Insertion
+               points cover query, body, JSON (nested, by dotted path),
+               cookies, headers and numeric path segments; build() replaces or
+               appends without disturbing the rest of the request. shape()
+               collapses /user/1 … /user/9000 into one thing to test.
+  session.py   FOUR authentication strategies — form POST (reads the login
+               form's own field names and hidden CSRF token), headless
+               Chromium (SSO, JS logins, harvests localStorage tokens),
+               pasted cookies/headers, and OAuth bearer with re-minting.
+               Every check sends through Authenticator.send, which verifies
+               the session against a check URL and re-authenticates when it
+               has lapsed. A scan cannot silently continue logged out.
+  crawl.py     Scope as a hard boundary (enforced on every request, not just
+               the crawl), link + form + JS-endpoint extraction, optional
+               browser render for SPAs, plausible form values so submissions
+               get past validation, and destructive links (logout, delete)
+               recorded but never followed.
+  oracles.py   THE PART THAT MATTERS. Differential (true/false pairs, judged
+               against a threshold taken from how much the page differs from
+               ITSELF — a flat 0.95 is useless because "no such record" is
+               96% identical to "here is the record" on any page with a nav
+               bar), timing (accepted only when the delay scales with the
+               number in the payload), database error signatures, and
+               reflection-context analysis.
+  checks/      sqli (boolean × 10 payload pairs across four syntax families,
+               error, time), injection (SSTI/code/command — confirmed by
+               making the server compute 7*191 and finding 1337, never by
+               running anything harmful), xss (context-aware payloads
+               confirmed by ACTUAL EXECUTION in headless Chromium, plus a
+               stored-payload sweep), files (traversal/LFI confirmed by file
+               content, open redirect), access (forced browsing with no
+               session, and IDOR by replaying one user's requests as a
+               second logged-in user — the check that needs two logins and is
+               the reason to scan authenticated at all).
+  engine.py    Profiles safe / standard / full, a shared rate limiter, a
+               worker pool, checks ordered by severity, and stop-on-confirmed-
+               critical.
+  report.py    HTML, Markdown and JSON from the same findings. Every finding
+               carries the request/response pair that proved it, and the
+               header says what was NOT tested.
+  cli.py       `python3 -m command_bridge.modules.scanner.cli` — same engine
+               without the window; exits 2 when something high or critical was
+               confirmed, so it can gate a pipeline.
+
+ui/tabs_scan.py — the Active Scan tab: target, authentication (all four
+  methods, second account for IDOR), profile and scope, live progress, and a
+  findings table with the evidence underneath. The engine runs on a worker
+  thread; Stop stops.
+constants.py — TABS gains "scan" (section TEST); APP_VERSION 6.0.0.
+
+tests/vulnerable_app.py — NEW. A deliberately vulnerable application with
+  seven planted bugs behind a login AND a correct implementation of each one
+  beside it (/clean vs /search, /item_safe vs /item, /go_safe vs /go, plus a
+  deliberately slow endpoint and a deliberately unstable one).
+tests/test_scanner.py — NEW, 98 checks. Unit coverage of the model, scope,
+  oracles and session, then a full authenticated scan asserting BOTH halves:
+  all ten planted bugs found, and nothing at all reported on the eight
+  correct endpoints. The false-positive half caught four real bugs during the
+  build.
+tests/test_gui_smoke.py 52 → 72.
+
 ## 2026-09-25 — COFFEE BREAK: the issue library, 25 → 113 entries (5.2.0)
 Burp's scanner ships 183 issue definitions. 25 was not a library, it was a
 start. cb_issues.ISSUES now holds 113, covering the ground Coffee Break's own
