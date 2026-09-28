@@ -182,16 +182,57 @@ SECURITY_HEADERS = {
     "x-content-type-options": "nosniff_missing",
     "referrer-policy": "referrer_policy",
     "permissions-policy": "permissions_policy",
+    "x-permitted-cross-domain-policies": "xpcdp_missing",
 }
 
 #: CSP directives that make the header present but ineffective. Burp reports
 #: each of these separately, and they do mean different things.
-CSP_WEAKNESSES = (
-    (re.compile(r"script-src[^;]*('unsafe-inline'|'unsafe-eval'|\*)"),
-     "csp_unsafe_script"),
-    (re.compile(r"^(?!.*frame-ancestors)", re.S), "csp_clickjacking"),
-    (re.compile(r"^(?!.*form-action)", re.S), "csp_form_hijack"),
-)
+def analyse_csp(policy):
+    """Everything wrong with a Content-Security-Policy, as issue keys.
+
+    A CSP that is present is not a CSP that works. These are the
+    misconfigurations that leave the header in place and the hole open, and
+    they are worth more attention than a missing header — because the
+    operator believes they are covered.
+    """
+    text = " ".join(str(policy or "").split())
+    if not text:
+        return []
+
+    directives = {}
+    for chunk in text.split(";"):
+        parts = chunk.strip().split()
+        if parts:
+            directives[parts[0].lower()] = [p.lower() for p in parts[1:]]
+
+    # script-src falls back to default-src; so does object-src.
+    script = directives.get("script-src") or directives.get("script-src-elem") \
+        or directives.get("default-src") or []
+    found = []
+
+    if any(source in ("'unsafe-inline'", "'unsafe-eval'") for source in script):
+        # A nonce or hash makes 'unsafe-inline' inert in browsers that support
+        # them, but 'unsafe-eval' is never inert.
+        has_nonce = any(s.startswith(("'nonce-", "'sha256-", "'sha384-",
+                                      "'sha512-")) for s in script)
+        if "'unsafe-eval'" in script or not has_nonce:
+            found.append("csp_unsafe_script")
+
+    wildcard = [s for s in script
+                if s == "*" or s.endswith(":") and s in ("http:", "https:",
+                                                         "data:", "blob:",
+                                                         "filesystem:")
+                or s.startswith("*.") and s.count(".") < 2]
+    if wildcard:
+        found.append("csp_wildcard_source")
+
+    if "object-src" not in directives or "base-uri" not in directives:
+        found.append("csp_missing_object_base")
+    if "frame-ancestors" not in directives:
+        found.append("csp_clickjacking")
+    if "form-action" not in directives:
+        found.append("csp_form_hijack")
+    return found
 
 
 def _finding_from(key, where, evidence="", stage="", **override):
@@ -263,16 +304,21 @@ def probe_headers(context, report):
     # operator believes they are covered.
     policy = headers.get("content-security-policy", "")
     if policy:
-        for pattern, key in CSP_WEAKNESSES:
-            if pattern.search(policy):
-                findings.append(_finding_from(
-                    key, response.url, f"Content-Security-Policy: {policy[:400]}",
-                    "headers"))
+        for key in analyse_csp(policy):
+            findings.append(_finding_from(
+                key, response.url,
+                f"Content-Security-Policy: {policy[:500]}", "headers"))
     if headers.get("content-security-policy-report-only") and not policy:
         findings.append(_finding_from(
             "csp_report_only", response.url,
             "Content-Security-Policy-Report-Only: "
             + headers["content-security-policy-report-only"][:300], "headers"))
+
+    if not any(name in headers for name in
+               ("cross-origin-opener-policy", "cross-origin-embedder-policy",
+                "cross-origin-resource-policy")):
+        findings.append(_finding_from("coop_missing", response.url,
+                                      seen_headers, "headers"))
 
     if response.url.startswith("http://"):
         findings.append(_finding_from(
@@ -1477,11 +1523,17 @@ class CoffeeBreakMixin:
             matched = row.get("matched-at") or row.get("host") or self.target
             template = row.get("template-id", "")
             name = info.get("name") or template or "nuclei match"
+            description = " ".join((info.get("description") or "").split())
 
-            # Fingerprinting templates say what the stack is. There are dozens
-            # of them on any real site and not one of them is a finding.
-            if cb_issues.is_fingerprint(template) or (
-                    severity == "INFO" and not info.get("remediation")):
+            # Name it BEFORE deciding it is noise. The previous order folded
+            # anything nuclei rated info with no remediation into the
+            # fingerprint bucket — and nuclei rates its entire exposed-panels
+            # library exactly that way, so a publicly reachable Umbraco or
+            # phpMyAdmin login page vanished into "Technology fingerprint".
+            # An unnamed template can be inventory; a named issue never is.
+            key, issue = cb_issues.for_nuclei(template, name, description)
+
+            if not key and cb_issues.is_fingerprint(template):
                 entry = f"{name} — {matched}"
                 if entry not in fingerprints:
                     fingerprints.append(entry)
@@ -1489,16 +1541,12 @@ class CoffeeBreakMixin:
 
             references = [r for r in (info.get("reference") or []) if r][:6] \
                 if isinstance(info.get("reference"), list) else []
-            description = " ".join((info.get("description") or "").split())
             evidence = ((row.get("extracted-results") and
                          ", ".join(row["extracted-results"])[:400])
                         or row.get("matcher-name", "") or line[:300])
             if template:
                 evidence = f"nuclei template: {template}\n{evidence}"
 
-            # Name it from the library when the template describes something
-            # the library knows; keep nuclei's own wording when it does not.
-            key, issue = cb_issues.for_nuclei(template, name, description)
             if key == "robots_disclosure" and \
                     not self._cb_robots_worth_reporting():
                 continue
@@ -1509,7 +1557,9 @@ class CoffeeBreakMixin:
                         or evidence
                 finding = self._cb_issue(
                     key, matched, evidence, stage["key"],
-                    severity=(severity if severity in SEVERITIES else None),
+                    severity=cb_issues.worst(
+                        issue["severity"],
+                        severity if severity in SEVERITIES else ""),
                     detail=issue["detail"] + (f"\n\nnuclei: {name}"
                                               if name else ""))
                 for reference in references:

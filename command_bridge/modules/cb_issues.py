@@ -347,6 +347,48 @@ ISSUES = {
         "Embedded content inherits access to camera, microphone and location.",
         "Send a Permissions-Policy naming only the features the page uses.",
         "CWE-693"),
+    "xpcdp_missing": _issue(
+        "LOW", "X-Permitted-Cross-Domain-Policies is missing",
+        "Without this header an Adobe client (Flash, and still today Acrobat "
+        "and some PDF viewers and mobile SDKs) will fetch /crossdomain.xml "
+        "from the site root and honour whatever it finds. On a host where "
+        "anyone can write to the web root — an upload directory mapped to /, "
+        "a shared CDN origin — that is a policy file an attacker supplies, "
+        "granting their domain read access to this one on a user's behalf. "
+        "The header costs nothing and closes the question.",
+        "Send 'X-Permitted-Cross-Domain-Policies: none' (or 'master-only' if "
+        "you genuinely serve a policy file).",
+        "CWE-942"),
+    "csp_wildcard_source": _issue(
+        "MEDIUM", "CSP allows script from a wildcard or scheme-wide source",
+        "The policy permits script from '*', from a bare scheme such as "
+        "'https:', or from 'data:'/'blob:'. Any of those lets an attacker who "
+        "can get content onto ANY host — a CDN, a sandbox domain, a data URI "
+        "they construct themselves — run script in this origin. A policy that "
+        "names a wildcard is doing bookkeeping, not security.",
+        "Name the exact origins that serve your script, or use a "
+        "per-response nonce.",
+        "CWE-693"),
+    "csp_missing_object_base": _issue(
+        "LOW", "CSP does not restrict object-src or base-uri",
+        "Without object-src an injected <object> or <embed> can load a plugin "
+        "document and execute; without base-uri an injected <base> tag "
+        "re-points every relative script URL on the page at the attacker's "
+        "host. Both are standard ways round an otherwise sound policy.",
+        "Add \"object-src 'none'\" and \"base-uri 'self'\".",
+        "CWE-693"),
+    "coop_missing": _issue(
+        "INFO", "Cross-origin isolation headers not set",
+        "Cross-Origin-Opener-Policy, Cross-Origin-Embedder-Policy and "
+        "Cross-Origin-Resource-Policy are absent. They limit what another "
+        "origin can do with a window handle to this page and what can embed "
+        "its resources — relevant to Spectre-class attacks and to tab-nabbing "
+        "through window.opener.",
+        "Send 'Cross-Origin-Opener-Policy: same-origin' and "
+        "'Cross-Origin-Resource-Policy: same-origin' where the site's "
+        "embedding needs allow it.",
+        "CWE-1021"),
+
     "content_type_missing": _issue(
         "INFO", "Content type is not specified or is wrong",
         "The browser has to guess how to treat the response, and its guess is "
@@ -965,8 +1007,9 @@ def for_testssl(record):
 
 _TEXT_ISSUES = (
     (r"\.env\b|env file", "env_file_exposed"),
-    (r"\.git/(config|HEAD)|git (config|repository) (exposed|disclos)|"
-     r"\.svn/|\.hg/", "vcs_exposed"),
+    (r"\.git/(config|HEAD)|git[ -]?(config|repository|directory)[ -]?"
+     r"(exposed|exposure|disclos|found)|\.svn/|\.hg/|git-config",
+     "vcs_exposed"),
     (r"private key|BEGIN (RSA |EC |OPENSSH |DSA )?PRIVATE KEY", "private_key_disclosed"),
     (r"aws[_ -]?(access[_ -]?key|secret)|AKIA[0-9A-Z]{16}|"
      r"gcp service account|azure storage key", "cloud_key_disclosed"),
@@ -1011,13 +1054,19 @@ _TEXT_ISSUES = (
     (r"crossdomain\.xml|clientaccesspolicy", "crossdomain_policy"),
     (r"graphql introspection", "graphql_introspection"),
     (r"graphql suggestion", "graphql_suggestions"),
-    (r"swagger|openapi|api-docs", "api_spec_exposed"),
+    (r"swagger|openapi|api-docs|graphql playground", "api_spec_exposed"),
     (r"\bput method\b|put is enabled|webdav write", "put_enabled"),
-    (r"\btrace\b method|track method", "trace_enabled"),
+    (r"\btrace\b method|track method|http-trace|trace is enabled",
+     "trace_enabled"),
     (r"(delete|move|copy|propfind|mkcol) method", "dangerous_method"),
-    (r"(login|admin|management|cms) panel (found|detected)|"
-     r"/umbraco|/wp-login|/administrator/|/manager/html|phpmyadmin|"
-     r"(admin|administrator) (login|portal) (page|found)",
+    # nuclei files every one of these under exposed-panels/ at severity
+    # "info", so the name and the template id both have to be enough on their
+    # own. A reachable management login is a finding whatever a tool calls it.
+    (r"(login|admin|management|cms|sign.?in) panel|exposed.?panel|"
+     r"/umbraco|/wp-login|/wp-admin|/administrator/|/manager/html|"
+     r"phpmyadmin|\badminer\b|/cpanel|/plesk|/webmail|/roundcube|"
+     r"(admin|administrator|management) (login|portal|console|interface)|"
+     r"[\w-]+-(login|panel|admin)\b|login page (found|detected)",
      "login_panel_exposed"),
     (r"admin (panel|interface|console)|management interface", "admin_exposed"),
     (r"unauthenticated|missing authentication|auth(orisation|orization) bypass|"
@@ -1043,9 +1092,10 @@ _TEXT_ISSUES = (
     (r"content.security.policy|\bcsp\b", "csp_missing"),
     (r"strict.transport.security|\bhsts\b", "hsts_missing"),
     (r"x-content-type-options|mime.?sniff", "nosniff_missing"),
-    (r"httponly", "cookie_no_httponly"),
+    (r"httponly|cookies-without-httponly", "cookie_no_httponly"),
     (r"samesite", "cookie_no_samesite"),
-    (r"secure flag|cookie without secure", "cookie_no_secure"),
+    (r"secure flag|cookie without secure|cookies-without-secure",
+     "cookie_no_secure"),
     (r"session (token|id) in url", "session_token_in_url"),
     (r"version (disclos|leak)|banner|^server\s*:\s*\S|"
      r"^retrieved x-powered-by", "version_disclosure"),
@@ -1126,14 +1176,20 @@ def worst(*severities):
 #: what is wrong with it. They are folded into one "Technology fingerprint"
 #: entry instead of one row each.
 NUCLEI_FINGERPRINT = (
+    # Audited: an entry here is SILENTLY FOLDED, so anything that is a real
+    # finding must not be on this list. Four were, and had to come off —
+    # git-config (a readable .git is a HIGH), http-trace, cookies-without and
+    # the OpenAPI/Swagger pair are all findings in the library, and listing
+    # them here made them disappear.
     "tech-detect", "waf-detect", "favicon-detect", "fingerprinthub",
-    "ssl-dns-names", "ssl-issuer", "tls-version", "http-missing-security-headers",
-    "options-method", "robots-txt", "sitemap", "dns-", "wappalyzer",
+    "ssl-dns-names", "ssl-issuer", "tls-version",
+    "http-missing-security-headers",   # our own header probe is authoritative
+    "options-method", "robots-txt", "sitemap", "wappalyzer",
     "metatag-cms", "caa-fingerprint", "mx-fingerprint", "txt-fingerprint",
     "nameserver-fingerprint", "ptr-fingerprint", "cname-fingerprint",
-    "http-trace", "cookies-without", "security-txt", "openapi", "swagger-api",
-    "wordpress-detect", "php-detect", "nginx-version", "apache-detect",
-    "iis-version", "server-version", "git-config", "url-analyse",
+    "security-txt", "wordpress-detect", "php-detect", "nginx-version",
+    "apache-detect", "iis-version", "server-version", "url-analyse",
+    "dns-fingerprint", "ssl-issuer-detect",
 )
 
 #: Nikto's line prefixes that are inventory, a banner, or the scan's own
