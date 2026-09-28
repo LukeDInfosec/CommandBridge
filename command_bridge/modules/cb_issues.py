@@ -212,6 +212,45 @@ ISSUES = {
         "Set an explicit modern cipher list and remove NULL, anonymous, "
         "export and 3DES suites.",
         "CWE-327"),
+    "tls_weak_signature_alg": _issue(
+        "LOW", "Weak signature algorithms offered for TLS 1.2",
+        "The server advertises SHA-1 among the signature algorithms it will "
+        "accept for the handshake. SHA-1 collisions have been practical since "
+        "2017, so a signature over it is not a proof of anything: an attacker "
+        "who can produce a collision can have one signature validate two "
+        "different handshakes. RSA-PKCS#1 v1.5 signatures (shown as plain "
+        "'RSA+SHA…' rather than 'RSA-PSS-RSAE+SHA…') are also the weaker of "
+        "the two schemes on offer and are what the ROBOT family of padding "
+        "oracle attacks works against.",
+        "Remove SHA-1 from the signature_algorithms list and prefer RSA-PSS "
+        "or ECDSA. On OpenSSL this is the SignatureAlgorithms option; on IIS "
+        "it is the cipher suite order policy.",
+        "CWE-327"),
+    "caa_missing": _issue(
+        "INFO", "No CAA record published",
+        "No DNS CAA record says which certificate authorities may issue for "
+        "this name, so any public CA will. It is not a vulnerability; it is a "
+        "control that is available and not switched on.",
+        "Publish a CAA record naming the authorities you actually use.",
+        "CWE-16"),
+    "login_panel_exposed": _issue(
+        "MEDIUM", "Administrative login panel publicly reachable",
+        "A management or CMS login page is reachable from the internet. It "
+        "gives an attacker a place to spray credentials, a version to look up "
+        "and, on most products, a different authentication path from the one "
+        "the application's own users take. It is usually the first thing "
+        "found and the last thing anybody restricts.",
+        "Restrict the panel by source address or put it behind a VPN; if it "
+        "must stay public, enforce multi-factor authentication and rate "
+        "limiting on it.",
+        "CWE-284"),
+    "scan_information": _issue(
+        "INFO", "Scanner observation",
+        "Descriptive output from a tool. Not a finding in itself; kept "
+        "because it is useful context for the ones that are.",
+        "No action required.",
+        "CWE-16"),
+
     "tls_generic": _issue(
         "LOW", "TLS configuration weakness",
         "Reported by testssl against the TLS configuration.",
@@ -976,8 +1015,11 @@ _TEXT_ISSUES = (
     (r"\bput method\b|put is enabled|webdav write", "put_enabled"),
     (r"\btrace\b method|track method", "trace_enabled"),
     (r"(delete|move|copy|propfind|mkcol) method", "dangerous_method"),
-    (r"admin (panel|interface|console|login)|/manager/html|phpmyadmin",
-     "admin_exposed"),
+    (r"(login|admin|management|cms) panel (found|detected)|"
+     r"/umbraco|/wp-login|/administrator/|/manager/html|phpmyadmin|"
+     r"(admin|administrator) (login|portal) (page|found)",
+     "login_panel_exposed"),
+    (r"admin (panel|interface|console)|management interface", "admin_exposed"),
     (r"unauthenticated|missing authentication|auth(orisation|orization) bypass|"
      r"improper access control", "access_control"),
     (r"file upload", "file_upload"),
@@ -992,6 +1034,10 @@ _TEXT_ISSUES = (
     (r"internal ip|private ip", "internal_ip_disclosure"),
     (r"robots\.txt", "robots_disclosure"),
     (r"mixed content", "mixed_content"),
+    # Nikto words BREACH as a Content-Encoding observation; testssl names it.
+    # They are the same issue and must land on the same finding.
+    (r"content-encoding header is set to \"?(deflate|gzip)|"
+     r"\bbreach\b|compression.*(reflected|breach)", "breach"),
     (r"cacheable|cache.control", "cacheable_https"),
     (r"clickjack|frame.?able|x-frame-options", "xfo_missing"),
     (r"content.security.policy|\bcsp\b", "csp_missing"),
@@ -1001,7 +1047,8 @@ _TEXT_ISSUES = (
     (r"samesite", "cookie_no_samesite"),
     (r"secure flag|cookie without secure", "cookie_no_secure"),
     (r"session (token|id) in url", "session_token_in_url"),
-    (r"version (disclos|leak)|banner", "version_disclosure"),
+    (r"version (disclos|leak)|banner|^server\s*:\s*\S|"
+     r"^retrieved x-powered-by", "version_disclosure"),
 )
 
 
@@ -1101,6 +1148,109 @@ NIKTO_NOISE = (
     "web server returns", "cookie ", "retrieved via header",
     "reports it is", "appears to be outdated",     # handled as its own issue
 )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  What is not a finding
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# A scanner's own bookkeeping is not a result. "1 host(s) tested" is a
+# statement about the scan; "Failed to check for updates: 403" is a complaint
+# about the scanner's own internet access. Neither belongs on a findings
+# screen at any severity, and putting them there at Low is worse than not
+# reporting them at all, because it teaches the reader that Low means nothing.
+
+NOT_A_FINDING = (
+    re.compile(r"^\d+\s+host\(s\)\s+tested", re.I),
+    re.compile(r"^\d+\s+requests?\s*:\s*\d+\s+error", re.I),
+    re.compile(r"^\d+\s+item\(s\)\s+reported", re.I),
+    re.compile(r"failed to check for updates", re.I),
+    re.compile(r"^(start|end)\s+time\s*:", re.I),
+    re.compile(r"^target\s+(ip|hostname|port|site)\s*:", re.I),
+    re.compile(r"^(platform|server)\s*:\s*(unknown|no banner|none)?\s*$", re.I),
+    re.compile(r"^scan terminated", re.I),
+    re.compile(r"^ssl info\s*:", re.I),
+    re.compile(r"^no CGI directories found", re.I),
+    re.compile(r"^nikto v?\d", re.I),
+    re.compile(r"^\+?\s*$"),
+    re.compile(r"^using .* for", re.I),
+    re.compile(r"^root page .* redirects to", re.I),
+    re.compile(r"^\d+ error\(s\) and \d+ item\(s\) reported", re.I),
+    re.compile(r"^(done|finished|complete)\b", re.I),
+    re.compile(r"^-+$"),
+    re.compile(r"^\d+:\d+:\d+\s+(start|end)", re.I),
+)
+
+
+def is_statement(line):
+    """True when a line describes the scan rather than the target."""
+    text = re.sub(r"^\+\s*", "", str(line or "")).strip()
+    return any(pattern.search(text) for pattern in NOT_A_FINDING)
+
+
+#: Severity discipline. A tool's own rating is not trusted: Nikto has one
+#: severity for everything it prints. The rule here is the one a report needs
+#: — something that is a weakness is LOW or above, something that is merely an
+#: observation is INFO, and nothing in between.
+OBSERVATION_ONLY = (
+    re.compile(r"retrieved [\w-]+ header", re.I),
+    re.compile(r"uncommon header", re.I),
+    re.compile(r"^/\S*\s*:\s*(this might be interesting|may be interesting)",
+               re.I),
+    re.compile(r"allowed http methods\s*:\s*(get|head|post|options)"
+               r"(\s*,\s*(get|head|post|options))*\s*$", re.I),
+    re.compile(r"^the site uses (ssl|tls)", re.I),
+    re.compile(r"cookie \S+ created without", re.I),   # handled as its own
+    re.compile(r"^(apache|nginx|iis|php|openssl)[\w./-]*\s+appears", re.I),
+    re.compile(r"favicon", re.I),
+    re.compile(r"^robots\.txt", re.I),
+    re.compile(r"^/\S*\s*:\s*(directory|file) found\.?$", re.I),
+    re.compile(r"entry .* in robots\.txt", re.I),
+)
+
+
+def is_observation(line):
+    """True when a line is information rather than a weakness."""
+    return any(pattern.search(str(line or "")) for pattern in OBSERVATION_ONLY)
+
+
+#: testssl records that describe the configuration rather than fault it. These
+#: come back on every host and were being reported as "TLS configuration
+#: weakness" with the raw record as the only explanation.
+TESTSSL_INFORMATIONAL = re.compile(
+    r"^(FS_|DNS_CAArecord|cipher_order|cipherorder_|cert_serialNumber|"
+    r"cert_fingerprint|cert_commonName$|cert_subjectAltName$|cert_caIssuers|"
+    r"cert_crlDistributionPoints|cert_ocspURL|cert_mustStaple|"
+    r"cert_eTLS|cert_numbers|intermediate_cert|OCSP_stapling|"
+    r"HTTP_(status_code|clock_skew|headerTime)|banner_|service|"
+    r"engine_problem|scanTime|clientsimulation|protocol_negotiated|"
+    r"TLS_extensions|TLS_session_ticket|SSL_sessionID_support|"
+    r"sub_cipherlists|std_|grade|cert_chain_of_trust$)", re.I)
+
+#: The few testssl records that are informational by id but worth a named
+#: entry of their own rather than silence.
+TESTSSL_NAMED_INFO = (
+    (re.compile(r"^FS_TLS12_sig_algs|signature algorithm", re.I),
+     "tls_weak_signature_alg", re.compile(r"\bSHA1\b|\+SHA1\b", re.I)),
+    (re.compile(r"^DNS_CAArecord", re.I), "caa_missing",
+     re.compile(r"^\s*$|no CAA|none", re.I)),
+)
+
+
+def for_testssl_informational(record):
+    """Is this informational record worth naming? Returns a key or None.
+
+    ``FS_TLS12_sig_algs`` listing RSA+SHA1 is worth a line, because SHA-1 in a
+    signature algorithm list is a real (if low) weakness. The same record
+    without SHA-1 is not worth anything, and neither is the CAA record when
+    one exists.
+    """
+    identifier = str(record.get("id", ""))
+    finding = str(record.get("finding", ""))
+    for pattern, key, matters in TESTSSL_NAMED_INFO:
+        if pattern.search(identifier) and matters.search(finding):
+            return key
+    return None
 
 
 def clean_title(text, limit=118):

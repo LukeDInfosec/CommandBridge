@@ -75,6 +75,14 @@ class CBFinding:
     seen_at: float = field(default_factory=time.time)
     cwe: str = ""
     references: list = field(default_factory=list)
+    #: The library key. Two tools describing the same problem in their own
+    #: words produce the same key, which is what lets them become one finding
+    #: instead of two that a reader has to work out are the same.
+    key: str = ""
+    #: Which stages saw it. A finding corroborated by three tools is worth
+    #: more than one seen by a single signature match, and the report should
+    #: say which ones.
+    sources: list = field(default_factory=list)
     #: Every other place the same issue was seen. Burp calls these instances,
     #: and keeping them on one finding is the difference between "the site is
     #: missing a CSP" and four hundred identical rows.
@@ -89,6 +97,13 @@ class CBFinding:
 
     def locations(self):
         return [self.where] + list(self.instances)
+
+    def add_source(self, stage):
+        """Record another tool that found the same thing."""
+        if stage and stage not in self.sources:
+            self.sources.append(stage)
+            return True
+        return False
 
     def add_instance(self, where, evidence=""):
         """Record another sighting. Returns True when it was new."""
@@ -170,7 +185,7 @@ def _finding_from(key, where, evidence="", stage="", **override):
                   where=where, detail=issue["detail"],
                   remediation=issue["remediation"], cwe=issue["cwe"],
                   references=list(issue["references"]), evidence=evidence,
-                  stage=stage)
+                  stage=stage, key=key, sources=[stage] if stage else [])
     fields.update({k: v for k, v in override.items() if v})
     return CBFinding(**fields)
 
@@ -573,6 +588,52 @@ class CoffeeBreakMixin:
         self._cb_thread = None
         self._cb_worker = None
         self._cb_skip_requested = False
+        self._cb_paused = False
+        self._cb_resume_pending = False
+        self._cb_current_command = ""
+        self._cb_muted = self._cb_load_muted()
+
+    # ── muted issues ─────────────────────────────────────────────────────
+    def _cb_muted_path(self):
+        from pathlib import Path as _Path
+        directory = _Path.home() / ".config" / "CommandBridge"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory / "muted_issues.json"
+
+    def _cb_load_muted(self):
+        """Issue types this operator does not report.
+
+        Every team has a list — the one that started this was BREACH. Muting
+        is per issue type and survives restarts, because having to delete the
+        same finding after every scan is how a tool trains you to skim.
+        """
+        try:
+            path = self._cb_muted_path()
+            if path.is_file():
+                data = json.loads(path.read_text() or "[]")
+                if isinstance(data, list):
+                    return set(data)
+        except Exception:                               # noqa: BLE001
+            pass
+        return set()
+
+    def _cb_save_muted(self, keys):
+        try:
+            self._cb_muted_path().write_text(json.dumps(sorted(keys), indent=2))
+        except Exception as exc:                        # noqa: BLE001
+            self.console.append_ansi(f"[i] could not save the muted list: "
+                                     f"{exc}\n")
+
+    def mute_issue_type(self, key, muted=True):
+        """Stop reporting an issue type, now and in future scans."""
+        current = set(getattr(self, "_cb_muted", None) or self._cb_load_muted())
+        if muted:
+            current.add(key)
+        else:
+            current.discard(key)
+        self._cb_muted = current
+        self._cb_save_muted(current)
+        return current
 
     # ── the chain ────────────────────────────────────────────────────────
     def _cb_stage_list(self):
@@ -722,7 +783,8 @@ class CoffeeBreakMixin:
         self.console.append_ansi(f"[*] {len(self._cb_stages)} stages. Findings "
                                  f"appear on the Coffee Break tab as they land.\n")
         self.console.append_ansi("=" * 80 + "\n")
-        self.set_status_state("running")
+        self.current_action_label = "Coffee Break"
+        self.set_status_state("running", tool="Coffee Break")
         self.update_status_bar("running", "Coffee Break")
         self._cb_advance()
 
@@ -739,6 +801,73 @@ class CoffeeBreakMixin:
         self.console.append_ansi("\n[!] Coffee Break stopped by the operator.\n")
         self.set_status_state("idle")
 
+    def pause_coffee_break(self):
+        """Suspend the run, and hold the chain until it is resumed.
+
+        Two things have to happen or this does not work: the process that is
+        running right now is stopped (SIGSTOP, so a forty-minute nmap is not
+        thrown away and restarted), and the chain is prevented from starting
+        the next stage. Pausing only the first leaves the sequence marching on
+        as soon as the current step ends.
+        """
+        if not getattr(self, "_cb_active", False):
+            return False
+        self._cb_paused = not getattr(self, "_cb_paused", False)
+        if self._cb_paused:
+            self._cb_signal_process("SIGSTOP")
+            self.console.append_ansi(
+                "\n[*] Coffee Break paused. The running step is suspended and "
+                "nothing further will start until you resume.\n")
+            try:
+                self.set_status_state("paused")
+                self.update_status_bar("paused", self._cb_current_command)
+            except Exception:                           # noqa: BLE001
+                pass
+        else:
+            self._cb_signal_process("SIGCONT")
+            self.console.append_ansi("\n[*] Coffee Break resumed.\n")
+            self._cb_assert_running()
+            if self._cb_resume_pending:
+                self._cb_resume_pending = False
+                QTimer.singleShot(0, self._cb_advance)
+        self._cb_ui_call("_cb_ui_paused", self._cb_paused)
+        return self._cb_paused
+
+    def _cb_signal_process(self, name):
+        """Stop or continue the child process, if there is one."""
+        import os
+        import signal
+        try:
+            pid = self.runner.process.processId()
+            if pid:
+                os.kill(pid, getattr(signal, name))
+                self._process_paused = (name == "SIGSTOP")
+        except Exception as exc:                        # noqa: BLE001
+            self.console.append_ansi(f"[i] could not {name} the running "
+                                     f"process: {exc}\n")
+
+    def _cb_assert_running(self):
+        """Put the status bar back to running.
+
+        The shared command runner announces "idle" when each command finishes
+        and schedules another "idle" three seconds later. During a chain that
+        is wrong twice over — the chain has not finished, and the next stage
+        has already started — so every stage boundary re-asserts the truth.
+        """
+        try:
+            self.current_action_label = (
+                f"Coffee Break — {self._cb_stage_name()}")
+            self.set_status_state("running", tool=self.current_action_label)
+            self.update_status_bar("running", self._cb_current_command)
+        except Exception:                               # noqa: BLE001
+            pass
+
+    def _cb_stage_name(self):
+        try:
+            return self._cb_stages[self._cb_index]["name"]
+        except Exception:                               # noqa: BLE001
+            return "running"
+
     def skip_coffee_break_stage(self):
         """Give up on the stage that is running and move to the next one."""
         if not getattr(self, "_cb_active", False):
@@ -752,6 +881,11 @@ class CoffeeBreakMixin:
     # ── sequencing ───────────────────────────────────────────────────────
     def _cb_advance(self):
         if not getattr(self, "_cb_active", False):
+            return
+        if getattr(self, "_cb_paused", False):
+            # Hold here. The resume picks the chain up from exactly this
+            # point rather than restarting the stage that just finished.
+            self._cb_resume_pending = True
             return
         self._cb_index += 1
         if self._cb_index >= len(self._cb_stages):
@@ -778,12 +912,21 @@ class CoffeeBreakMixin:
 
         if stage["kind"] == "shell":
             self.current_action_label = f"Coffee Break — {stage['name']}"
+            self._cb_current_command = stage["command"]
+            self._cb_ui_call("_cb_ui_command", stage["command"])
+            self._cb_assert_running()
             try:
                 self.start_progress_animation()
             except Exception:
                 pass
             self.runner.run_command(stage["command"], str(self.output_dir))
         else:
+            self.current_action_label = f"Coffee Break — {stage['name']}"
+            self._cb_current_command = (
+                f"(built in) {stage['name']} — running inside Command Bridge, "
+                f"no external tool")
+            self._cb_ui_call("_cb_ui_command", self._cb_current_command)
+            self._cb_assert_running()
             self._cb_start_worker(stage)
 
     def _cb_start_worker(self, stage):
@@ -846,6 +989,8 @@ class CoffeeBreakMixin:
         else:
             status, note = "failed", f"exit {exit_code}"
         self._cb_ui_call("_cb_ui_stage", stage["key"], status, note)
+        if getattr(self, "_cb_active", False):
+            self._cb_assert_running()
         QTimer.singleShot(0, self._cb_advance)
 
     def _cb_capture_output(self, text):
@@ -857,6 +1002,8 @@ class CoffeeBreakMixin:
 
     def _cb_complete(self):
         self._cb_active = False
+        self._cb_current_command = ""
+        self.current_action_label = None
         elapsed = time.time() - self._cb_started_at
         counts = {s: 0 for s in SEVERITIES}
         for finding in self._cb_findings:
@@ -911,15 +1058,40 @@ class CoffeeBreakMixin:
         thing. Burp consolidates by issue type and lists the affected locations
         underneath, and so does this now.
         """
+        if finding.key and finding.key in self._cb_muted:
+            return
+
         for existing in self._cb_findings:
-            if (existing.title, existing.stage) != (finding.title, finding.stage):
+            #: Same issue = same library key, whichever tool found it. Nikto
+            #: calling BREACH "the Content-Encoding header is set to deflate"
+            #: and testssl calling it BREACH are one finding with two sources,
+            #: not two findings a human has to reconcile.
+            same = (existing.key and existing.key == finding.key) or \
+                   (not finding.key and
+                    (existing.title, existing.stage) ==
+                    (finding.title, finding.stage))
+            if not same:
                 continue
-            if existing.add_instance(finding.where, finding.evidence):
-                # A repeat of a firm finding is firmer than a single tentative
-                # one, but a repeat never makes a tentative finding firm.
+            changed = existing.add_instance(finding.where, finding.evidence)
+            if existing.add_source(finding.stage):
+                changed = True
+                # Corroboration by a second tool raises confidence, never
+                # severity: two scanners agreeing is better evidence, not a
+                # worse problem.
+                if existing.confidence == "tentative":
+                    existing.confidence = "firm"
+            # The more serious assessment of the same issue wins.
+            if cb_issues.worst(existing.severity, finding.severity) != \
+                    existing.severity:
+                existing.severity = cb_issues.worst(existing.severity,
+                                                    finding.severity)
+                changed = True
+            if changed:
                 self._cb_ui_call("_cb_ui_refresh", existing)
             return
 
+        if not finding.sources and finding.stage:
+            finding.sources = [finding.stage]
         self._cb_findings.append(finding)
         self._cb_ui_call("_cb_ui_finding", finding)
         self.console.append_ansi(
@@ -939,7 +1111,7 @@ class CoffeeBreakMixin:
             where=where, detail=issue["detail"],
             remediation=issue["remediation"], cwe=issue["cwe"],
             references=list(issue["references"]), evidence=evidence,
-            stage=stage)
+            stage=stage, key=key, sources=[stage] if stage else [])
         fields.update({k: v for k, v in override.items() if v})
         return CBFinding(**fields)
 
@@ -1000,12 +1172,33 @@ class CoffeeBreakMixin:
         #: key → (severity, [evidence lines], [cves])
         grouped = {}
         for record in records:
-            key, issue = cb_issues.for_testssl(record)
+            identifier = str(record.get("id", ""))
+            # Records that describe the configuration rather than fault it.
+            # These were the whole of the "TLS configuration weakness" noise:
+            # a list of signature algorithms and an empty CAA record, reported
+            # as a weakness with the raw record as the only explanation.
+            informational = bool(
+                cb_issues.TESTSSL_INFORMATIONAL.match(identifier))
+            if informational:
+                named = cb_issues.for_testssl_informational(record)
+                if not named:
+                    continue
+                key, issue = named, ISSUES[named]
+            else:
+                key, issue = cb_issues.for_testssl(record)
             if not key:
                 continue
-            severity = str(record.get("severity", "")).upper()
-            severity = cb_issues.worst(issue["severity"],
-                                       severity if severity in SEVERITIES else "")
+            reported = str(record.get("severity", "")).upper()
+            if informational:
+                # testssl rates a missing CAA record LOW. It is a control that
+                # is available and not switched on, not a weakness in the TLS
+                # configuration, and letting the tool's rating win here is how
+                # a findings screen fills up with things nobody will fix.
+                severity = issue["severity"]
+            else:
+                severity = cb_issues.worst(
+                    issue["severity"],
+                    reported if reported in SEVERITIES else "")
             line = clean_title(record.get("finding", ""), 300)
             identifier = str(record.get("id", ""))
             bucket = grouped.setdefault(key, {"severity": severity,
@@ -1024,8 +1217,24 @@ class CoffeeBreakMixin:
             evidence = "\n".join(bucket["lines"][:14])
             if len(bucket["lines"]) > 14:
                 evidence += f"\n… and {len(bucket['lines']) - 14} more"
+            detail = ISSUES[key]["detail"]
+            if key == "tls_generic":
+                # "TLS configuration weakness — reported by testssl" tells the
+                # reader nothing. Name the checks that failed and hand over
+                # testssl's own wording, which at least says what it looked at.
+                names = ", ".join(sorted({line.split(":")[0]
+                                          for line in bucket["lines"]})[:6])
+                detail = (
+                    f"testssl flagged {len(bucket['lines'])} TLS check(s) on "
+                    f"this host that do not map to a named attack: {names}. "
+                    f"The specific wording of each is in the evidence below. "
+                    f"These are usually cipher-suite or protocol preferences "
+                    f"rather than a single exploitable flaw — read the "
+                    f"evidence and decide whether the configuration meets the "
+                    f"standard this engagement is being measured against.")
             finding = self._cb_issue(key, host, evidence, stage["key"],
-                                     severity=bucket["severity"])
+                                     severity=bucket["severity"],
+                                     detail=detail)
             for cve in bucket["cves"]:
                 if cve not in finding.references:
                     finding.references.append(cve)
@@ -1089,13 +1298,20 @@ class CoffeeBreakMixin:
         return records
 
     def _cb_parse_nikto(self, stage, text):
-        """Nikto's '+' lines, minus the inventory.
+        """Nikto's '+' lines, with the scan's own bookkeeping thrown away.
 
-        Most of what Nikto prints is a description of the server, not a problem
-        with it — the headers it did and did not see, the methods allowed, the
-        banner. Those go into one collapsed observation; the rest become
-        findings, still marked tentative because Nikto matches signatures and
-        does not confirm anything.
+        Three rules, in order:
+
+          1. A statement about the scan is not a finding. "1 host(s) tested",
+             "8299 requests: 0 errors", "Failed to check for updates: 403" —
+             none of these say anything about the target, and reporting them
+             at Low teaches the reader that Low means nothing.
+          2. If the library recognises what Nikto is describing, the finding
+             takes the library's name, severity, explanation and CWE. That is
+             what merges Nikto's "the Content-Encoding header is set to
+             deflate" with testssl's BREACH into one entry.
+          3. Anything left is INFORMATIONAL unless it names a weakness.
+             Nikto rates everything the same; a report cannot.
         """
         produced = 0
         observations = []
@@ -1104,44 +1320,116 @@ class CoffeeBreakMixin:
             if not clean.startswith("+ ") or len(clean) < 12:
                 continue
             body = clean[2:].strip()
-            if cb_issues.is_nikto_noise(body):
-                if len(observations) < 40 and body not in observations:
+
+            if cb_issues.is_statement(body):
+                continue                      # the scan talking about itself
+
+            key, issue = cb_issues.for_text(body)
+            if key == "robots_disclosure" and \
+                    not self._cb_robots_worth_reporting():
+                continue
+            if key:
+                if issue["severity"] != "INFO":
+                    produced += 1
+                self._cb_record(self._cb_issue(
+                    key, self._cb_where_for(key, body), body[:500],
+                    stage["key"], confidence="tentative",
+                    detail=issue["detail"] + f"\n\nNikto reported: {body}\n\n"
+                           "Nikto matches signatures and does not confirm "
+                           "what it finds; verify before this goes in a "
+                           "report."))
+                continue
+
+            if cb_issues.is_observation(body):
+                if len(observations) < 60 and body not in observations:
                     observations.append(body)
                 continue
-            key, issue = cb_issues.for_text(body)
-            if key:
-                self._cb_record(self._cb_issue(
-                    key, self._cb_target_url(), body[:500], stage["key"],
-                    confidence="tentative",
-                    detail=issue["detail"] + f"\n\nNikto reported: {body}\n\n"
-                           "Nikto matches signatures and does not confirm what "
-                           "it finds; verify before this goes in a report."))
-            else:
-                lowered = body.lower()
+
+            # Unrecognised, and not obviously an observation. Report it, but
+            # at the severity its wording justifies rather than a flat Low.
+            lowered = body.lower()
+            if any(word in lowered for word in
+                   ("remote code", "shell", "backdoor", "command execution")):
+                severity = "HIGH"
+            elif any(word in lowered for word in
+                     ("osvdb", "cve-", "vulnerab", "exploit", "injection",
+                      "traversal", "disclosure", "bypass", "overflow")):
+                severity = "MEDIUM"
+            elif any(word in lowered for word in
+                     ("outdated", "insecure", "missing", "weak", "default",
+                      "exposed", "enabled", "unprotected")):
                 severity = "LOW"
-                if any(w in lowered for w in ("osvdb", "cve-", "vulnerab")):
-                    severity = "MEDIUM"
-                self._cb_record(CBFinding(
-                    severity=severity, title=clean_title(body),
-                    where=self._cb_target_url(),
-                    detail="Reported by Nikto.\n\n" + body + "\n\nNikto is "
-                           "signature-driven and does not verify what it "
-                           "matches; confirm this by hand before reporting it.",
-                    evidence=body[:500], confidence="tentative",
-                    stage=stage["key"]))
-            produced += 1
+            else:
+                severity = "INFO"
+
+            self._cb_record(CBFinding(
+                severity=severity, title=clean_title(body),
+                where=self._cb_target_url(),
+                detail="Reported by Nikto.\n\n" + body + "\n\nNikto is "
+                       "signature-driven and does not verify what it matches; "
+                       "confirm this by hand before reporting it.",
+                evidence=body[:500], confidence="tentative",
+                stage=stage["key"], sources=[stage["key"]]))
+            if severity != "INFO":
+                produced += 1
 
         if observations:
-            self._cb_record(CBFinding(
-                severity="INFO",
+            self._cb_record(self._cb_issue(
+                "scan_information", self._cb_target_url(),
+                "\n".join(observations), stage["key"],
                 title="Server inventory observed by Nikto",
-                where=self._cb_target_url(),
-                detail="Descriptive output from Nikto, collapsed into one "
-                       "entry. None of it is a finding on its own; it is here "
-                       "because it is useful context for the ones that are.",
-                evidence="\n".join(observations),
-                confidence="tentative", stage=stage["key"]))
+                confidence="tentative"))
         return produced
+
+    def _cb_robots_worth_reporting(self):
+        """Is there anything in robots.txt worth a line in a report?
+
+        A 200 on robots.txt is not a finding. An empty file is not a finding.
+        The finding — such as it is — is the file naming paths the operator
+        wanted kept out of a search index, which is a shortlist of where to
+        look. So fetch it and check, rather than trusting a scanner that only
+        confirmed the file exists.
+        """
+        cached = self._cb_artifacts.get("robots_checked")
+        if cached is not None:
+            return cached
+        worth, entries = False, []
+        try:
+            import requests
+            response = requests.get(
+                self._cb_target_url().rstrip("/") + "/robots.txt",
+                timeout=12, verify=False,
+                headers={"User-Agent": "CommandBridge"})
+            if response.status_code == 200 and \
+                    "html" not in (response.headers.get("Content-Type") or ""):
+                for line in (response.text or "").splitlines():
+                    line = line.strip()
+                    if re.match(r"^(dis)?allow\s*:\s*\S", line, re.I) and \
+                            not re.match(r"^disallow\s*:\s*/\s*$", line, re.I):
+                        entries.append(line)
+                worth = bool(entries)
+        except Exception:                               # noqa: BLE001
+            pass
+        self._cb_artifacts["robots_checked"] = worth
+        self._cb_artifacts["robots_entries"] = entries
+        return worth
+
+    def _cb_where_for(self, key, body):
+        """The URL a finding belongs to, pulled out of the tool's own line.
+
+        A login panel finding that says "somewhere on the target" is half a
+        finding. Nikto prints the path it found; this puts it in the finding's
+        location so the reader can click it.
+        """
+        base = self._cb_target_url().rstrip("/")
+        match = re.search(r"(/[A-Za-z0-9_\-./%]{1,120})", body or "")
+        if match and key in ("login_panel_exposed", "admin_exposed",
+                             "directory_listing", "backup_file",
+                             "vcs_exposed", "env_file_exposed",
+                             "info_page_exposed", "source_code_disclosure",
+                             "config_disclosed", "api_spec_exposed"):
+            return base + match.group(1)
+        return self._cb_target_url()
 
     def _cb_parse_nuclei(self, stage, text):
         produced = 0
@@ -1187,7 +1475,14 @@ class CoffeeBreakMixin:
             # Name it from the library when the template describes something
             # the library knows; keep nuclei's own wording when it does not.
             key, issue = cb_issues.for_nuclei(template, name, description)
+            if key == "robots_disclosure" and \
+                    not self._cb_robots_worth_reporting():
+                continue
             if key:
+                if key == "robots_disclosure":
+                    evidence = "\n".join(
+                        self._cb_artifacts.get("robots_entries") or []) \
+                        or evidence
                 finding = self._cb_issue(
                     key, matched, evidence, stage["key"],
                     severity=(severity if severity in SEVERITIES else None),
