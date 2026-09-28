@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame,
     QScrollArea, QProgressBar, QTableWidget, QTableWidgetItem, QSplitter,
     QTextEdit, QHeaderView, QAbstractItemView, QComboBox, QFileDialog,
-    QMessageBox, QSizePolicy, QMenu, QApplication,
+    QMessageBox, QSizePolicy, QMenu, QApplication, QCheckBox, QGridLayout,
 )
 
 from command_bridge.modules.coffee_break import SEVERITIES, SEV_ORDER
@@ -37,13 +37,17 @@ SEV_COLOURS = {
     "INFO": "#8b9bb4",
 }
 
+#: The checklist marks. A tick for done, an arrow for the one in flight, an
+#: empty circle for what is still to come — the point of the list is that you
+#: can tell those three apart from across the room.
 STAGE_MARK = {
     "pending": ("○", "#6b7688"),
-    "running": ("◐", "#4f8cff"),
-    "done": ("●", "#2dd4a7"),
-    "skipped": ("◌", "#8b9bb4"),
+    "running": ("▶", "#4f8cff"),
+    "done": ("✓", "#2dd4a7"),
+    "skipped": ("⊘", "#8b9bb4"),
     "failed": ("✕", "#ff5f6d"),
 }
+FINISHED = ("done", "skipped", "failed")
 
 
 class _SeverityItem(QTableWidgetItem):
@@ -77,6 +81,7 @@ class CoffeeBreakTabMixin:
         layout.setSpacing(18)
 
         layout.addWidget(self._cb_build_header())
+        layout.addWidget(self._cb_build_options())
         layout.addWidget(self._cb_build_stages())
         layout.addWidget(self._cb_build_findings(), 1)
 
@@ -86,6 +91,7 @@ class CoffeeBreakTabMixin:
 
         self._cb_rows = []
         self._cb_stage_rows = {}
+        self._cb_stage_status = {}
         self._cb_ui_finding_list = []
         return scroll
 
@@ -184,16 +190,131 @@ class CoffeeBreakTabMixin:
         card.layout().addLayout(box)
         return card
 
+    # ── options ──────────────────────────────────────────────────────────
+    def _cb_build_options(self):
+        """Everything you might want to change, folded away until you do.
+
+        Collapsed by default: on most runs you press the button and walk off,
+        and a screen that opens with fourteen checkboxes in your face buries
+        the thing you actually came to look at.
+        """
+        from command_bridge.modules.coffee_break import CB_STAGE_CATALOGUE
+
+        card = self.create_card("Scan options")
+        self._init_collapsible_groupbox(card, "cb_options_card")
+        box = QVBoxLayout()
+        box.setSpacing(10)
+
+        hint = QLabel(
+            "Which steps run, and what gets reported. Turning a step off "
+            "removes it from the checklist below rather than skipping it "
+            "silently.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: palette(mid); font-size: 11.5px;")
+        box.addWidget(hint)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(18)
+        grid.setVerticalSpacing(4)
+        self.cb_stage_toggles = {}
+        for position, (key, name, note) in enumerate(CB_STAGE_CATALOGUE):
+            toggle = QCheckBox(name)
+            toggle.setChecked(True)
+            toggle.setToolTip(note)
+            toggle.stateChanged.connect(self._cb_stages_chosen)
+            self.cb_stage_toggles[key] = toggle
+            grid.addWidget(toggle, position % 7, position // 7)
+        box.addLayout(grid)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        for label, keys in (
+                ("All", [k for k, _n, _h in CB_STAGE_CATALOGUE]),
+                ("None", []),
+                ("Quick (skip the slow scans)",
+                 [k for k, _n, _h in CB_STAGE_CATALOGUE
+                  if k not in ("nmap_full", "nmap_udp", "smartfuzz")])):
+            button = QPushButton(label)
+            button.setObjectName("secondaryButton")
+            button.setMinimumHeight(30)
+            button.clicked.connect(
+                lambda _checked=False, chosen=keys: self._cb_choose(chosen))
+            row.addWidget(button)
+        row.addStretch()
+        box.addLayout(row)
+
+        self.cb_muted_label = QLabel("")
+        self.cb_muted_label.setWordWrap(True)
+        self.cb_muted_label.setStyleSheet(
+            "color: palette(mid); font-size: 11.5px;")
+        box.addWidget(self.cb_muted_label)
+
+        self.cb_unmute_btn = QPushButton("Report muted issue types again")
+        self.cb_unmute_btn.setObjectName("secondaryButton")
+        self.cb_unmute_btn.setMinimumHeight(30)
+        self.cb_unmute_btn.clicked.connect(self._cb_unmute_all)
+        box.addWidget(self.cb_unmute_btn)
+
+        card.layout().addLayout(box)
+        self._cb_refresh_muted()
+        return card
+
+    def _cb_choose(self, keys):
+        wanted = set(keys)
+        for key, toggle in self.cb_stage_toggles.items():
+            toggle.blockSignals(True)
+            toggle.setChecked(key in wanted)
+            toggle.blockSignals(False)
+        self._cb_stages_chosen()
+
+    def _cb_stages_chosen(self):
+        self._cb_enabled_stages = {
+            key for key, toggle in self.cb_stage_toggles.items()
+            if toggle.isChecked()}
+
+    def _cb_refresh_muted(self):
+        muted = sorted(getattr(self, "_cb_muted", None) or
+                       self._cb_load_muted())
+        from command_bridge.modules.cb_issues import ISSUES
+        if not muted:
+            self.cb_muted_label.setText(
+                "No issue types are muted. Right-click a finding to stop "
+                "reporting its type.")
+            self.cb_unmute_btn.setVisible(False)
+            return
+        names = [ISSUES.get(key, {}).get("title", key) for key in muted]
+        self.cb_muted_label.setText(
+            "Not reported: " + " · ".join(names))
+        self.cb_unmute_btn.setVisible(True)
+
+    def _cb_unmute_all(self):
+        for key in list(getattr(self, "_cb_muted", None) or
+                        self._cb_load_muted()):
+            self.mute_issue_type(key, False)
+        self._cb_refresh_muted()
+        self.console.append_ansi("\n[i] every muted issue type will be "
+                                 "reported again.\n")
+
     # ── stage list ───────────────────────────────────────────────────────
     def _cb_build_stages(self):
-        card = self.create_card("Stages")
+        card = self.create_card("Checklist")
+        self._cb_stages_card = card
         self._init_collapsible_groupbox(card, "cb_stages_card")
+        outer = QVBoxLayout()
+        outer.setSpacing(6)
+
+        self.cb_stage_summary = QLabel("Not started.")
+        self.cb_stage_summary.setStyleSheet(
+            "color: palette(mid); font-size: 11.5px;")
+        outer.addWidget(self.cb_stage_summary)
+
         self.cb_stage_box = QVBoxLayout()
         self.cb_stage_box.setSpacing(4)
         placeholder = QLabel("The chain has not been run yet.")
         placeholder.setStyleSheet("color: palette(mid); font-size: 12px;")
         self.cb_stage_box.addWidget(placeholder)
-        card.layout().addLayout(self.cb_stage_box)
+        outer.addLayout(self.cb_stage_box)
+        card.layout().addLayout(outer)
         return card
 
     def _cb_clear_stage_box(self):
@@ -266,6 +387,16 @@ class CoffeeBreakTabMixin:
         self.cb_table.setContextMenuPolicy(
             Qt.ContextMenuPolicy.CustomContextMenu)
         self.cb_table.customContextMenuRequested.connect(self._cb_menu)
+        # Delete does the same as the menu's first item. A context menu that
+        # does not open leaves you with nothing; a key always works.
+        remove = QtGui.QShortcut(QtGui.QKeySequence.StandardKey.Delete,
+                                 self.cb_table)
+        remove.setContext(Qt.ShortcutContext.WidgetShortcut)
+        remove.activated.connect(self._cb_delete_selected)
+        self.cb_table.setToolTip(
+            "Right-click a finding to delete it, delete every finding of its "
+            "type, or never report that type again. Delete removes the "
+            "selected one.")
         self.cb_table.setMinimumHeight(300)
         splitter.addWidget(self.cb_table)
 
@@ -298,6 +429,13 @@ class CoffeeBreakTabMixin:
 
         self._cb_clear_stage_box()
         self._cb_stage_rows = {}
+        self._cb_stage_status = {}
+        # A checklist you cannot see is not a checklist. However the card was
+        # left last time, a run opens it.
+        try:
+            self._cb_stages_card.setChecked(True)
+        except Exception:                               # noqa: BLE001
+            pass
         for stage in stages:
             row = QWidget()
             line = QHBoxLayout(row)
@@ -315,6 +453,11 @@ class CoffeeBreakTabMixin:
             line.addWidget(note)
             self.cb_stage_box.addWidget(row)
             self._cb_stage_rows[stage["key"]] = (mark, name, note)
+            self._cb_stage_status[stage["key"]] = "pending"
+
+        total = len(stages)
+        self.cb_stage_summary.setText(
+            f"0 done · {total} to go" if total else "Nothing to run.")
 
         self.cb_start_btn.setEnabled(False)
         self.cb_skip_btn.setEnabled(True)
@@ -325,26 +468,53 @@ class CoffeeBreakTabMixin:
         self._cb_elapsed_timer.start()
 
     def _cb_ui_stage(self, key, status, note):
+        self._cb_stage_status[key] = status
         widgets = getattr(self, "_cb_stage_rows", {}).get(key)
         if widgets:
             mark, name, note_label = widgets
             glyph, colour = STAGE_MARK.get(status, STAGE_MARK["pending"])
             mark.setText(glyph)
             mark.setStyleSheet(f"color: {colour};")
-            name.setStyleSheet(
-                "font-weight: 600;" if status == "running" else "")
+            # Done steps are struck through and dimmed, the running one is
+            # bold, and everything still to come is left plain. You should be
+            # able to see where the scan has got to without reading a word.
+            if status == "done":
+                name.setStyleSheet("text-decoration: line-through; "
+                                   "color: palette(mid);")
+            elif status == "skipped":
+                name.setStyleSheet("text-decoration: line-through; "
+                                   "color: palette(mid); font-style: italic;")
+            elif status == "failed":
+                name.setStyleSheet(f"color: {STAGE_MARK['failed'][1]};")
+            elif status == "running":
+                name.setStyleSheet(
+                    f"font-weight: 700; color: {STAGE_MARK['running'][1]};")
+            else:
+                name.setStyleSheet("")
             note_label.setText(note or "")
 
         total = max(1, len(getattr(self, "_cb_stages", [])) or 1)
-        done = sum(1 for k, (m, _n, _o) in self._cb_stage_rows.items()
-                   if m.text() in (STAGE_MARK["done"][0],
-                                   STAGE_MARK["skipped"][0],
-                                   STAGE_MARK["failed"][0]))
-        self.cb_progress.setValue(int(done / total * 100))
+        counts = {state: 0 for state in
+                  ("pending", "running", "done", "skipped", "failed")}
+        for state in self._cb_stage_status.values():
+            counts[state] = counts.get(state, 0) + 1
+        finished = sum(counts[state] for state in FINISHED)
+
+        self.cb_progress.setValue(int(finished / total * 100))
+        parts = [f"{counts['done']} done"]
+        if counts["skipped"]:
+            parts.append(f"{counts['skipped']} skipped")
+        if counts["failed"]:
+            parts.append(f"{counts['failed']} failed")
+        outstanding = total - finished
+        parts.append(f"{outstanding} to go" if outstanding else "all finished")
+        self.cb_stage_summary.setText(" · ".join(parts))
+
         if status == "running":
             label = self._cb_stage_rows.get(key)
             self.cb_progress.setFormat(
-                f"{done + 1} of {total} — {label[1].text() if label else key}")
+                f"{finished + 1} of {total} — "
+                f"{label[1].text() if label else key}")
 
     def _cb_ui_command(self, command):
         """Show the command the current stage is running."""
@@ -540,6 +710,23 @@ class CoffeeBreakTabMixin:
             return None
         return findings[index]
 
+    def _cb_row_at(self, position):
+        """Which row was right-clicked.
+
+        customContextMenuRequested hands back a position in the widget's own
+        coordinates, while rowAt() expects the viewport's — and the two differ
+        by the height of the horizontal header. That is about 25 pixels, which
+        was enough to return the wrong row near the top of the table and -1 on
+        the first row, so the menu never appeared at all. Map it properly,
+        then fall back to whatever is selected.
+        """
+        table = self.cb_table
+        for candidate in (table.viewport().mapFrom(table, position), position):
+            index = table.indexAt(candidate)
+            if index.isValid():
+                return index.row()
+        return table.currentRow()
+
     def _cb_menu(self, position):
         """Delete a finding, delete its whole type, or mute it for good.
 
@@ -548,10 +735,14 @@ class CoffeeBreakTabMixin:
         every scan after it, which is the difference between a fix and a
         chore you repeat.
         """
-        row = self.cb_table.rowAt(position.y())
+        row = self._cb_row_at(position)
         finding = self._cb_finding_at(row)
         if finding is None:
             return
+        # Right-clicking a row selects it, so the detail pane below matches
+        # what the menu is about to act on.
+        if row != self.cb_table.currentRow():
+            self.cb_table.selectRow(row)
 
         menu = QMenu(self)
         title = finding.title
@@ -572,7 +763,7 @@ class CoffeeBreakTabMixin:
         copy_one = menu.addAction("Copy this finding")
         copy_all = menu.addAction("Copy every finding as Markdown")
 
-        chosen = menu.exec(self.cb_table.viewport().mapToGlobal(position))
+        chosen = menu.exec(self.cb_table.mapToGlobal(position))
         if chosen is None:
             return
 
@@ -593,6 +784,11 @@ class CoffeeBreakTabMixin:
         elif chosen is copy_all:
             QApplication.clipboard().setText(self.coffee_break_report())
             self.flash_status("report copied")
+
+    def _cb_delete_selected(self):
+        finding = self._cb_finding_at(self.cb_table.currentRow())
+        if finding is not None:
+            self._cb_drop([finding])
 
     def _cb_same_type(self, finding):
         key = getattr(finding, "key", "") or ""
@@ -642,8 +838,18 @@ class CoffeeBreakTabMixin:
             return
         import time
         elapsed = int(time.time() - started)
+        if getattr(self, "_cb_paused", False):
+            self.cb_elapsed_label.setText("paused")
+            return
         self.cb_elapsed_label.setText(
             f"running for {elapsed // 60}m {elapsed % 60:02d}s")
+        # The status bar's clock belongs to the chain while one is running,
+        # not to whichever step happens to be in flight.
+        try:
+            minutes, seconds = divmod(elapsed, 60)
+            self.update_status_elapsed(f"{minutes:02d}:{seconds:02d}")
+        except Exception:                               # noqa: BLE001
+            pass
 
     def _cb_export(self):
         if not getattr(self, "_cb_findings", None):
