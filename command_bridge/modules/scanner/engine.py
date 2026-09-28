@@ -266,7 +266,18 @@ class ScanEngine:
             self.on_progress("Looking for stored payloads", 1, 1)
 
         # 4 ── access control
-        if "access" in self.profile.checks and not self.stopped():
+        if "access" in self.profile.checks and not self.stopped() \
+                and not self.result.authenticated:
+            self.result.notes.append(
+                "Access control was not tested. Both halves of that check are "
+                "comparisons against a logged-in session — what an anonymous "
+                "user can reach that a logged-in one can, and what one user "
+                "can reach that another cannot — and this scan had no "
+                "authenticated session. It was skipped rather than reported "
+                "against itself.")
+            self.on_log("[scan] access control skipped — no authenticated "
+                        "session to compare against")
+        elif "access" in self.profile.checks and not self.stopped():
             anonymous = anonymous_identity(auth)
             anonymous.pace = self.pacer.wait
             access = AccessControlCheck(anonymous, second)
