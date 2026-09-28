@@ -573,6 +573,112 @@ def main():
               "weakness'",
               any(t == "TLS configuration weakness" for t in titles), False)
 
+        print("\n\033[1mNothing worth reporting is silently folded\033[0m")
+        # The regression this exists for: nuclei files its entire
+        # exposed-panels library at severity "info" with no remediation, and
+        # the fold rule was "info + no remediation = inventory". A publicly
+        # reachable Umbraco login page disappeared into "Technology
+        # fingerprint". Separately, git-config was ON the fingerprint list, so
+        # a readable .git vanished too. Every line below is a real finding and
+        # must come out as one.
+        engine = Engine(base)
+        engine._cb_artifacts["robots_checked"] = False
+        must_report = [
+            ("umbraco-login", "Umbraco Login Panel", "info",
+             "login_panel_exposed"),
+            ("phpmyadmin-panel", "phpMyAdmin Panel", "info",
+             "login_panel_exposed"),
+            ("jenkins-login", "Jenkins Login Panel", "info",
+             "login_panel_exposed"),
+            ("git-config", "Git Config Exposure", "medium", "vcs_exposed"),
+            ("phpinfo-files", "phpinfo() Disclosure", "low",
+             "info_page_exposed"),
+            ("http-trace", "HTTP TRACE method enabled", "info",
+             "trace_enabled"),
+            ("swagger-api", "Swagger API Documentation", "info",
+             "api_spec_exposed"),
+            ("CVE-2021-41773", "Apache 2.4.49 path traversal", "critical",
+             "traversal"),
+        ]
+        rows = [json.dumps({"template-id": tid,
+                            "matched-at": f"{base}/{tid}",
+                            "info": {"name": name, "severity": sev}})
+                for tid, name, sev, _key in must_report]
+        # and some that genuinely are inventory
+        rows += [json.dumps({"template-id": tid, "matched-at": base,
+                             "info": {"name": name, "severity": "info"}})
+                 for tid, name in (("tech-detect", "Nginx detected"),
+                                   ("waf-detect", "Cloudflare WAF"),
+                                   ("ssl-dns-names", "SSL DNS names"))]
+        engine._cb_parse_nuclei({"key": "nuclei"}, "\n".join(rows))
+        keys = {f.key for f in engine._cb_findings}
+        for _tid, name, _sev, key in must_report:
+            check(f"{name!r} is reported", key in keys)
+        check("an exposed admin panel is Medium, not Info",
+              [f.severity for f in engine._cb_findings
+               if f.key == "login_panel_exposed"], ["MEDIUM"])
+        check("a tool rating cannot lower the library's severity",
+              [f.severity for f in engine._cb_findings
+               if f.key == "info_page_exposed"], ["MEDIUM"])
+        check("three panels on one host are one finding with three places",
+              [f.count for f in engine._cb_findings
+               if f.key == "login_panel_exposed"], [3])
+        check("real fingerprinting is still folded away",
+              [f.title for f in engine._cb_findings if f.severity == "INFO"],
+              ["Technology fingerprint"])
+        check("and the folded entry names what was detected",
+              all(word in [f for f in engine._cb_findings
+                           if f.severity == "INFO"][0].evidence
+                  for word in ("Nginx", "Cloudflare")))
+
+        print("\n\033[1mSecurity headers\033[0m")
+        from command_bridge.modules.coffee_break import (
+            SECURITY_HEADERS, analyse_csp)
+        check("X-Permitted-Cross-Domain-Policies is checked",
+              SECURITY_HEADERS.get("x-permitted-cross-domain-policies"),
+              "xpcdp_missing")
+        check("and it explains what an Adobe client does without it",
+              "crossdomain.xml" in
+              cb_issues.ISSUES["xpcdp_missing"]["detail"])
+
+        sound = ("default-src 'self'; script-src 'self'; object-src 'none'; "
+                 "base-uri 'self'; frame-ancestors 'none'; form-action 'self'")
+        check("a sound policy raises nothing", analyse_csp(sound), [])
+        check("unsafe-inline is caught",
+              "csp_unsafe_script" in analyse_csp(
+                  sound.replace("script-src 'self'",
+                                "script-src 'self' 'unsafe-inline'")))
+        check("a nonce excuses unsafe-inline, as the browser does",
+              analyse_csp(sound.replace(
+                  "script-src 'self'",
+                  "script-src 'nonce-r4nd0m' 'unsafe-inline'")), [])
+        check("but never excuses unsafe-eval",
+              "csp_unsafe_script" in analyse_csp(sound.replace(
+                  "script-src 'self'",
+                  "script-src 'nonce-r4nd0m' 'unsafe-eval'")))
+        for source, label in (("*", "a bare wildcard"),
+                              ("https:", "a scheme-wide source"),
+                              ("data:", "a data: source")):
+            check(f"{label} in script-src is caught",
+                  "csp_wildcard_source" in analyse_csp(
+                      sound.replace("script-src 'self'",
+                                    f"script-src 'self' {source}")))
+        check("a missing object-src is caught",
+              "csp_missing_object_base" in analyse_csp(
+                  sound.replace("object-src 'none'; ", "")))
+        check("a missing base-uri is caught",
+              "csp_missing_object_base" in analyse_csp(
+                  sound.replace("base-uri 'self'; ", "")))
+        check("a missing frame-ancestors is caught",
+              "csp_clickjacking" in analyse_csp(
+                  sound.replace("frame-ancestors 'none'; ", "")))
+        check("script-src falls back to default-src when absent",
+              "csp_unsafe_script" in analyse_csp(
+                  "default-src 'self' 'unsafe-inline'; object-src 'none'; "
+                  "base-uri 'self'; frame-ancestors 'none'; "
+                  "form-action 'self'"))
+        check("an empty header analyses to nothing", analyse_csp(""), [])
+
         print("\n\033[1mThe report\033[0m")
         engine = Engine(base)
         engine._cb_record(CBFinding("CRITICAL", "Path traversal via 'file'",
