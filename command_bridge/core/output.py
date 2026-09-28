@@ -274,8 +274,16 @@ class OutputMixin:
         if hasattr(self, "_process_paused"):
             self._process_paused = False
         self.console.append_ansi("\n[!] Process stopped by user\n")
-        self.set_status_state("idle")
-        
+        # A sequence that is still running has not gone idle: the chain is
+        # between steps, not finished. Saying "Idle" here — and again three
+        # seconds later, on top of the next step — is what made a running
+        # Coffee Break scan look stopped.
+        _chain_running = (getattr(self, "_cb_active", False)
+                          or getattr(self, "_auto_scan_active", False)
+                          or getattr(self, "_externals_active", False))
+        if not _chain_running:
+            self.set_status_state("idle")
+
         # Update status bar
         self.stop_progress_animation()
         self.update_status_bar("stopped", self.current_command)
@@ -564,18 +572,33 @@ class OutputMixin:
                 self.append_scan_completion_message(scan_name, success=True)
             else:
                 self.append_scan_completion_message(scan_name, success=False, exit_code=exit_code)
-        self.set_status_state("idle")
-        
+        # A sequence that is still running has not gone idle: the chain is
+        # between steps, not finished. Saying "Idle" here — and again three
+        # seconds later, on top of the next step — is what made a running
+        # Coffee Break scan look stopped.
+        _chain_running = (getattr(self, "_cb_active", False)
+                          or getattr(self, "_auto_scan_active", False)
+                          or getattr(self, "_externals_active", False))
+        if not _chain_running:
+            self.set_status_state("idle")
+
         # Update status bar
         self.stop_progress_animation()
-        if exit_code == 0:
+        if _chain_running:
+            pass            # the chain re-asserts its own state as it advances
+        elif exit_code == 0:
             self.update_status_bar("success", self.current_command)
             self.progress_bar.setValue(100)
         else:
             self.update_status_bar("error", self.current_command)
         
-        # Reset to idle after 3 seconds
-        QTimer.singleShot(3000, lambda: self.update_status_bar("idle", ""))
+        # Reset to idle after 3 seconds — unless a sequence is still going,
+        # in which case this timer would land in the middle of a later step.
+        QTimer.singleShot(3000, lambda: None if (
+            getattr(self, "_cb_active", False)
+            or getattr(self, "_auto_scan_active", False)
+            or getattr(self, "_externals_active", False))
+            else self.update_status_bar("idle", ""))
         
         self.refresh_file_list()
 
