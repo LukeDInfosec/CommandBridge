@@ -265,6 +265,168 @@ def main():
     check("the detail pane carries the evidence",
           "root:x:0:0" in window.cb_detail.toPlainText())
 
+    print("\n\033[1mThe checklist crosses things off\033[0m")
+    from command_bridge.modules.coffee_break import CB_STAGE_CATALOGUE
+    stages = [{"key": k, "name": n} for k, n, _h in CB_STAGE_CATALOGUE[:5]]
+    window._cb_stages = stages
+    window._cb_ui_reset(stages, "example.com")
+    check("every stage gets a row", len(window._cb_stage_rows), 5)
+    check("the card is open, however it was left",
+          window._cb_stages_card.isChecked())
+    check("nothing is done yet", "0 done" in window.cb_stage_summary.text())
+    check("and it says how many are outstanding",
+          "5 to go" in window.cb_stage_summary.text())
+
+    window._cb_ui_stage("nmap_quick", "done", "2 finding(s)")
+    mark, name, _note = window._cb_stage_rows["nmap_quick"]
+    check("a finished step is ticked", mark.text(), "✓")
+    check("and struck through", "line-through" in name.styleSheet())
+    window._cb_ui_stage("nmap_full", "running", "")
+    mark, name, _note = window._cb_stage_rows["nmap_full"]
+    check("the running step is marked", mark.text(), "▶")
+    check("and stands out", "700" in name.styleSheet())
+    mark, name, _note = window._cb_stage_rows["testssl"]
+    check("an outstanding step is left plain", mark.text(), "○")
+    check("with no strikethrough", "line-through" in name.styleSheet(), False)
+    window._cb_ui_stage("nmap_udp", "skipped", "not installed")
+    window._cb_ui_stage("headers", "failed", "exit 1")
+    check("the summary counts each kind",
+          window.cb_stage_summary.text(),
+          "1 done · 1 skipped · 1 failed · 2 to go")
+    check("progress follows the checklist, not just successes",
+          window.cb_progress.value(), 60)
+
+    print("\n\033[1mScan options\033[0m")
+    check("every stage can be turned off",
+          len(window.cb_stage_toggles), len(CB_STAGE_CATALOGUE))
+    check("they all start on",
+          all(t.isChecked() for t in window.cb_stage_toggles.values()))
+    window._cb_choose(["nmap_quick", "headers"])
+    check("choosing a subset is remembered",
+          window._cb_enabled_stages, {"nmap_quick", "headers"})
+    check("and the chain honours it",
+          [s["key"] for s in window._cb_stage_list()],
+          ["nmap_quick", "headers"])
+    window._cb_choose([k for k, _n, _h in CB_STAGE_CATALOGUE])
+    check("turning them all back on restores the full chain",
+          len(window._cb_stage_list()), len(CB_STAGE_CATALOGUE))
+    check("muted types are listed where they can be undone",
+          "muted" in window.cb_muted_label.text().lower())
+
+    print("\n\033[1mThe screen says what is running\033[0m")
+    window._cb_ui_command("nmap -sV -sC -p- -T4 example.com -oN out.txt")
+    check("the current command is shown",
+          "nmap -sV" in window.cb_command.text())
+    check("and the full command is on hover",
+          "example.com" in window.cb_command.toolTip())
+    long_command = "nuclei -u https://example.com " + "-t x " * 80
+    window._cb_ui_command(long_command)
+    check("a very long command is elided rather than stretching the card",
+          len(window.cb_command.text()) <= 200)
+    check("but the whole of it is still on hover",
+          window.cb_command.toolTip().endswith("-t x"))
+
+    print("\n\033[1mPause\033[0m")
+    check("Pause is offered", window.cb_pause_btn.text(), "Pause")
+    window._cb_ui_paused(True)
+    check("it becomes Resume while paused", window.cb_pause_btn.text(),
+          "Resume")
+    check("and the progress bar says so", window.cb_progress.format(), "paused")
+    window._cb_ui_paused(False)
+    check("and back again", window.cb_pause_btn.text(), "Pause")
+    check("the engine has the pause", hasattr(window, "pause_coffee_break"))
+    check("pausing when nothing is running does nothing",
+          window.pause_coffee_break(), False)
+
+    print("\n\033[1mA chain that is running does not report Idle\033[0m")
+    # The symptom: the shared runner announces idle as each step finishes,
+    # and again three seconds later — on top of the step that has already
+    # started. During a chain both are wrong.
+    window._cb_active = True
+    window._cb_stages = [{"key": "nmap_quick", "name": "Nmap — service scan"}]
+    window._cb_index = 0
+    window._cb_current_command = "nmap -sV example.com"
+    window._cb_assert_running()
+    check("the state chip says running",
+          window._status_state, "running")
+    check("and names the stage rather than the tool",
+          "Coffee Break" in window.current_action_label)
+    window._cb_active = False
+
+    print("\n\033[1mThe clock belongs to the scan, not the step\033[0m")
+    import time as _time
+    window._cb_started_at = _time.time() - 125
+    window._cb_paused = False
+    window._cb_tick()
+    check("the tab shows the elapsed time",
+          window.cb_elapsed_label.text(), "running for 2m 05s")
+    check("and so does the status bar", window._status_elapsed.text(), "02:05")
+    # The bug: this runs at the end of every step, and used to zero the clock
+    # fourteen times during one chain.
+    window._cb_active = True
+    window.stop_progress_animation()
+    check("a step ending does not reset the scan's clock",
+          window._status_elapsed.text(), "02:05")
+    window._cb_active = False
+    window.stop_progress_animation()
+    check("but the clock does clear once the scan is over",
+          window._status_elapsed.text(), "00:00")
+
+    print("\n\033[1mRight-clicking a finding\033[0m")
+    window._cb_ui_reset(
+        [{"key": "headers", "name": "HTTP and security headers"},
+         {"key": "nuclei", "name": "Nuclei templates"}], "example.com")
+    window.cb_filter.setCurrentIndex(0)
+    one = CBFinding("LOW", "BREACH (HTTP compression with reflected input)",
+                    "http://x/", "compression", "", "", "testssl")
+    one.key = "breach"
+    two = CBFinding("LOW", "BREACH (HTTP compression with reflected input)",
+                    "http://y/", "compression", "", "", "nikto")
+    two.key = "breach"
+    three = CBFinding("HIGH", "Something else", "http://x/", "", "", "", "nuclei")
+    three.key = "sqli"
+    for finding in (one, two, three):
+        window._cb_ui_finding(finding)
+    check("three findings are on the table", window.cb_table.rowCount(), 3)
+
+    # The bug: customContextMenuRequested reports a position in the widget's
+    # own coordinates, and rowAt() wants the viewport's. The difference is the
+    # header's height, which was enough to return -1 for the first row — so
+    # right-clicking the top finding opened no menu at all.
+    from PyQt6.QtCore import QPoint
+    header_height = window.cb_table.horizontalHeader().height()
+    row_height = window.cb_table.rowHeight(0) or 24
+    first_row = QPoint(40, header_height + row_height // 2)
+    check("the first row is found at a widget-coordinate click",
+          window._cb_row_at(first_row), 0)
+    second_row = QPoint(40, header_height + row_height + row_height // 2)
+    check("and so is the second", window._cb_row_at(second_row), 1)
+    check("a click in open space falls back to the selection rather than "
+          "failing", isinstance(window._cb_row_at(QPoint(40, 4000)), int))
+    check("and the row resolves to a real finding",
+          window._cb_finding_at(window._cb_row_at(first_row)) is not None)
+
+    spare = CBFinding("INFO", "A finding added for the keyboard test",
+                      "http://z/", "", "", "", "nikto")
+    spare.key = "version_disclosure"
+    window._cb_ui_finding(spare)
+    window.cb_table.selectRow(window.cb_table.rowCount() - 1)
+    before = window.cb_table.rowCount()
+    window._cb_delete_selected()
+    check("Delete removes the selected finding",
+          window.cb_table.rowCount(), before - 1)
+    check("and leaves the other three", window.cb_table.rowCount(), 3)
+    check("the menu counts every finding of a type",
+          window._cb_count_of(one), 2)
+    window._cb_drop(window._cb_same_type(one))
+    check("deleting a type removes all of them", window.cb_table.rowCount(), 1)
+    check("and leaves the others alone",
+          window.cb_table.item(0, 1).text(), "Something else")
+    check("copying a finding produces something pasteable",
+          "Something else" in window._cb_as_text(three))
+    check("and it names the tools that found it",
+          "Detected by" in window._cb_as_text(three))
+
     print("\n\033[1mStage progress\033[0m")
     window._cb_stages = [{"key": "headers"}, {"key": "nuclei"}]
     window._cb_ui_stage("headers", "done", "3 finding(s)")

@@ -354,6 +354,56 @@ def main():
         check("and the access control failure",
               confidences.get("access_control"), "confirmed")
 
+        print("\n\033[1mAn unauthenticated scan does not invent access "
+              "control failures\033[0m")
+        # The report that prompted this said "requested with no session
+        # cookie at all and returned the same content as it does for a
+        # logged-in user (responses 100% identical)" — on an engagement that
+        # had no login. Of course they were identical: both requests were the
+        # same anonymous request. Every page looked like broken access
+        # control, and none of them were.
+        anon_profile = Profile.standard()
+        anon_profile.use_browser = False
+        anon_profile.rate = 80
+        anon_profile.checks = ("access",)
+        anon_engine = ScanEngine(base, auth=AuthConfig("none"),
+                                 profile=anon_profile, scope=build_scope(base))
+        anon_result = anon_engine.run()
+        check("no access control findings without a session",
+              [f.issue for f in anon_result.findings
+               if f.issue == "access_control"], [])
+        check("and the report says why rather than staying silent",
+              any("Access control was not tested" in note
+                  for note in anon_result.notes))
+        check("it still says it was unauthenticated",
+              anon_result.authenticated, False)
+
+        from command_bridge.modules.scanner.checks.access import \
+            AccessControlCheck
+
+        class Unauthenticated:
+            config = AuthConfig("none")
+            logged_in = True
+
+        class LoggedIn:
+            config = AuthConfig("form", name="alice")
+            logged_in = True
+
+        class Lapsed:
+            config = AuthConfig("form", name="alice")
+            logged_in = False
+
+        class Ctx:
+            def __init__(self, auth):
+                self.auth = auth
+
+        check("the check knows an anonymous session is not authenticated",
+              AccessControlCheck.authenticated(Ctx(Unauthenticated())), False)
+        check("and that a lapsed one is not either",
+              AccessControlCheck.authenticated(Ctx(Lapsed())), False)
+        check("but a live login is",
+              AccessControlCheck.authenticated(Ctx(LoggedIn())), True)
+
         print("\n\033[1mAnd nothing on the endpoints that are correct\033[0m")
         safe_paths = ("/clean", "/item_safe", "/profile_safe", "/go_safe",
                       "/download_safe", "/jitter", "/wobble", "/about")

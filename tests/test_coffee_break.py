@@ -325,7 +325,10 @@ def main():
                  "+ /admin/: Directory indexing found.\n"
                  "+ OSVDB-3233: /icons/README: Apache default file found.\n")
         produced = engine._cb_parse_nikto({"key": "nikto"}, nikto)
-        check("banner lines are not findings", produced, 2)
+        check("banner lines are not counted as findings", produced, 2)
+        check("the server banner is kept as information, not a finding",
+              [f.severity for f in engine._cb_findings
+               if f.key == "version_disclosure"], ["INFO"])
         check("nikto findings are marked tentative",
               all(f.confidence == "tentative" for f in engine._cb_findings))
 
@@ -462,6 +465,113 @@ def main():
               "Directory indexing found")
         check("colour codes are stripped",
               clean_title("\x1b[31mRC4 ciphers\x1b[0m"), "RC4 ciphers")
+
+        print("\n\033[1mA scanner's bookkeeping is not a finding\033[0m")
+        engine = Engine(base)
+        nikto = "\n".join("+ " + line for line in [
+            "Target IP: 127.0.0.1",
+            "Server: nginx/1.24",
+            "Retrieved x-powered-by header: PHP/8.1",
+            "/test.php: This might be interesting.",
+            "8299 requests: 0 errors and 11 items reported on the remote host",
+            "1 host(s) tested",
+            "ERROR: Failed to check for updates: 403",
+            "Platform: Unknown",
+            "Start Time: 2026-09-28 10:00:00",
+            "/admin/: Directory indexing found.",
+            "Umbraco Login Panel found at /umbraco/",
+            'The Content-Encoding header is set to "deflate" which may mean '
+            "that the server is vulnerable to the BREACH attack",
+        ])
+        engine._cb_parse_nikto({"key": "nikto"}, nikto)
+        titles = [f.title for f in engine._cb_findings]
+        for statement in ("host(s) tested", "requests:", "Failed to check",
+                          "Platform", "Start Time"):
+            check(f"{statement!r} is not reported",
+                  any(statement in t for t in titles), False)
+        check("a real finding still is",
+              any("Directory listing" in t for t in titles))
+
+        print("\n\033[1mSeverity discipline\033[0m")
+        panel = [f for f in engine._cb_findings
+                 if "login panel" in f.title.lower()]
+        check("an exposed admin login panel is found", len(panel), 1)
+        check("and it is not Low", panel[0].severity, "MEDIUM")
+        check("and it carries the path, not just the host",
+              panel[0].where.endswith("/umbraco/"))
+        check("observations are collected as Info, not Low",
+              [f.severity for f in engine._cb_findings
+               if "inventory" in f.title.lower()], ["INFO"])
+        check("two tools' wording for the same banner is one finding",
+              len([f for f in engine._cb_findings
+                   if f.key == "version_disclosure"]), 1)
+        check("nothing was reported at Low that is only an observation",
+              [f.title for f in engine._cb_findings
+               if f.severity == "LOW" and "Server:" in f.evidence], [])
+
+        print("\n\033[1mOne issue, however many tools find it\033[0m")
+        # Nikto words BREACH as a Content-Encoding observation; testssl names
+        # it. Two tools, two vocabularies, one problem — and previously two
+        # findings that a human had to work out were the same.
+        breach = [f for f in engine._cb_findings if f.key == "breach"]
+        check("Nikto's deflate line is recognised as BREACH", len(breach), 1)
+        records = [{"id": "BREACH", "severity": "LOW", "cve": "CVE-2013-3587",
+                    "cwe": "CWE-310",
+                    "finding": "potentially NOT ok, uses gzip HTTP compression"}]
+        json_path = engine.output_dir / "x_testssl.json"
+        json_path.write_text(json.dumps(records))
+        engine._cb_parse_testssl(
+            {"key": "testssl", "artefact_file": str(json_path)}, "")
+        breach = [f for f in engine._cb_findings if f.key == "breach"]
+        check("testssl's BREACH lands on the same finding", len(breach), 1)
+        check("and the finding names both tools",
+              sorted(breach[0].sources), ["nikto", "testssl"])
+        check("corroboration raises confidence, not severity",
+              (breach[0].confidence, breach[0].severity), ("firm", "LOW"))
+
+        print("\n\033[1mMuting an issue type\033[0m")
+        engine = Engine(base)
+        engine._cb_muted = {"breach"}
+        engine._cb_record(engine._cb_issue("breach", base, "x", "testssl"))
+        check("a muted issue is never recorded", engine._cb_findings, [])
+        engine._cb_muted = set()
+        engine._cb_record(engine._cb_issue("breach", base, "x", "testssl"))
+        check("and is recorded again once unmuted",
+              len(engine._cb_findings), 1)
+
+        print("\n\033[1mtestssl says what is actually wrong\033[0m")
+        engine = Engine(base)
+        records = [
+            {"id": "FS_TLS12_sig_algs", "severity": "INFO", "cve": "",
+             "cwe": "", "finding": "RSA-PSS-RSAE+SHA256 RSA+SHA256 RSA+SHA1"},
+            {"id": "DNS_CAArecord", "severity": "LOW", "cve": "", "cwe": "",
+             "finding": ""},
+            {"id": "cipher_order", "severity": "OK", "cve": "", "cwe": "",
+             "finding": "server order honoured"},
+            {"id": "cert_serialNumber", "severity": "INFO", "cve": "",
+             "cwe": "", "finding": "0A1B2C3D"},
+        ]
+        json_path = engine.output_dir / "x_testssl.json"
+        json_path.write_text(json.dumps(records))
+        engine._cb_parse_testssl(
+            {"key": "testssl", "artefact_file": str(json_path)}, "")
+        titles = [f.title for f in engine._cb_findings]
+        check("a signature algorithm list containing SHA-1 is named",
+              any("signature algorithm" in t.lower() for t in titles))
+        weak = [f for f in engine._cb_findings
+                if f.key == "tls_weak_signature_alg"][0]
+        check("and it explains why SHA-1 matters",
+              "collision" in weak.detail.lower())
+        check("a missing CAA record is Info, not a weakness",
+              [f.severity for f in engine._cb_findings
+               if f.key == "caa_missing"], ["INFO"])
+        check("the cipher order record is not reported at all",
+              any("order" in t.lower() for t in titles), False)
+        check("nor is the certificate serial number",
+              any("serial" in t.lower() for t in titles), False)
+        check("nothing came out as an unexplained 'TLS configuration "
+              "weakness'",
+              any(t == "TLS configuration weakness" for t in titles), False)
 
         print("\n\033[1mThe report\033[0m")
         engine = Engine(base)
