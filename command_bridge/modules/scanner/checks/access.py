@@ -62,11 +62,32 @@ class AccessControlCheck:
         #: A second logged-in Authenticator, when one was configured.
         self.second = second_identity
 
+    @staticmethod
+    def authenticated(ctx):
+        """Is there a real logged-in session to compare an anonymous one to?
+
+        Both halves of this check are comparisons — what a logged-in user can
+        reach that an anonymous one cannot, and what one user can reach that
+        another cannot. Neither question exists without a session, so the
+        check does not run rather than answering it wrongly.
+        """
+        config = getattr(ctx.auth, "config", None)
+        return bool(config and config.strategy != "none"
+                    and getattr(ctx.auth, "logged_in", False))
+
     # ── the pass over every request ──────────────────────────────────────
     def run(self, ctx, request):
         if request.method not in ("GET", "POST"):
             return []
         if PUBLIC.search(request.url):
+            return []
+        if not self.authenticated(ctx):
+            # Without a logged-in session there is nothing to compare against.
+            # The "authorised" request and the anonymous one are the same
+            # request, so every page comes back 100% identical and every page
+            # looks like broken access control. On an unauthenticated
+            # engagement that is not a finding, it is the definition of the
+            # engagement — and a report full of them is worse than useless.
             return []
 
         authorised = ctx.auth.send(request, allow_redirects=False)
@@ -89,6 +110,11 @@ class AccessControlCheck:
     def _forced_browsing(self, ctx, request, authorised):
         anonymous = self.unauthenticated.send(request, allow_redirects=False)
         if anonymous is None:
+            return None
+        # Re-confirm the session right now. A session that lapsed earlier in
+        # the scan would make the "authorised" response anonymous too, and
+        # every remaining page would be reported.
+        if not ctx.auth.verify_session(force=True):
             return None
         if anonymous.status_code in (301, 302, 303, 307, 308):
             return None                     # redirected to login: correct
