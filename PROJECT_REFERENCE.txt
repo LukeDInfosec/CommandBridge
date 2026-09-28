@@ -19,6 +19,57 @@ HOW TO USE THIS FILE
  CHANGELOG (most recent first)
 ================================================================================
 
+## 2026-09-28 — REGRESSION: real findings were being folded away (6.1.2)
+
+A PUBLICLY REACHABLE UMBRACO LOGIN PAGE STOPPED BEING REPORTED. My fault, and
+worth writing down because the shape of the mistake will recur.
+
+The noise work in 6.1.0 added this to _cb_parse_nuclei:
+
+    if is_fingerprint(template) or (severity == "INFO"
+                                    and not info.get("remediation")):
+        fold into "Technology fingerprint"
+
+nuclei files its ENTIRE exposed-panels library at severity "info" with no
+remediation field. So every admin login page — Umbraco, phpMyAdmin, Jenkins,
+cPanel, webmail — was quietly folded into an informational entry. The rule
+also ran BEFORE the library lookup, so being a named issue could not save it.
+
+TWO FIXES:
+  1. Order reversed. The library mapping runs FIRST; only a template that
+     maps to nothing AND is on the fingerprint list is folded. An unnamed
+     template can be inventory; a named issue never is.
+  2. NUCLEI_FINGERPRINT audited. Four entries were real findings and had to
+     come off: git-config (a readable .git is HIGH), http-trace,
+     cookies-without-*, and openapi/swagger-api. Anything on that list is
+     silently dropped, so it now carries a comment saying exactly that.
+
+Also: a tool's own rating can no longer LOWER the library's severity —
+cb_issues.worst() of the two. nuclei calls phpinfo "low"; a diagnostic page
+listing the environment is a medium wherever it is found.
+
+NEW REGRESSION GUARD in test_coffee_break.py: a table of eight real tool
+outputs that must never be silently dropped, asserted by issue key. This is
+the test that would have caught the above.
+
+HEADERS — as requested:
+  - X-Permitted-Cross-Domain-Policies is now checked (new xpcdp_missing, LOW,
+    explaining that an Adobe client falls back to fetching /crossdomain.xml
+    and honouring whatever is there).
+  - The CSP regex list is replaced by analyse_csp(), a real parser:
+      unsafe-inline / unsafe-eval in script-src, correctly falling back to
+        default-src, and correctly treating a nonce or hash as excusing
+        unsafe-inline (as browsers do) but NEVER unsafe-eval;
+      wildcard and scheme-wide sources — '*', 'https:', 'data:', 'blob:' —
+        as csp_wildcard_source (new, MEDIUM);
+      missing object-src or base-uri as csp_missing_object_base (new, LOW),
+        the two standard routes around an otherwise sound policy;
+      missing frame-ancestors and form-action as before.
+  - Cross-origin isolation headers (COOP/COEP/CORP) reported as INFO when all
+    three are absent.
+
+tests: test_coffee_break.py 123 → 150.
+
 ## 2026-09-28 — FOUR FIXES FROM A REAL ENGAGEMENT (6.1.1)
 
 BROKEN ACCESS CONTROL ON AN UNAUTHENTICATED SCAN — every page reported, all
