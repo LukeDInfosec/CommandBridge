@@ -52,6 +52,26 @@ from command_bridge.modules.cb_issues import ISSUES, clean_title
 #  Findings
 # ─────────────────────────────────────────────────────────────────────────────
 
+#: Every stage, in order, as (key, name, why you might turn it off). The
+#: options panel needs this before a target exists, so it cannot come from
+#: _cb_stage_list() — that one builds real commands and needs a target.
+CB_STAGE_CATALOGUE = (
+    ("nmap_quick", "Nmap — service scan", "fast, almost always worth it"),
+    ("nmap_full", "Nmap — all 65535 ports", "thorough and slow"),
+    ("nmap_udp", "Nmap — UDP top 200", "slow, and noisy on some networks"),
+    ("testssl", "TLS configuration (testssl)", "HTTPS only"),
+    ("headers", "HTTP and security headers", "fast"),
+    ("nikto", "Nikto", "signature-driven, needs verifying"),
+    ("nuclei", "Nuclei templates", "the widest coverage here"),
+    ("javascript", "JavaScript retrieval and analysis", "front-end heavy apps"),
+    ("redirect", "Unvalidated redirects", "fast"),
+    ("wordpress", "WordPress (wpscan)", "skipped unless WordPress is found"),
+    ("smartfuzz", "SmartFuzz content discovery", "the long one"),
+    ("params", "Parameter discovery", "feeds the traversal stage"),
+    ("traversal", "Path traversal against parameters", "needs parameters"),
+    ("bypass", "403 bypass", "needs something that answered 401/403"),
+)
+
 SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")
 SEV_ORDER = {name: index for index, name in enumerate(reversed(SEVERITIES))}
 
@@ -652,7 +672,8 @@ class CoffeeBreakMixin:
             return self._substitute_web_placeholders(
                 self.command_registry.get(button_id, default))
 
-        return [
+        enabled = getattr(self, "_cb_enabled_stages", None)
+        stages = [
             dict(key="nmap_quick", name="Nmap — service scan", kind="shell",
                  command=registry("net_nmap_quick",
                                   "nmap -sV -sC -T4 {TARGET_HOST} "
@@ -730,6 +751,9 @@ class CoffeeBreakMixin:
                  when=lambda a: bool(a.get("forbidden")),
                  skip_note="nothing answered 401 or 403"),
         ]
+        if enabled is not None:
+            stages = [stage for stage in stages if stage["key"] in enabled]
+        return stages
 
     def _cb_smartfuzz_command(self):
         """SmartFuzz, inheriting any auth the operator set on the button."""
