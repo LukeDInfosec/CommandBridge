@@ -313,6 +313,17 @@ def main():
     check("muted types are listed where they can be undone",
           "muted" in window.cb_muted_label.text().lower())
 
+    print("\n\033[1mThe TLS stage is wired to the real cleanup\033[0m")
+    # The Coffee Break stage calls a helper that lives on StatusMixin. If that
+    # ever moves or is renamed, the stage silently stops clearing the previous
+    # run's reports and testssl starts failing on every re-scan again.
+    check("the window provides the cleanup the stage relies on",
+          hasattr(CommandBridgeV5, "_cleanup_testssl_outputs"))
+    check("and the built-in summariser it now feeds",
+          hasattr(CommandBridgeV5, "_summarize_testssl_if_applicable"))
+    check("the stage builds its own command",
+          hasattr(CommandBridgeV5, "_cb_testssl_command"))
+
     print("\n\033[1mThe screen says what is running\033[0m")
     window._cb_ui_command("nmap -sV -sC -p- -T4 example.com -oN out.txt")
     check("the current command is shown",

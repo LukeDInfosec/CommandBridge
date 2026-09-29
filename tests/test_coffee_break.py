@@ -110,6 +110,7 @@ class Engine(CoffeeBreakMixin):
         self.output_dir = Path(tempfile.mkdtemp())
         self.console = self
         self.printed = []
+        self.cleaned = []
         self._cb_reset()
 
     # console
@@ -122,6 +123,15 @@ class Engine(CoffeeBreakMixin):
 
     def sanitize_target_for_filename(self, value):
         return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
+
+    # The real window gets this from StatusMixin; the stub mirrors it so the
+    # re-run behaviour can be tested.
+    def _cleanup_testssl_outputs(self, safe):
+        self.cleaned.append(safe)
+        for suffix in (".json", ".log", ".txt"):
+            path = self.output_dir / f"{safe}_testssl{suffix}"
+            if path.exists():
+                path.unlink()
 
 
 def main():
@@ -376,6 +386,106 @@ def main():
                cb_issues.NMAP_SERVICES.get("ms-wbt-server")),
               ("exposed_datastore", "cleartext_service",
                "remote_access_exposed"))
+
+        print("\n\033[1mThe TLS stage survives a second run\033[0m")
+        # The bug: --jsonfile REFUSES to overwrite. The first scan of a target
+        # wrote the file and every scan after it died on a file-exists error,
+        # which is why this only appeared on a target being re-scanned. Auto
+        # Scan already cleared the files first; Coffee Break did not.
+        engine = Engine(base)
+        stale = engine.output_dir / \
+            f"{engine.sanitize_target_for_filename(base)}_testssl.json"
+        stale.write_text("a report from the last run")
+        command = engine._cb_testssl_command()
+        check("the previous run's reports are cleared first",
+              engine.cleaned != [])
+        check("so the stale JSON is gone before testssl starts",
+              stale.exists(), False)
+        check("the log file is written, for the built-in summariser",
+              "--logfile" in command)
+        check("and the text report, which is what it actually reads",
+              "tee" in command)
+        check("testssl.sh is tried as well as testssl",
+              "testssl.sh" in command)
+        check("a missing testssl says so rather than failing silently",
+              "not installed" in command)
+        check("no unsubstituted placeholders reach the shell",
+              [p for p in ("{LOG_FILE}", "{JSON_FILE}", "{HOST}",
+                           "{TXT_FILE}", "{TARGET}") if p in command], [])
+
+        print("\n\033[1mA non-zero exit is not always a failure\033[0m")
+        # testssl returns non-zero BECAUSE it found something. The
+        # application already knew this — _summarize_testssl_if_applicable
+        # says so in its own docstring — but the Coffee Break stage was
+        # judging purely on the exit code and marking a good scan "failed".
+        engine = Engine(base)
+        safe = engine.sanitize_target_for_filename(base)
+        report = engine.output_dir / f"{safe}_testssl.json"
+        report.write_text(json.dumps([
+            {"id": "SWEET32", "severity": "LOW", "cve": "CVE-2016-2183",
+             "finding": "VULNERABLE, uses 64 bit block ciphers"}]))
+        stage = {"key": "testssl", "parser": "_cb_parse_testssl",
+                 "judge_by_output": True, "artefact_file": str(report),
+                 "name": "TLS configuration (testssl)"}
+        check("a report on disk means the stage produced something",
+              engine._cb_stage_produced(stage, ""))
+        check("no report and no output means it really did fail",
+              engine._cb_stage_produced(
+                  {"key": "x", "artefact_file": str(engine.output_dir / "no")},
+                  ""), False)
+
+        print("\n\033[1mDeprecated protocols and weak ciphers are "
+              "reported\033[0m")
+        engine = Engine(base)
+        records = [
+            {"id": "SSLv2", "severity": "OK", "finding": "not offered"},
+            {"id": "SSLv3", "severity": "HIGH", "finding": "offered (NOT ok)"},
+            {"id": "TLS1", "severity": "LOW", "finding": "offered (deprecated)"},
+            {"id": "TLS1_1", "severity": "LOW",
+             "finding": "offered (deprecated)"},
+            {"id": "TLS1_2", "severity": "OK", "finding": "offered (OK)"},
+            {"id": "LUCKY13", "severity": "LOW", "cve": "CVE-2013-0169",
+             "finding": "potentially VULNERABLE, uses TLS CBC ciphers"},
+            {"id": "SWEET32", "severity": "LOW", "cve": "CVE-2016-2183",
+             "finding": "VULNERABLE, uses 64 bit block ciphers"},
+            {"id": "RC4", "severity": "HIGH", "cve": "CVE-2013-2566",
+             "finding": "VULNERABLE (NOT ok): RC4-SHA RC4-MD5"},
+            {"id": "BEAST", "severity": "LOW", "cve": "CVE-2011-3389",
+             "finding": "VULNERABLE -- but also supports higher protocols"},
+            {"id": "cipherlist_3DES_IDEA", "severity": "MEDIUM",
+             "finding": "offered"},
+            {"id": "heartbleed", "severity": "OK", "finding": "not vulnerable"},
+            {"id": "cert_expirationStatus", "severity": "MEDIUM",
+             "finding": "expires < 30 days (17)"},
+        ]
+        path = engine.output_dir / "report.json"
+        path.write_text(json.dumps(records))
+        engine._cb_parse_testssl(
+            {"key": "testssl", "artefact_file": str(path)}, "")
+        by_key = {f.key: f for f in engine._cb_findings}
+        for key, label in (("obsolete_protocol", "deprecated protocols"),
+                           ("lucky13", "Lucky 13"),
+                           ("sweet32", "Sweet32"),
+                           ("rc4", "RC4"),
+                           ("beast", "BEAST"),
+                           ("weak_cipher", "3DES / weak ciphers")):
+            check(f"{label} is reported", key in by_key)
+        check("the protocol finding names the versions",
+              by_key["obsolete_protocol"].title,
+              "Obsolete TLS protocol versions enabled: SSLv3, TLS 1.0, TLS 1.1")
+        check("and carries each one as evidence",
+              all(v in by_key["obsolete_protocol"].evidence
+                  for v in ("SSLv3", "TLS1", "TLS1_1")))
+        check("a protocol that is not offered is not reported",
+              "SSLv2" in by_key["obsolete_protocol"].evidence, False)
+        check("and neither is one that is fine",
+              "TLS1_2" in by_key["obsolete_protocol"].evidence, False)
+        check("a clean Heartbleed result is not a finding",
+              "heartbleed" in by_key, False)
+        check("a certificate expiring in 17 days is not called expired",
+              "cert_expiring" in by_key)
+        check("Lucky 13 carries the CVE",
+              "CVE-2013-0169" in by_key["lucky13"].references)
 
         print("\n\033[1mtestssl becomes named issues\033[0m")
         # The JSON testssl writes, in the shape it writes it. Three of these
