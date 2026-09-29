@@ -25,6 +25,7 @@ from PyQt6.QtWidgets import (
     QMessageBox, QSizePolicy, QMenu, QApplication, QCheckBox, QGridLayout,
 )
 
+from command_bridge.modules import cb_evidence
 from command_bridge.modules.coffee_break import SEVERITIES, SEV_ORDER
 
 #: One colour per severity, picked to read on every theme in the app rather
@@ -667,6 +668,55 @@ class CoffeeBreakTabMixin:
             f"{_esc(finding.stage)} · {_esc(finding.confidence)} confidence</span></div>",
             f"<p><b>Where:</b> <code>{_esc(finding.where)}</code></p>",
         ]
+        state = getattr(finding, "state", "")
+        validation = getattr(finding, "validation", None)
+        if state:
+            badge = {"CONFIRMED": "#3fb950", "VALIDATED": "#58a6ff",
+                     "POTENTIAL": "#d29922", "DETECTED": "#8b9bb4",
+                     "INCONCLUSIVE": "#d29922",
+                     "FALSE_POSITIVE": "#6e7681"}.get(state, "#8b9bb4")
+            html.insert(1, f"<div style='color:{badge};font-weight:700'>"
+                           f"[{_esc(state)}]</div>")
+        scanner_severity = getattr(finding, "scanner_severity", "")
+        if scanner_severity and scanner_severity != finding.severity:
+            html.append(
+                f"<p><b>Severity:</b> {_esc(finding.severity)} "
+                f"(tool-assessed) &nbsp;·&nbsp; {_esc(scanner_severity)} "
+                f"(reported by {_esc(finding.stage)}). The scanner's rating "
+                f"is kept as metadata; it does not set ours.</p>")
+        if validation is not None:
+            if not validation.classification_consistent:
+                html.append(
+                    "<p style='color:#d29922'><b>⚠ Classification / evidence "
+                    "mismatch.</b> " + "<br>".join(
+                        _esc(c) for c in validation.conflicts) + "</p>")
+            html.append(
+                "<p><b>Why this was detected</b><br>"
+                + _esc(validation.rationale
+                       or "Detection rationale unavailable.") + "</p>")
+            checklist = cb_evidence.evidence_checklist(
+                getattr(finding, "key", ""),
+                getattr(finding, "proof", None) or cb_evidence.Evidence())
+            if checklist:
+                html.append("<p><b>Observed evidence</b></p>"
+                            "<pre style='white-space:pre-wrap'>"
+                            + _esc("\n".join(checklist)) + "</pre>")
+            poc = (getattr(finding, "proof", None)
+                   or cb_evidence.Evidence()).poc()
+            html.append("<p><b>Proof of concept</b></p>"
+                        + (f"<pre style='white-space:pre-wrap'>{_esc(poc)}"
+                           f"</pre>" if poc else
+                           "<p><i>PoC unavailable — insufficient evidence "
+                           "was captured.</i></p>"))
+            if validation.false_positive_indicators:
+                html.append("<p><b>Potential false-positive indicators</b></p>"
+                            "<ul>" + "".join(
+                                f"<li>{_esc(i)}</li>"
+                                for i in validation.false_positive_indicators)
+                            + "</ul>")
+            if validation.action:
+                html.append(f"<p><b>Next step:</b> "
+                            f"{_esc(validation.action)}</p>")
         sources = [s for s in (getattr(finding, "sources", []) or
                                [finding.stage]) if s]
         if len(sources) > 1:
@@ -686,11 +736,18 @@ class CoffeeBreakTabMixin:
         if finding.detail:
             html.append("".join(f"<p>{_esc(para)}</p>"
                                 for para in str(finding.detail).split("\n\n")))
-        if finding.evidence:
+        raw = (getattr(finding, "proof", None)
+               or cb_evidence.Evidence()).raw_detection()
+        if raw.strip() != "RAW DETECTION":
+            html.append("<p><b>Raw detection</b> — exactly what the tool "
+                        "reported, before interpretation</p>"
+                        f"<pre style='white-space:pre-wrap'>{_esc(raw)}</pre>")
+        elif finding.evidence:
             html.append("<p><b>Evidence</b></p>"
                         f"<pre style='white-space:pre-wrap'>{_esc(finding.evidence)}</pre>")
         if finding.remediation:
-            html.append(f"<p><b>Fix:</b> {_esc(finding.remediation)}</p>")
+            html.append(f"<p><b>Recommended remediation:</b> "
+                        f"{_esc(finding.remediation)}</p>")
         if getattr(finding, "cwe", ""):
             html.append(f"<p><b>Classification:</b> {_esc(finding.cwe)}</p>")
         references = list(getattr(finding, "references", []) or [])
@@ -814,7 +871,8 @@ class CoffeeBreakTabMixin:
 
     @staticmethod
     def _cb_as_text(finding):
-        parts = [f"## [{finding.severity}] {finding.title}",
+        parts = [f"## [{getattr(finding, 'state', 'DETECTED')}] "
+                 f"[{finding.severity}] {finding.title}",
                  f"Where: {finding.where}"]
         for extra in (getattr(finding, "instances", []) or [])[:20]:
             parts.append(f"  also: {extra}")
@@ -823,12 +881,36 @@ class CoffeeBreakTabMixin:
         parts.append(f"Confidence: {finding.confidence}")
         if getattr(finding, "cwe", ""):
             parts.append(f"Classification: {finding.cwe}")
-        if finding.detail:
-            parts.append("\n" + finding.detail)
-        if finding.evidence:
+        proof = getattr(finding, "proof", None) or cb_evidence.Evidence()
+        validation = getattr(finding, "validation", None)
+        if validation is not None:
+            parts.append("\nWhy this was detected:\n  "
+                         + (validation.rationale
+                            or "Detection rationale unavailable."))
+            parts.append("\nObserved evidence:\n"
+                         + "\n".join(cb_evidence.evidence_checklist(
+                             getattr(finding, "key", ""), proof)))
+            poc = proof.poc()
+            parts.append("\n" + (poc if poc else
+                                 "PoC unavailable — insufficient evidence "
+                                 "was captured."))
+            for conflict in validation.conflicts:
+                parts.append("\n⚠ " + conflict)
+            if validation.false_positive_indicators:
+                parts.append("\nPotential false-positive indicators:\n"
+                             + "\n".join(
+                                 f"  - {i}"
+                                 for i in
+                                 validation.false_positive_indicators))
+        raw = proof.raw_detection()
+        if raw.strip() != "RAW DETECTION":
+            parts.append("\n" + raw)
+        elif finding.evidence:
             parts.append("\nEvidence:\n" + finding.evidence)
+        if finding.detail:
+            parts.append("\nGeneric description:\n" + finding.detail)
         if finding.remediation:
-            parts.append("\nFix: " + finding.remediation)
+            parts.append("\nRecommended remediation: " + finding.remediation)
         return "\n".join(parts)
 
     # ── misc ─────────────────────────────────────────────────────────────
