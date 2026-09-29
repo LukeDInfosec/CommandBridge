@@ -170,6 +170,15 @@ ISSUES = {
         "is usually serving nothing but an attacker's downgrade.",
         "Offer TLS 1.2 and 1.3 only.",
         "CWE-326", ("RFC 8996",)),
+    "cert_expiring": _issue(
+        "LOW", "Certificate expires soon",
+        "The certificate is still valid but not for much longer. Worth "
+        "raising because the failure mode is an outage plus a browser "
+        "interstitial, and because a certificate close to expiry is often a "
+        "sign that nothing is automating the renewal.",
+        "Renew it, and automate the renewal so the date stops being "
+        "something anyone has to remember.",
+        "CWE-298"),
     "cert_expired": _issue(
         "HIGH", "Certificate expired or not yet valid",
         "Every client sees an interstitial warning, and the ones that do not — "
@@ -931,7 +940,7 @@ _TESTSSL_IDS = (
     (r"^(secure_renego|secure_client_renego|renego)", "renegotiation"),
     (r"^fallback_SCSV", "fallback"),
     (r"^(SSLv2|SSLv3|TLS1$|TLS1_1)", "obsolete_protocol"),
-    (r"^cert_expiration", "cert_expired"),
+    (r"^cert_expiration", "cert_expired"),   # refined below by the text
     (r"^cert_(chain_of_trust|trust|caIssuers)", "cert_untrusted"),
     (r"^cert_(commonName|subjectAltName|hostname)", "cert_hostname"),
     (r"^cert_signatureAlgorithm", "cert_weak_signature"),
@@ -968,6 +977,16 @@ _NOT_VULNERABLE = re.compile(
     r"not supported|isn't vulnerable|downgrade attack protection", re.I)
 
 
+#: Where the id alone would give the wrong headline. testssl reports both
+#: "expired" and "expires < 30 days" under cert_expirationStatus, and calling
+#: a live certificate expired in a client report is the kind of mistake that
+#: costs you the next engagement.
+_TESTSSL_REFINE = (
+    ("cert_expired", re.compile(r"expires?\s*[<(]|expires? in|\bdays\b", re.I),
+     "cert_expiring"),
+)
+
+
 def for_testssl(record):
     """Map one testssl JSON record onto a library entry.
 
@@ -989,6 +1008,10 @@ def for_testssl(record):
         # console fallback reconstructs an id from the printed label, which
         # is capitalised however the section header was.
         if re.search(pattern, identifier, re.I):
+            for candidate, text_pattern, refined in _TESTSSL_REFINE:
+                if key == candidate and text_pattern.search(finding) \
+                        and "expired" not in finding.lower():
+                    return refined, ISSUES[refined]
             return key, ISSUES[key]
     for pattern, key in _TESTSSL_TEXT:
         if re.search(pattern, finding, re.I):

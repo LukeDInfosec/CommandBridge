@@ -736,16 +736,13 @@ class CoffeeBreakMixin:
                                   "-oN {SAFE_TARGET}_nmap_udp.txt"),
                  parser="_cb_parse_nmap"),
             dict(key="testssl", name="TLS configuration (testssl)", kind="shell",
-                 command=(
-                     f"if command -v testssl >/dev/null 2>&1; then "
-                     f"testssl --quiet --color 0 --jsonfile "
-                     f"{out}/{safe}_testssl.json {host} 2>&1; "
-                     f"elif command -v testssl.sh >/dev/null 2>&1; then "
-                     f"testssl.sh --quiet --color 0 --jsonfile "
-                     f"{out}/{safe}_testssl.json {host} 2>&1; "
-                     f"else echo '[i] testssl is not installed — skipping. "
-                     f"Install: sudo apt install testssl'; fi"),
+                 command=self._cb_testssl_command(),
                  parser="_cb_parse_testssl",
+                 # testssl exits non-zero when it FINDS something, and again
+                 # for a handful of benign conditions. Judging the stage on
+                 # its exit code marked a successful scan as failed; the
+                 # stage is judged on whether a report was produced.
+                 judge_by_output=True,
                  artefact_file=f"{out}/{safe}_testssl.json"),
             dict(key="headers", name="HTTP and security headers", kind="python",
                  probe=probe_headers),
@@ -800,6 +797,56 @@ class CoffeeBreakMixin:
         if enabled is not None:
             stages = [stage for stage in stages if stage["key"] in enabled]
         return stages
+
+    def _cb_testssl_command(self):
+        """The same invocation the application's own TLS button uses.
+
+        Two things were wrong with the bespoke command this replaces, and the
+        rest of the application already had both solved:
+
+          * ``--jsonfile`` REFUSES TO OVERWRITE. Auto Scan calls
+            _cleanup_testssl_outputs() before it runs for exactly this reason
+            — its comment says "so reruns do not crash". Coffee Break never
+            did, so the first scan of a target worked, wrote the JSON, and
+            every scan after it died instantly on a file-exists error. That
+            is why this only started failing on a target being scanned
+            repeatedly.
+          * it wrote only JSON. The log and text reports are what
+            _summarize_testssl() reads to print its summary, so that summary
+            never appeared for a Coffee Break run.
+
+        The command is built here rather than taken from the
+        externals_testssl registry entry, because that template is written in
+        {LOG_FILE}/{JSON_FILE}/{HOST} placeholders that only the externals
+        code substitutes — reusing it here would run testssl with those braces
+        still in the arguments. This mirrors Auto Scan's invocation instead,
+        which is the one already proven against a real target.
+        """
+        import shlex
+        safe = self.sanitize_target_for_filename(self.target)
+        host = self.get_scanner_target()
+        out = str(self.output_dir)
+
+        # Clear the previous run's reports first — this is the fix.
+        try:
+            self._cleanup_testssl_outputs(safe)
+        except Exception as exc:                        # noqa: BLE001
+            self.console.append_ansi(
+                f"[i] could not clear the previous TLS reports: {exc}\n")
+
+        log_path = shlex.quote(f"{out}/{safe}_testssl.log")
+        json_path = shlex.quote(f"{out}/{safe}_testssl.json")
+        txt_path = shlex.quote(f"{out}/{safe}_testssl.txt")
+        default = (
+            f"if command -v testssl >/dev/null 2>&1; then "
+            f"testssl --logfile {log_path} --jsonfile {json_path} "
+            f"{host} | tee {txt_path}; "
+            f"elif command -v testssl.sh >/dev/null 2>&1; then "
+            f"testssl.sh --logfile {log_path} --jsonfile {json_path} "
+            f"{host} | tee {txt_path}; "
+            f"else echo '[i] testssl is not installed — skipping the TLS "
+            f"stage. Install it with: sudo apt install testssl'; fi")
+        return default
 
     def _cb_smartfuzz_command(self):
         """SmartFuzz, inheriting any auth the operator set on the button."""
@@ -1056,12 +1103,36 @@ class CoffeeBreakMixin:
             status, note = "skipped", "skipped by the operator"
         elif exit_code == 0:
             status, note = "done", f"{produced} finding(s)"
+        elif stage.get("judge_by_output") and self._cb_stage_produced(stage,
+                                                                     text):
+            # The tool said something went wrong; it also produced a full
+            # report. testssl returns non-zero precisely BECAUSE it found
+            # something, which is the opposite of a failure.
+            status, note = "done", f"{produced} finding(s)"
         else:
             status, note = "failed", f"exit {exit_code}"
         self._cb_ui_call("_cb_ui_stage", stage["key"], status, note)
         if getattr(self, "_cb_active", False):
             self._cb_assert_running()
         QTimer.singleShot(0, self._cb_advance)
+
+    def _cb_stage_produced(self, stage, text):
+        """Did this stage leave a usable report behind, whatever it exited?"""
+        path = stage.get("artefact_file")
+        try:
+            if path and Path(path).is_file() and Path(path).stat().st_size > 20:
+                return True
+        except Exception:                               # noqa: BLE001
+            pass
+        safe = self.sanitize_target_for_filename(self.target)
+        for suffix in (".txt", ".log"):
+            try:
+                companion = Path(self.output_dir) / f"{safe}_testssl{suffix}"
+                if companion.is_file() and companion.stat().st_size > 200:
+                    return True
+            except Exception:                           # noqa: BLE001
+                continue
+        return len((text or "").strip()) > 400
 
     def _cb_capture_output(self, text):
         """Tee the runner's output into the current stage's buffer."""
@@ -1288,6 +1359,20 @@ class CoffeeBreakMixin:
             if len(bucket["lines"]) > 14:
                 evidence += f"\n… and {len(bucket['lines']) - 14} more"
             detail = ISSUES[key]["detail"]
+            title = None
+            if key == "obsolete_protocol":
+                # Name the versions. "Obsolete TLS protocol version enabled"
+                # is the first thing a client asks a follow-up question about.
+                pretty = {"sslv2": "SSLv2", "sslv3": "SSLv3", "tls1": "TLS 1.0",
+                          "tls1_1": "TLS 1.1"}
+                versions = [pretty[v] for v in
+                            sorted({line.split(":")[0].strip().lower()
+                                    for line in bucket["lines"]})
+                            if v in pretty]
+                if versions:
+                    title = (f"Obsolete TLS protocol version"
+                             f"{'s' if len(versions) > 1 else ''} enabled: "
+                             f"{', '.join(versions)}")
             if key == "tls_generic":
                 # "TLS configuration weakness — reported by testssl" tells the
                 # reader nothing. Name the checks that failed and hand over
@@ -1304,7 +1389,7 @@ class CoffeeBreakMixin:
                     f"standard this engagement is being measured against.")
             finding = self._cb_issue(key, host, evidence, stage["key"],
                                      severity=bucket["severity"],
-                                     detail=detail)
+                                     detail=detail, title=title)
             for cve in bucket["cves"]:
                 if cve not in finding.references:
                     finding.references.append(cve)
