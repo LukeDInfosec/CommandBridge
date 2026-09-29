@@ -19,6 +19,45 @@ HOW TO USE THIS FILE
  CHANGELOG (most recent first)
 ================================================================================
 
+## 2026-09-29 — SCORING IS THE LIBRARY'S, AND A PARAMETER LIST (6.2.0)
+
+THE LIBRARY IS NOW THE SCORING POLICY. cb_issues.severity_for(key, tool) —
+the entry in ISSUES decides, and a tool's own rating no longer overrides it
+in EITHER direction. Letting testssl escalate was why "deprecated TLS
+versions" came out HIGH (testssl rates SSLv3 high) when the policy says
+MEDIUM, and why RC4 came out HIGH for the same reason. One place to change
+how anything is rated, and the same answer whichever tool found it.
+
+  Lucky 13 (CBC ciphers)            MEDIUM → LOW
+  Obsolete TLS protocol versions    MEDIUM   (was being reported HIGH)
+  RC4 cipher suites                 MEDIUM   (was being reported HIGH)
+
+The exceptions are TOOL_RATED = {known_cve, tls_generic, scan_information} —
+keys that are passthroughs with no severity of their own to defend. A nuclei
+template for a specific CVE still reports at the severity nuclei gave it.
+
+To change any rating in future: edit the one _issue(...) line in cb_issues.py.
+Nothing else reads a severity from anywhere else.
+
+NEW: "Discovered Parameters.txt", written by the parameter stage into the
+output directory. The URLs with their values stripped, which is the form you
+feed to ffuf, sqlmap or Intruder:
+
+    https://example.com/search?q=Test    →   https://example.com/search?q=
+    https://example.com/item?id=7&s=a    →   https://example.com/item?id=&s=
+
+  - one line per distinct parameter shape, so a paginated site does not
+    produce four hundred near-identical lines;
+  - parameter ORDER preserved (occasionally what a WAF keys on), duplicate
+    names collapsed (?a=1&a=2 is one thing to fuzz), fragments dropped;
+  - the traversal stage still gets the URLs with their real values, because
+    a request that 404s without them proves nothing either way;
+  - strip_parameter_values() is a plain function, so it is testable and
+    reusable;
+  - the path is logged to the console and kept in _cb_artifacts.
+
+tests: test_coffee_break.py 172 → 198.
+
 ## 2026-09-29 — TLS STAGE: stop failing on every re-scan (6.1.3)
 
 THE TLS STAGE FAILED ON EVERY RUN AFTER THE FIRST. --jsonfile REFUSES TO
