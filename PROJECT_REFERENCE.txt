@@ -19,6 +19,56 @@ HOW TO USE THIS FILE
  CHANGELOG (most recent first)
 ================================================================================
 
+## 2026-09-29 — TLS STAGE: stop failing on every re-scan (6.1.3)
+
+THE TLS STAGE FAILED ON EVERY RUN AFTER THE FIRST. --jsonfile REFUSES TO
+OVERWRITE an existing file, so testssl died instantly with a file-exists
+error. The first scan of a target worked and wrote the JSON; every scan after
+it failed. That is why it looked like a regression on a target being scanned
+repeatedly and fine everywhere else.
+
+The rest of the application already had this solved and Coffee Break simply
+was not using it:
+  - Auto Scan calls _cleanup_testssl_outputs() before running, with the
+    comment "so reruns do not crash". _cb_testssl_command() now does the same.
+  - The invocation now mirrors Auto Scan's working one: --logfile AND
+    --jsonfile AND `| tee` to a .txt, with a testssl.sh fallback. It wrote
+    only JSON before, which is why _summarize_testssl() — the built-in
+    summary — never appeared for a Coffee Break run. It reads the .txt/.log,
+    so the summary now prints for this stage too.
+  - NOT taken from the externals_testssl registry entry: that template is
+    written in {LOG_FILE}/{JSON_FILE}/{HOST} placeholders only the externals
+    code substitutes, so reusing it would run testssl with the braces still
+    in the arguments.
+
+A NON-ZERO EXIT IS NOT ALWAYS A FAILURE. testssl returns non-zero when it
+FINDS something. status.py's own docstring says this — "we therefore do not
+gate the summary on exit_code" — but the stage was judging on exit code alone
+and marking a successful scan "failed". Stages can now carry
+judge_by_output=True; _cb_stage_produced() then checks for a report on disk
+(or substantial console output) before calling it a failure.
+
+WHAT IT NOW REPORTS, verified against a realistic testssl record set:
+  Obsolete TLS protocol versions enabled: SSLv3, TLS 1.0, TLS 1.1   (HIGH)
+      — the title NAMES the versions and the evidence lists each; versions
+        that are "not offered", and TLS 1.2, are correctly absent
+  RC4 cipher suites supported                                       (HIGH)
+  Lucky 13 (CBC ciphers supported)                                  (MEDIUM)
+  Sweet32 (64-bit block ciphers)                                    (MEDIUM)
+  Weak cipher suites offered  [3DES]                                (MEDIUM)
+  BEAST (CBC ciphers over TLS 1.0)                                  (LOW)
+  POODLE, DROWN, FREAK, Logjam, ROBOT, Heartbleed, CCS … as before
+  A clean result ("not vulnerable", "not offered") is still not a finding.
+
+Also: cert_expirationStatus with "expires < 30 days" is now a new
+cert_expiring (LOW) rather than "Certificate expired or not yet valid".
+Calling a live certificate expired in a client report is the kind of mistake
+that costs the next engagement.
+
+tests: test_coffee_break.py 150 → 172, test_gui_smoke.py 118 → 121. The GUI
+test asserts the window still provides _cleanup_testssl_outputs and
+_summarize_testssl_if_applicable, so the stage cannot silently lose them.
+
 ## 2026-09-28 — REGRESSION: real findings were being folded away (6.1.2)
 
 A PUBLICLY REACHABLE UMBRACO LOGIN PAGE STOPPED BEING REPORTED. My fault, and
