@@ -31,7 +31,8 @@ def check(label, got, want=True):
 
 def main():
     from PyQt6.QtCore import Qt
-    from PyQt6.QtWidgets import QApplication, QPushButton, QLabel
+    from PyQt6.QtWidgets import (
+        QApplication, QPushButton, QLabel, QSplitter)
     from command_bridge.constants import TABS, RAIL_SECTIONS
     from command_bridge.ui.navigation import _TAB_BUILDERS, _SAFE_BUILD_ORDER
     from command_bridge.ui.window import CommandBridgeV5
@@ -129,6 +130,32 @@ def main():
           window.tab_widget.currentIndex(), window.tab_index("coffee"))
     check("its findings table exists", window.cb_table.columnCount(), 5)
     check("it starts empty", window.cb_table.rowCount(), 0)
+
+    # The list and the evidence sit side by side. Stacked, the detail pane got
+    # whatever vertical room the table left over, which on a laptop meant
+    # dragging the divider up for every finding.
+    splitter = window.cb_table.parent()
+    while splitter is not None and not isinstance(splitter, QSplitter):
+        splitter = splitter.parent()
+    check("the findings list and the detail pane share a splitter",
+          isinstance(splitter, QSplitter))
+    check("and it lays them out side by side",
+          splitter.orientation(), Qt.Orientation.Horizontal)
+    check("neither pane can be collapsed to nothing",
+          splitter.childrenCollapsible(), False)
+    check("the detail pane starts wider than the list",
+          splitter.sizes()[1] > splitter.sizes()[0])
+    check("the detail pane is tall enough to read without dragging",
+          window.cb_detail.minimumHeight() >= 320)
+    for column, name in ((0, "severity"), (1, "finding")):
+        check(f"the {name} column is shown",
+              window.cb_table.isColumnHidden(column), False)
+    for column, name in ((2, "where"), (3, "stage"), (4, "confidence")):
+        # Still populated — the filter, the sort and the delete menu read
+        # them — just shown in the detail pane instead of in a column two
+        # words wide.
+        check(f"the {name} column moves to the detail pane",
+              window.cb_table.isColumnHidden(column), True)
 
     print("\n\033[1mThe Active Scan tab builds and is usable\033[0m")
     window.goto_tab("scan")
@@ -295,6 +322,43 @@ def main():
           "1 done · 1 skipped · 1 failed · 2 to go")
     check("progress follows the checklist, not just successes",
           window.cb_progress.value(), 60)
+
+    print("\n\033[1mDimmed text is readable in every theme\033[0m")
+    # Qt's own Mid is a dark grey. Nothing set the role, so every widget
+    # styled `color: palette(mid)` — the running-command line most of all —
+    # rendered near-black, and on a dark theme that is black on black: the
+    # command actually running was invisible on most of the palettes.
+    from PyQt6.QtGui import QPalette, QColor
+    from command_bridge.constants import THEMES
+
+    def relative_luminance(colour):
+        channels = []
+        for value in (colour.redF(), colour.greenF(), colour.blueF()):
+            channels.append(value / 12.92 if value <= 0.03928
+                            else ((value + 0.055) / 1.055) ** 2.4)
+        return (0.2126 * channels[0] + 0.7152 * channels[1]
+                + 0.0722 * channels[2])
+
+    def contrast(first, second):
+        a, b = relative_luminance(first), relative_luminance(second)
+        return (max(a, b) + 0.05) / (min(a, b) + 0.05)
+
+    worst_theme, worst_ratio = "", 99.0
+    for name in THEMES:
+        window.apply_theme(name)
+        palette = QApplication.instance().palette()
+        for role in (QPalette.ColorRole.Mid,
+                     QPalette.ColorRole.PlaceholderText):
+            ratio = contrast(palette.color(role),
+                             QColor(THEMES[name]["panel_bg"]))
+            if ratio < worst_ratio:
+                worst_theme, worst_ratio = f"{name}/{role.name}", ratio
+    check(f"dimmed text clears 4.5:1 on every theme "
+          f"(worst: {worst_theme} at {worst_ratio:.1f}:1)",
+          worst_ratio >= 4.5)
+    check("the running-command line uses that role, not a literal colour",
+          "palette(mid)" in window.cb_command.styleSheet())
+    window.apply_theme("Obsidian")
 
     print("\n\033[1mScan options\033[0m")
     check("every stage can be turned off",
