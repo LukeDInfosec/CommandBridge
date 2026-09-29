@@ -30,6 +30,12 @@ import re
 # certain than usual can raise it, but the default is here so that two runs of
 # the same finding never disagree with each other.
 
+#: Issue keys whose severity legitimately comes from the tool rather than
+#: from here: one is a passthrough for "whatever CVE this happens to be", the
+#: others are catch-alls with no fixed meaning of their own.
+TOOL_RATED = {"known_cve", "tls_generic", "scan_information"}
+
+
 def _issue(severity, title, detail, remediation, cwe="", references=()):
     return {"severity": severity, "title": title, "detail": detail,
             "remediation": remediation, "cwe": cwe,
@@ -39,7 +45,7 @@ def _issue(severity, title, detail, remediation, cwe="", references=()):
 ISSUES = {
     # ── TLS: the named attacks ───────────────────────────────────────────
     "lucky13": _issue(
-        "MEDIUM", "Lucky 13 (CBC ciphers supported)",
+        "LOW", "Lucky 13 (CBC ciphers supported)",
         "The server negotiates CBC-mode cipher suites. The way TLS composes "
         "MAC-then-encrypt with CBC padding leaks, through the time taken to "
         "reject a record, whether the padding was well formed. Given enough "
@@ -1174,6 +1180,26 @@ NMAP_SERVICES = {
 NMAP_SEVERITY = {"telnet": "HIGH", "rsh": "HIGH", "rlogin": "HIGH",
                  "rexec": "HIGH", "redis": "HIGH", "mongodb": "HIGH",
                  "memcached": "HIGH", "elasticsearch": "HIGH"}
+
+
+def severity_for(key, tool_severity=""):
+    """The severity a finding is reported at.
+
+    THE LIBRARY WINS. This is the house scoring policy — one place to change
+    how an issue is rated, and the same answer every time whichever tool
+    happened to find it. Letting a tool escalate was why "deprecated TLS
+    versions" came out HIGH on a host where testssl rated SSLv3 high, when
+    the policy here says MEDIUM.
+
+    The exceptions are the keys in TOOL_RATED, which have no severity of
+    their own to defend.
+    """
+    issue = ISSUES.get(key)
+    if not issue:
+        return (tool_severity or "MEDIUM").upper()
+    if key in TOOL_RATED and tool_severity:
+        return tool_severity.upper()
+    return issue["severity"]
 
 
 def worst(*severities):

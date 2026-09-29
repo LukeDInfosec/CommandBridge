@@ -235,6 +235,32 @@ def analyse_csp(policy):
     return found
 
 
+def strip_parameter_values(url):
+    """``…/search?q=Test&id=7`` → ``…/search?q=&id=``.
+
+    Parameter ORDER is preserved rather than sorted, because the order a
+    parameter appears in is occasionally what a WAF keys on and it costs
+    nothing to keep. Duplicated names are kept once — ?a=1&a=2 is one
+    parameter with two values, and for this list it is one thing to fuzz.
+    """
+    try:
+        parsed = urllib.parse.urlparse(str(url).strip())
+    except Exception:                                   # noqa: BLE001
+        return ""
+    if not parsed.query:
+        return ""
+    names, seen = [], set()
+    for pair in parsed.query.split("&"):
+        name = pair.split("=", 1)[0].strip()
+        if name and name not in seen:
+            seen.add(name)
+            names.append(name)
+    if not names:
+        return ""
+    return urllib.parse.urlunparse(
+        parsed._replace(query="&".join(f"{n}=" for n in names), fragment=""))
+
+
 def _finding_from(key, where, evidence="", stage="", **override):
     """A CBFinding built from the library — the free-function form.
 
@@ -1330,21 +1356,16 @@ class CoffeeBreakMixin:
             if not key:
                 continue
             reported = str(record.get("severity", "")).upper()
-            if informational:
-                # testssl rates a missing CAA record LOW. It is a control that
-                # is available and not switched on, not a weakness in the TLS
-                # configuration, and letting the tool's rating win here is how
-                # a findings screen fills up with things nobody will fix.
-                severity = issue["severity"]
-            else:
-                severity = cb_issues.worst(
-                    issue["severity"],
-                    reported if reported in SEVERITIES else "")
+            # The library decides, not testssl. Its ratings are absolute
+            # (SSLv3 is "high" wherever it appears); a report needs one
+            # consistent scale, and that scale lives in cb_issues.
+            severity = cb_issues.severity_for(
+                key, reported if reported in SEVERITIES else "")
             line = clean_title(record.get("finding", ""), 300)
             identifier = str(record.get("id", ""))
             bucket = grouped.setdefault(key, {"severity": severity,
                                               "lines": [], "cves": []})
-            bucket["severity"] = cb_issues.worst(bucket["severity"], severity)
+            bucket["severity"] = severity
             entry = f"{identifier}: {line}" if identifier else line
             if entry not in bucket["lines"]:
                 bucket["lines"].append(entry)
@@ -1642,9 +1663,8 @@ class CoffeeBreakMixin:
                         or evidence
                 finding = self._cb_issue(
                     key, matched, evidence, stage["key"],
-                    severity=cb_issues.worst(
-                        issue["severity"],
-                        severity if severity in SEVERITIES else ""),
+                    severity=cb_issues.severity_for(
+                        key, severity if severity in SEVERITIES else ""),
                     detail=issue["detail"] + (f"\n\nnuclei: {name}"
                                               if name else ""))
                 for reference in references:
@@ -1747,22 +1767,59 @@ class CoffeeBreakMixin:
         return produced
 
     def _cb_parse_params(self, stage, text):
-        """Collect parameterised URLs for the traversal stage."""
+        """Collect parameterised URLs, and write the stripped list to a file.
+
+        Two outputs from one pass. The traversal stage wants the URLs with
+        their discovered values intact — a request that 404s without them
+        proves nothing. A person wants them with the values removed, because
+        that is the form you feed to ffuf, sqlmap or Burp Intruder:
+
+            https://example.com/search?q=Test   →   https://example.com/search?q=
+            https://example.com/item?id=7&s=a   →   https://example.com/item?id=&s=
+
+        One line per distinct parameter shape, so a paginated site does not
+        produce four hundred lines that differ only by an id.
+        """
         urls = self._cb_artifacts.setdefault("param_urls", [])
         blob = text
         path = stage.get("artefact_file")
         if path and Path(path).is_file():
             blob += "\n" + Path(path).read_text(errors="replace")
-        # Anything the JavaScript stage saw counts too.
+        # Anything the JavaScript stage or the crawl saw counts too.
         for candidate in (self._cb_artifacts.get("endpoints") or []):
             blob += "\n" + candidate
         for match in re.finditer(r"https?://\S+\?\S+=\S*", blob):
             url = match.group(0).strip().rstrip(",;)'\"")
             if url not in urls:
                 urls.append(url)
+
+        written = self._cb_write_parameter_file(urls)
         self.console.append_ansi(
             f"    {len(urls)} parameterised URL(s) for the traversal stage\n")
+        if written:
+            self.console.append_ansi(f"    parameters written to {written}\n")
         return 0
+
+    def _cb_write_parameter_file(self, urls):
+        """Write 'Discovered Parameters.txt' — the URLs with values stripped."""
+        stripped = []
+        for url in urls:
+            bare = strip_parameter_values(url)
+            if bare and bare not in stripped:
+                stripped.append(bare)
+        if not stripped:
+            return ""
+        path = Path(self.output_dir) / "Discovered Parameters.txt"
+        try:
+            path.write_text("\n".join(sorted(stripped)) + "\n",
+                            encoding="utf-8")
+        except Exception as exc:                        # noqa: BLE001
+            self.console.append_ansi(
+                f"    [!] could not write the parameter list: {exc}\n")
+            return ""
+        self._cb_artifacts["parameter_file"] = str(path)
+        self._cb_artifacts["stripped_params"] = stripped
+        return str(path)
 
     # ── export ───────────────────────────────────────────────────────────
     def coffee_break_report(self):
