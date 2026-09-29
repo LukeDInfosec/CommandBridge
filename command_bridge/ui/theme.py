@@ -841,6 +841,23 @@ QMenu::separator {{ height: 1px; background: {border}; margin: 5px 10px; }}
             pal.setColor(C.Base, QtGui.QColor(t["panel_bg"]))
             pal.setColor(C.AlternateBase, QtGui.QColor(t["card_bg"]))
             pal.setColor(C.Text, QtGui.QColor(t["text"]))
+            # Mid and PlaceholderText were never set, so every widget styled
+            # `color: palette(mid)` — the running-command line, the card
+            # subtitles, the finding counts — fell back to Qt's own Mid,
+            # which is a dark grey. On a dark theme that is black text on a
+            # black panel: the command that is actually running was
+            # invisible on exactly the themes most people use. Both now come
+            # from the theme's own dimmed-text colour.
+            dim = QtGui.QColor(theme_value(t, "text_dim"))
+            if dim == QtGui.QColor(t["text"]):
+                # A theme with no text_dim of its own: derive one that is
+                # readable against this theme's background rather than
+                # leaving it identical to the body text.
+                dim = QtGui.QColor(mix(t["text"], t["panel_bg"], 0.42))
+            pal.setColor(C.Mid, dim)
+            pal.setColor(C.Dark, dim)
+            pal.setColor(C.PlaceholderText, dim)
+            pal.setColor(C.ToolTipText, QtGui.QColor(t["text"]))
             pal.setColor(C.Button, QtGui.QColor(theme_value(t, "surface")))
             pal.setColor(C.ButtonText, QtGui.QColor(t["text"]))
             pal.setColor(C.Highlight, QtGui.QColor(t["accent"]))

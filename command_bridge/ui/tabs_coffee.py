@@ -354,7 +354,12 @@ class CoffeeBreakTabMixin:
         controls.addWidget(self.cb_count_label)
         box.addLayout(controls)
 
-        splitter = QSplitter(Qt.Orientation.Vertical)
+        # Side by side, not stacked. Stacked, the detail pane got whatever
+        # vertical room the table left it — which on a laptop was a few lines,
+        # and meant dragging the divider up for every single finding. Beside
+        # it, the list stays a list and the detail gets the height of the
+        # whole card.
+        splitter = QSplitter(Qt.Orientation.Horizontal)
 
         self.cb_table = QTableWidget(0, 5)
         self.cb_table.setHorizontalHeaderLabels(
@@ -384,6 +389,13 @@ class CoffeeBreakTabMixin:
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
         self.cb_table.setColumnWidth(4, 104)
+        # In a narrow left-hand column there is room for the severity and the
+        # name, and that is all a list needs to be scanned down. Where, stage
+        # and confidence are still populated — filtering, sorting and the
+        # delete menu all read them — but they are shown in the detail pane
+        # on the right rather than squeezed into a column two words wide.
+        for column in (2, 3, 4):
+            self.cb_table.setColumnHidden(column, True)
         self.cb_table.itemSelectionChanged.connect(self._cb_show_detail)
         self.cb_table.setContextMenuPolicy(
             Qt.ContextMenuPolicy.CustomContextMenu)
@@ -399,16 +411,24 @@ class CoffeeBreakTabMixin:
             "type, or never report that type again. Delete removes the "
             "selected one.")
         self.cb_table.setMinimumHeight(300)
+        self.cb_table.setMinimumWidth(260)
         splitter.addWidget(self.cb_table)
 
         self.cb_detail = QTextEdit()
         self.cb_detail.setReadOnly(True)
-        self.cb_detail.setMinimumHeight(170)
+        # Tall enough that a finding's evidence, PoC and fix are readable
+        # without touching the divider — which is the whole reason the panes
+        # sit side by side.
+        self.cb_detail.setMinimumHeight(360)
+        self.cb_detail.setMinimumWidth(320)
         self.cb_detail.setPlaceholderText(
             "Select a finding to see what it means, the evidence, and the fix.")
         splitter.addWidget(self.cb_detail)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
+        # The list is a fixed-ish index; the evidence takes the rest.
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([340, 860])
+        splitter.setChildrenCollapsible(False)
 
         box.addWidget(splitter)
         card.layout().addLayout(box)
@@ -579,7 +599,17 @@ class CoffeeBreakTabMixin:
         title = QTableWidgetItem(finding.title)
         # The column can be narrower than the title on a small window, so the
         # full text is always one hover away.
-        title.setToolTip(finding.title)
+        state = getattr(finding, "state", "")
+        title.setToolTip(f"[{state}] {finding.title}" if state
+                         else finding.title)
+        # A CRITICAL nobody has validated must not look, at a glance down the
+        # list, like one that has been. Italics carry that without a column
+        # and without depending on a colour that some theme will wash out.
+        validation = getattr(finding, "validation", None)
+        if validation is not None and validation.needs_manual_validation:
+            unsettled = QtGui.QFont(title.font())
+            unsettled.setItalic(True)
+            title.setFont(unsettled)
         where = QTableWidgetItem(_where_text(finding))
         where.setToolTip("\n".join(finding.locations()[:40]))
         confidence = QTableWidgetItem(finding.confidence)
