@@ -19,6 +19,87 @@ HOW TO USE THIS FILE
  CHANGELOG (most recent first)
 ================================================================================
 
+## 2026-09-29 — THE EVIDENCE CHAIN (6.3.0)
+
+A finding may no longer claim anything its evidence does not support.
+
+ROOT CAUSE OF THE CSP → CWE-78 REPORT. cb_issues.for_nuclei() classified a
+nuclei result from `template-id + name + DESCRIPTION`. A template's
+description is prose about the class of problem, written for a human. nuclei
+ships weak-csp-detect with a description ending "…which can lead to arbitrary
+code execution"; _TEXT_ISSUES matches `code execution` → command_injection
+several entries before it reaches the `csp` pattern; so a
+Content-Security-Policy header was published as CRITICAL / CWE-78 / "Input
+reaches a shell", with `object-src 'none'` underneath it as the proof. Nothing
+downstream could catch it, because nothing downstream ever compared the claim
+against the evidence.
+
+  * for_nuclei() now classifies from the template's IDENTITY only (id +
+    name). The description is retained as metadata on the evidence object and
+    is never consulted for classification. The parameter is kept in the
+    signature and deliberately unused.
+
+NEW MODULE: command_bridge/modules/cb_evidence.py
+
+  * Evidence — one object per detection holding method, URL, endpoint,
+    parameter, location, original value, payload, request, response, status,
+    headers, body excerpt, baseline pair, comparison, timing, redirect, OOB
+    interaction, detector, template id/name/author/severity/tags/path,
+    matcher, extracted values, raw output, observation, timestamp and a
+    correlation id. Deep-copied on every hand-off; never shared.
+  * States — DETECTED / POTENTIAL / VALIDATED / CONFIRMED / INCONCLUSIVE /
+    FALSE_POSITIVE. Confidence — informational / potential / low / medium /
+    high / confirmed. Both are DERIVED from the evidence, never set by hand.
+  * EVIDENCE_TOPICS + topics_in() — what a piece of evidence could possibly
+    be about (csp, shell, sql, xss, tls, header, cookie, path, panel,
+    disclosure, service, timing, oob).
+  * CLASSIFICATION_TOPICS — what each classification is a claim about.
+    Evidence sharing no topic with the claim is a classification conflict,
+    reported in as many words and never suppressed.
+  * EXPLOIT_REQUIRED + EVIDENCE_REQUIREMENTS — the injection/execution
+    classes cannot be established by a signature, header or banner. They need
+    an injection point, a payload and an observed consequence (or a validated
+    OOB interaction). Missing pieces become false-positive indicators.
+  * assess() / corroborate() — the verdict. Corroboration by a second tool
+    raises confidence, never severity, and not at all while the
+    classification is in dispute.
+  * poc_section() / Evidence.poc() / burp_request() — a PoC is rendered from
+    captured evidence or not at all. "PoC unavailable — insufficient evidence
+    was captured" is printed instead; nothing is invented.
+  * render() — the §12/§19 block: state, both severities, rationale, evidence
+    checklist, validation, false-positive indicators, PoC, RAW DETECTION, and
+    the generic description and remediation as separate, labelled sections.
+
+coffee_break.py
+
+  * CBFinding gains proof (Evidence), validation, state, scanner_severity and
+    instance_proof, plus revalidate(). __post_init__ seeds proof from the
+    short-form constructor so older call sites keep working.
+  * add_instance() no longer concatenates one sighting's evidence onto
+    another's; each sighting keeps its own Evidence, parallel to instances.
+  * _cb_record() merges only when the library key AND the evidence subject
+    agree (_cb_compatible), so de-duplication can no longer hand one finding
+    another's proof. Confidence changes go through the validator.
+  * _cb_issue() / _finding_from() copy any evidence handed in.
+  * _cb_parse_nuclei() builds the full §11 evidence object and keeps nuclei's
+    own severity and CWE as SCANNER metadata, separate from ours.
+  * finding_from_scan() carries the active scanner's parameter, payload,
+    request, response and oracle note into the evidence chain, so its results
+    come out CONFIRMED with a real PoC.
+  * The console line and the Markdown report lead with the state and flag
+    classification mismatches.
+
+tabs_coffee.py — the detail pane shows the state badge, both severities, the
+mismatch warning, "why this was detected", the evidence checklist, the PoC or
+its absence, the false-positive indicators, the next step and RAW DETECTION.
+
+TESTS: 268 (coffee break, +68) / 121 (GUI) / 104 (scanner) / 13 (chain).
+The new block covers exactly the reported failure — Tests A–F: a genuine
+command injection, a CSP template that must stay CSP, two simultaneous
+findings that must not swap evidence, a CWE-78 claim with no evidence, six
+concurrent engines, and de-duplication.
+
+
 ## 2026-09-29 — SCORING IS THE LIBRARY'S, AND A PARAMETER LIST (6.2.0)
 
 THE LIBRARY IS NOW THE SCORING POLICY. cb_issues.severity_for(key, tool) —
