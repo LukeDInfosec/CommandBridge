@@ -19,6 +19,44 @@ HOW TO USE THIS FILE
  CHANGELOG (most recent first)
 ================================================================================
 
+## 2026-09-29 — FINDINGS SIDE BY SIDE, AND DIM TEXT YOU CAN SEE (6.3.1)
+
+TWO THINGS A SMALL LAPTOP SCREEN MADE OBVIOUS.
+
+1. THE FINDINGS PANES NOW SIT SIDE BY SIDE. The splitter in the Findings card
+   was Vertical, so the detail pane got whatever vertical room the table left
+   over — a few lines — and reading any finding meant dragging the divider up,
+   every time. It is now Horizontal: the list runs down the left, the evidence
+   fills the right for the full height of the card.
+     * tabs_coffee.py — QSplitter(Horizontal); sizes [340, 860]; stretch 0/1;
+       setChildrenCollapsible(False); table min width 260, detail min width
+       320 and min height 360.
+     * Columns 2-4 (Where / Stage / Confidence) are hidden rather than
+       removed. They are still populated — the filter, the sort, the delete
+       menu and _cb_ui_refresh all read them — and all three already appear in
+       the detail pane. Severity and Finding are what a list needs.
+     * A finding whose validation still needs a human is shown in italics, so
+       an unvalidated CRITICAL does not look, at a glance down the list, like
+       one that has been confirmed. The state is in the row's tooltip too.
+
+2. DIMMED TEXT WAS BLACK ON BLACK. theme.py's _sync_palette() never set
+   QPalette.Mid, so every widget styled `color: palette(mid)` fell back to
+   Qt's own Mid — a dark grey. On the dark themes that is black text on a
+   black panel, which is why the running-command line under the progress bar
+   was invisible, along with the card subtitles, hints and finding counts.
+     * _sync_palette() now sets Mid, Dark and PlaceholderText from the theme's
+       own text_dim, deriving one with mix(text, panel_bg, 0.42) for any
+       palette that does not define it.
+     * Fixed in the palette rather than at the call site, so all seventeen
+       themes and every palette(mid) widget in the application are fixed at
+       once. Measured: the worst case is now Nord Frost at 5.2:1 against the
+       panel; every other theme is 5.4:1 or better.
+
+TESTS: 133 (GUI, +12 — the splitter orientation, the hidden columns, the
+detail pane's size, and a contrast sweep asserting dimmed text clears 4.5:1
+on every theme) / 268 (coffee break) / 104 (scanner) / 13 (chain).
+
+
 ## 2026-09-29 — THE EVIDENCE CHAIN (6.3.0)
 
 A finding may no longer claim anything its evidence does not support.
