@@ -18,8 +18,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from command_bridge.modules import cb_evidence               # noqa: E402
+from command_bridge.modules import cb_issues                 # noqa: E402
+from command_bridge.modules.cb_evidence import Evidence      # noqa: E402
 from command_bridge.modules.coffee_break import (          # noqa: E402
-    CBFinding, SEVERITIES, SEV_ORDER, CoffeeBreakMixin,
+    CBFinding, SEVERITIES, SEV_ORDER, CoffeeBreakMixin, finding_from_scan,
     probe_headers, probe_redirects, probe_traversal, probe_403_bypass,
     BYPASS_TRICKS, TRAVERSAL_PAYLOADS,
 )
@@ -339,8 +342,15 @@ def main():
         check("the server banner is kept as information, not a finding",
               [f.severity for f in engine._cb_findings
                if f.key == "version_disclosure"], ["INFO"])
-        check("nikto findings are marked tentative",
-              all(f.confidence == "tentative" for f in engine._cb_findings))
+        # Nikto pattern-matches; it does not reproduce anything. On the
+        # evidence scale that is a long way from confirmed, whatever Nikto
+        # itself says.
+        check("nikto findings never come out confirmed",
+              all(f.confidence != cb_evidence.CONFIRMED_C
+                  for f in engine._cb_findings))
+        check("and none of them is presented as exploited",
+              all(f.state != cb_evidence.CONFIRMED
+                  for f in engine._cb_findings))
 
         print("\n\033[1mThe issue library\033[0m")
         from command_bridge.modules import cb_issues
@@ -727,7 +737,10 @@ def main():
         check("and the finding names both tools",
               sorted(breach[0].sources), ["nikto", "testssl"])
         check("corroboration raises confidence, not severity",
-              (breach[0].confidence, breach[0].severity), ("firm", "LOW"))
+              (breach[0].confidence, breach[0].severity),
+              (cb_evidence.HIGH, "LOW"))
+        check("and never past the ceiling for something nobody exploited",
+              breach[0].confidence != cb_evidence.CONFIRMED_C)
 
         print("\n\033[1mMuting an issue type\033[0m")
         engine = Engine(base)
@@ -893,6 +906,327 @@ def main():
         check("the evidence is in it", "root:x:0:0" in report)
         check("the bypass table is in it", "| X-Original-URL |" in report)
         check("severity headings are used", "## CRITICAL (1)" in report)
+
+        # ─────────────────────────────────────────────────────────────────
+        #  The evidence chain
+        # ─────────────────────────────────────────────────────────────────
+        #
+        # These exist because of one real report: a Content-Security-Policy
+        # header was published as a CRITICAL CWE-78 OS command injection with
+        # "Input reaches a shell" above it and `object-src 'none'` underneath
+        # as the proof. Every check below is a different way of asking that
+        # the tool cannot do that again.
+
+        def nuclei_line(**over):
+            row = {"template-id": "weak-csp-detect", "matched-at": base,
+                   "info": {"name": "Weak Content Security Policy - Detect",
+                            "severity": "info",
+                            "author": ["geeknik"],
+                            "tags": ["csp", "misconfig"],
+                            "description":
+                                "Content Security Policy is an added layer "
+                                "of security that helps to detect and "
+                                "mitigate certain types of attacks, "
+                                "including Cross-Site Scripting and data "
+                                "injection attacks, which can lead to "
+                                "arbitrary code execution."},
+                   "extracted-results":
+                       ["object-src 'none'; frame-ancestors 'self' "
+                        "https://www.paypal.com"]}
+            row.update(over)
+            return json.dumps(row)
+
+        print("\n\033[1mTest B — a CSP template stays a CSP finding\033[0m")
+        # The exact input that produced the bad report.
+        key, _ = cb_issues.for_nuclei(
+            "weak-csp-detect", "Weak Content Security Policy - Detect",
+            "…which can lead to arbitrary code execution.")
+        check("classification comes from the template, not its prose",
+              key, "csp_missing")
+        check("and CWE-78 is nowhere near it",
+              cb_issues.ISSUES[key]["cwe"] != "CWE-78")
+
+        engine = Engine(base)
+        engine._cb_parse_nuclei({"key": "nuclei"}, nuclei_line())
+        csp = engine._cb_findings[0]
+        check("the finding is about CSP", csp.key, "csp_missing")
+        check("it is not OS command injection",
+              "command injection" not in csp.title.lower())
+        check("it is not CRITICAL", csp.severity != "CRITICAL")
+        check("the template id survives into the evidence",
+              csp.proof.template_id, "weak-csp-detect")
+        check("so do nuclei's tags", csp.proof.template_tags,
+              ["csp", "misconfig"])
+        check("and nuclei's own severity is kept apart from ours",
+              (csp.scanner_severity, csp.severity), ("INFO", "MEDIUM"))
+        check("the raw detection is still available",
+              "weak-csp-detect" in csp.proof.raw_detection())
+
+        print("\n\033[1mTest D — a claim with no evidence is not "
+              "confirmed\033[0m")
+        # Force the old failure directly: CWE-78 classification, CSP proof.
+        contaminated = CBFinding(
+            "CRITICAL", "OS command injection", base,
+            detail=cb_issues.ISSUES["command_injection"]["detail"],
+            remediation=cb_issues.ISSUES["command_injection"]["remediation"],
+            cwe="CWE-78",
+            key="command_injection", stage="nuclei",
+            proof=Evidence(detector="nuclei", template_id="weak-csp-detect",
+                           url=base,
+                           extracted=["object-src 'none'; frame-ancestors "
+                                      "'self'"]))
+        check("it is not presented as confirmed",
+              contaminated.state != cb_evidence.CONFIRMED)
+        check("it is inconclusive", contaminated.state,
+              cb_evidence.INCONCLUSIVE)
+        check("confidence is not 'firm'", contaminated.confidence,
+              cb_evidence.POTENTIAL_C)
+        check("the mismatch is stated, not swallowed",
+              any("Classification conflict" in c
+                  for c in contaminated.validation.conflicts))
+        check("the conflict names both subjects",
+              "csp" in contaminated.validation.conflicts[0]
+              and "command_injection" in contaminated.validation.conflicts[0])
+        check("and it says manual validation is required",
+              "MANUAL VALIDATION REQUIRED" in
+              contaminated.validation.action.upper())
+        check("no PoC is invented", contaminated.proof.poc(), "")
+        check("the report says so instead",
+              "PoC unavailable" in
+              "\n".join(Engine(base)._cb_evidence_block(contaminated)))
+        check("no parameter is invented", contaminated.proof.parameter, "")
+        check("no payload is invented", contaminated.proof.payload, "")
+        check("the false-positive reasons are the missing pieces",
+              any("no injection point" in i.lower()
+                  for i in
+                  contaminated.validation.false_positive_indicators))
+
+        # The same classification with nothing at all behind it: still not a
+        # confirmed critical, even without a contradiction to catch it.
+        bare = CBFinding("CRITICAL", "OS command injection", base,
+                         key="command_injection", stage="nuclei")
+        check("an evidence-free CWE-78 is only POTENTIAL",
+              bare.state, cb_evidence.POTENTIAL)
+        check("with the missing pieces enumerated",
+              sorted(bare.validation.missing),
+              ["injection_point", "observation", "payload"])
+
+        print("\n\033[1mTest A — a genuine command injection reports "
+              "fully\033[0m")
+
+        class FakeEvidence:
+            label = "injected payload: ;id"
+            request = "GET /ping?host=127.0.0.1%3Bid HTTP/1.1\nHost: target"
+            response = "HTTP/1.1 200 OK\n\nuid=33(www-data) gid=33(www-data)"
+            note = ("The response to ';id' contains uid=33(www-data), which "
+                    "the baseline response does not.")
+            payload = "127.0.0.1;id"
+
+            def render(self):
+                return self.request + "\n→\n" + self.response
+
+        class FakeScan:
+            issue = "command_injection"
+            where = f"{base}/ping"
+            point = "host"
+            severity = ""
+            confidence = "confirmed"
+            detail_extra = ""
+            evidence = [FakeEvidence()]
+
+            def evidence_text(self):
+                return self.evidence[0].render()
+
+        real = finding_from_scan(FakeScan())
+        check("it is classified as OS command injection",
+              real.title, "OS command injection")
+        check("with CWE-78", real.cwe, "CWE-78")
+        check("severity is CRITICAL", real.severity, "CRITICAL")
+        check("the state is CONFIRMED", real.state, cb_evidence.CONFIRMED)
+        check("and the confidence is confirmed", real.confidence,
+              cb_evidence.CONFIRMED_C)
+        check("the classification is consistent with the evidence",
+              real.validation.classification_consistent)
+        check("the evidence is sufficient", real.validation.evidence_sufficient)
+        check("there are no false-positive indicators",
+              real.validation.false_positive_indicators, [])
+        poc = real.proof.poc()
+        check("a PoC exists", bool(poc))
+        check("it names the parameter", "host" in poc)
+        check("it shows the payload", "127.0.0.1;id" in poc)
+        check("it shows the request", "GET /ping?host=" in poc)
+        check("it shows the response", "uid=33(www-data)" in poc)
+        check("it explains the observation", "baseline response does not" in poc)
+        check("and it pastes into Burp",
+              real.proof.burp_request().startswith("GET /ping?host="))
+
+        print("\n\033[1mTest C — findings do not swap evidence\033[0m")
+        engine = Engine(base)
+        engine._cb_record(real)
+        engine._cb_parse_nuclei({"key": "nuclei"}, nuclei_line())
+        by_key = {f.key: f for f in engine._cb_findings}
+        check("both findings are present", sorted(by_key), sorted(
+            ["command_injection", "csp_missing"]))
+        check("the injection keeps its own proof",
+              "uid=33(www-data)" in by_key["command_injection"].proof.response)
+        check("and did not acquire the CSP header",
+              "object-src" not in
+              by_key["command_injection"].proof.evidence_text())
+        check("the CSP finding kept its own proof",
+              "object-src" in by_key["csp_missing"].proof.evidence_text())
+        check("and did not acquire the shell output",
+              "uid=33" not in by_key["csp_missing"].proof.evidence_text())
+        check("their evidence objects are not the same object",
+              by_key["command_injection"].proof is not
+              by_key["csp_missing"].proof)
+        check("nor do they share a correlation id",
+              by_key["command_injection"].proof.correlation_id !=
+              by_key["csp_missing"].proof.correlation_id)
+
+        # Mutating one must not reach the other, and must not reach whatever
+        # built it either.
+        source_proof = Evidence(url=base, raw="uid=0(root)",
+                                parameter="cmd", payload=";id",
+                                detector="probe")
+        held = engine._cb_issue("command_injection", base, proof=source_proof,
+                                stage="probe")
+        source_proof.raw = "MUTATED AFTER THE FACT"
+        check("a finding copies the evidence handed to it",
+              held.proof.raw, "uid=0(root)")
+
+        print("\n\033[1mTest F — de-duplication does not merge unrelated "
+              "evidence\033[0m")
+        engine = Engine(base)
+        engine._cb_record(CBFinding(
+            "MEDIUM", "Missing Content-Security-Policy", f"{base}/one",
+            key="csp_missing", stage="nuclei",
+            proof=Evidence(url=f"{base}/one", detector="nuclei",
+                           raw="Content-Security-Policy: default-src 'self'")))
+        engine._cb_record(CBFinding(
+            "MEDIUM", "Missing Content-Security-Policy", f"{base}/two",
+            key="csp_missing", stage="nikto",
+            proof=Evidence(url=f"{base}/two", detector="nikto",
+                           raw="Content-Security-Policy header not found")))
+        merged = [f for f in engine._cb_findings if f.key == "csp_missing"]
+        check("the same issue at two places is one finding", len(merged), 1)
+        check("with both locations listed", merged[0].count, 2)
+        check("and both tools named", sorted(merged[0].sources),
+              ["nikto", "nuclei"])
+        check("each sighting keeps its own evidence object",
+              len(merged[0].instance_proof), 1)
+        check("the second sighting's proof is its own",
+              merged[0].instance_proof[0].raw,
+              "Content-Security-Policy header not found")
+        check("and the first is untouched",
+              merged[0].proof.raw,
+              "Content-Security-Policy: default-src 'self'")
+
+        # Same key, incompatible evidence: these must NOT become one row.
+        engine = Engine(base)
+        engine._cb_record(real)
+        engine._cb_record(CBFinding(
+            "CRITICAL", "OS command injection", f"{base}/other",
+            key="command_injection", stage="nuclei",
+            proof=Evidence(url=f"{base}/other", detector="nuclei",
+                           raw="Content-Security-Policy: object-src 'none'")))
+        injections = [f for f in engine._cb_findings
+                      if f.key == "command_injection"]
+        check("an exploited finding does not absorb an unrelated alert",
+              len(injections), 2)
+        check("the confirmed one is still confirmed",
+              injections[0].state, cb_evidence.CONFIRMED)
+        check("the unsupported one is still inconclusive",
+              injections[1].state, cb_evidence.INCONCLUSIVE)
+
+        print("\n\033[1mTest E — concurrent scanners do not cross-"
+              "contaminate\033[0m")
+        engines = []
+        errors = []
+
+        def run_one(index):
+            try:
+                local = Engine(f"{base}/site{index}")
+                # One scanner feeding a CSP template, another feeding real
+                # shell output, both at once, over and over.
+                for _ in range(15):
+                    local._cb_parse_nuclei({"key": "nuclei"}, nuclei_line(
+                        **{"matched-at": f"{base}/site{index}"}))
+                    local._cb_record(CBFinding(
+                        "CRITICAL", "OS command injection",
+                        f"{base}/site{index}/ping",
+                        key="command_injection", stage="active-scan",
+                        proof=Evidence(
+                            url=f"{base}/site{index}/ping",
+                            parameter="host", payload=f";id{index}",
+                            detector="active-scan",
+                            request=f"GET /ping?host=;id{index}",
+                            response=f"uid={index}(user{index})",
+                            observed=f"uid={index}(user{index}) came back")))
+                engines.append((index, local))
+            except Exception as exc:                    # noqa: BLE001
+                errors.append(exc)
+
+        workers = [threading.Thread(target=run_one, args=(i,))
+                   for i in range(6)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+        check("every worker finished", len(engines), 6)
+        check("with no exceptions", errors, [])
+        clean = True
+        for index, local in engines:
+            found = {f.key: f for f in local._cb_findings}
+            if sorted(found) != ["command_injection", "csp_missing"]:
+                clean = False
+                break
+            injection = found["command_injection"]
+            csp_finding = found["csp_missing"]
+            if f"uid={index}(user{index})" not in injection.proof.response:
+                clean = False
+            if "object-src" in injection.proof.evidence_text():
+                clean = False
+            if "uid=" in csp_finding.proof.evidence_text():
+                clean = False
+            # Nobody else's host may appear anywhere in this engine's proof.
+            for other, _ in engines:
+                if other != index and \
+                        f"site{other}" in injection.proof.evidence_text():
+                    clean = False
+        check("no engine holds another engine's evidence, URL or "
+              "classification", clean)
+
+        print("\n\033[1mThe report separates what was seen from what it "
+              "means\033[0m")
+        engine = Engine(base)
+        engine._cb_record(contaminated)
+        text = engine.coffee_break_report()
+        check("the state is printed", "**Status:** INCONCLUSIVE" in text)
+        check("both severities are shown, and labelled",
+              "Severity (tool-assessed)" in text)
+        check("the rationale is printed", "Why this was detected" in text)
+        check("observed evidence has its own section",
+              "**Observed evidence:**" in text)
+        check("the generic description has its own section",
+              "generic description" in text)
+        check("remediation has its own section",
+              "**Recommended remediation:**" in text)
+        check("the raw tool output is not hidden",
+              "Raw detection (what the tool actually said)" in text)
+        check("the conflict is in the report",
+              "Classification conflict detected" in text)
+        check("no PoC is fabricated", "PoC unavailable" in text)
+
+        report_line = cb_evidence.render(
+            contaminated.title, contaminated.severity, contaminated.key,
+            contaminated.proof, contaminated.validation,
+            scanner_severity="INFO", detail=contaminated.detail,
+            remediation=contaminated.remediation, cwe=contaminated.cwe)
+        check("the console block leads with the state",
+              report_line.startswith("[INCONCLUSIVE] OS command injection"))
+        check("and spells out what is missing",
+              "Injection point: NOT IDENTIFIED" in report_line
+              and "Payload: NOT CAPTURED" in report_line)
 
     finally:
         server.shutdown()
