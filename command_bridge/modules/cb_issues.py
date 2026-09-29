@@ -1148,14 +1148,31 @@ def for_text(text, default=None):
 
 
 def for_nuclei(template_id, name, description=""):
-    """A nuclei match, by template id first and then by its name."""
+    """A nuclei match, classified from the template's IDENTITY only.
+
+    The identity of a check is its template id and its name. Its
+    ``description`` is prose *about* the class of problem, written for a
+    human, and it is not evidence of anything.
+
+    Reading the description was a real bug and a bad one. nuclei ships
+    ``weak-csp-detect`` with a description ending "…which can lead to
+    arbitrary code execution", :data:`_TEXT_ISSUES` matches "code execution"
+    before it reaches the CSP pattern, and a Content-Security-Policy header
+    was published as a CRITICAL CWE-78 OS command injection with the CSP
+    string sitting underneath it as the proof. The description is now kept
+    as metadata by the caller and never consulted here.
+
+    ``description`` is retained in the signature so existing callers keep
+    working; it is deliberately unused.
+    """
+    del description                     # never classify on prose. See above.
     identifier = str(template_id or "")
     if re.match(r"^CVE-\d{4}-\d+$", identifier, re.I):
         # The template id is the CVE itself; the name says what kind of bug it
         # is, so look there before falling back to "known CVE".
-        key, issue = for_text(f"{name} {description}")
+        key, issue = for_text(str(name or ""))
         return (key, issue) if key else ("known_cve", ISSUES["known_cve"])
-    return for_text(f"{identifier} {name} {description}")
+    return for_text(f"{identifier} {name}")
 
 
 #: nmap service names that are findings in themselves, and which issue they

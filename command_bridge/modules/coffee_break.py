@@ -45,7 +45,8 @@ from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QMessageBox
 
 from command_bridge.constants import BASE_DIR
-from command_bridge.modules import cb_issues
+from command_bridge.modules import cb_evidence, cb_issues
+from command_bridge.modules.cb_evidence import Evidence
 from command_bridge.modules.cb_issues import ISSUES, clean_title
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -107,6 +108,56 @@ class CBFinding:
     #: and keeping them on one finding is the difference between "the site is
     #: missing a CSP" and four hundred identical rows.
     instances: list = field(default_factory=list)
+    #: The evidence chain. Its own object, never shared with another finding,
+    #: holding the request, parameter, payload, response, detector and raw
+    #: tool output that this specific finding rests on.
+    proof: object = None            # cb_evidence.Evidence
+    #: The verdict on whether ``proof`` supports ``key``.
+    validation: object = None       # cb_evidence.Validation
+    #: Where the finding sits on DETECTED → CONFIRMED.
+    state: str = cb_evidence.DETECTED
+    #: What the scanner itself rated it, kept apart from our own severity so
+    #: the report can show both and say which is which.
+    scanner_severity: str = ""
+    #: One evidence object per additional sighting, parallel to ``instances``.
+    instance_proof: list = field(default_factory=list)
+
+    def __post_init__(self):
+        if self.proof is None:
+            self.proof = cb_evidence.Evidence()
+        # A finding built the short way — severity, title, where, evidence —
+        # still gets an evidence object, seeded from what it was given. That
+        # way there is exactly one place the report reads proof from, and
+        # older call sites keep working without being rewritten.
+        if self.proof.is_empty() and self.evidence:
+            self.proof.raw = self.evidence
+        if not self.proof.url:
+            self.proof.url = self.where
+        if not self.proof.detector:
+            self.proof.detector = self.stage
+        self.confidence = cb_evidence.normalise_confidence(self.confidence)
+        if self.validation is None:
+            self.revalidate()
+
+    # ── the evidence chain ───────────────────────────────────────────────
+    def revalidate(self, detector_confirmed=False):
+        """Re-run the sufficiency and consistency checks over this finding.
+
+        Called whenever the evidence changes. The state, the confidence and
+        the false-positive notes are all *derived* — none of them is set by
+        hand anywhere, so none of them can drift away from what was seen.
+        """
+        self.validation = cb_evidence.assess(
+            self.key, self.proof,
+            issue_severity=self.severity,
+            scanner_severity=self.scanner_severity,
+            detector_confirmed=detector_confirmed,
+            is_information=(self.severity == "INFO"))
+        if len(self.sources) > 1:
+            cb_evidence.corroborate(self.validation, self.sources)
+        self.state = self.validation.state
+        self.confidence = self.validation.confidence
+        return self.validation
 
     def sort_key(self):
         return (-SEV_ORDER.get(self.severity, 0), self.title.lower())
@@ -125,16 +176,29 @@ class CBFinding:
             return True
         return False
 
-    def add_instance(self, where, evidence=""):
-        """Record another sighting. Returns True when it was new."""
+    def add_instance(self, where, evidence="", proof=None):
+        """Record another sighting of *the same issue*. True when it was new.
+
+        The sighting's own evidence is kept as its own object, tagged with
+        its location. It used to be concatenated onto ``self.evidence``,
+        which is how a finding's proof pane came to contain text belonging to
+        a different observation — and, once the two were run together, there
+        was no way to tell which line had come from where.
+        """
         if not where or where == self.where or where in self.instances:
             return False
         self.instances.append(where)
-        # Keep a little more proof, but not an unbounded amount of it: the
-        # detail pane has to stay readable.
-        if evidence and len(self.evidence) < 1200:
-            self.evidence = (self.evidence.rstrip() + "\n" + evidence).strip()
+        if proof is not None:
+            self.instance_proof.append(proof.copy())
+        elif evidence:
+            self.instance_proof.append(
+                cb_evidence.Evidence(url=where, raw=evidence,
+                                     detector=self.stage))
         return True
+
+    def all_proof(self):
+        """This finding's evidence and every instance's, in order."""
+        return [self.proof] + list(self.instance_proof)
 
     def as_dict(self):
         return asdict(self)
@@ -261,20 +325,79 @@ def strip_parameter_values(url):
         parsed._replace(query="&".join(f"{n}=" for n in names), fragment=""))
 
 
-def _finding_from(key, where, evidence="", stage="", **override):
+def _finding_from(key, where, evidence="", stage="", proof=None, **override):
     """A CBFinding built from the library — the free-function form.
 
     The mixin has its own ``_cb_issue``; probes run on a worker thread with no
     access to it, so they use this.
     """
     issue = ISSUES.get(key) or ISSUES["tls_generic"]
+    if proof is None:
+        proof = Evidence(url=where, detector=stage, raw=evidence,
+                         observed=override.pop("observed", ""))
+    else:
+        # Worker threads build these; a copy means the finding cannot be
+        # changed from underneath by whatever produced it.
+        proof = proof.copy()
+        proof.url = proof.url or where
+        proof.detector = proof.detector or stage
     fields = dict(severity=issue["severity"], title=issue["title"],
                   where=where, detail=issue["detail"],
                   remediation=issue["remediation"], cwe=issue["cwe"],
-                  references=list(issue["references"]), evidence=evidence,
-                  stage=stage, key=key, sources=[stage] if stage else [])
+                  references=list(issue["references"]),
+                  evidence=evidence or proof.raw,
+                  stage=stage, key=key, sources=[stage] if stage else [],
+                  proof=proof)
     fields.update({k: v for k, v in override.items() if v})
     return CBFinding(**fields)
+
+
+def finding_from_scan(scan_finding, stage="active-scan"):
+    """Turn one of the active scanner's results into a CBFinding.
+
+    The active scanner does not guess: by the time it emits a
+    :class:`~command_bridge.modules.scanner.model.ScanFinding` it has already
+    put a payload into a named insertion point and watched what came back.
+    That whole chain is carried across here — parameter, payload, request,
+    response, and the oracle's own words for what it saw — so the finding
+    that reaches the report can show its working, and the validator can check
+    it rather than take anyone's word for it.
+    """
+    items = list(getattr(scan_finding, "evidence", []) or [])
+    first = items[0] if items else None
+    proof = Evidence(
+        url=getattr(scan_finding, "where", ""),
+        parameter=getattr(scan_finding, "point", ""),
+        detector=stage,
+        payload=getattr(first, "payload", "") if first else "",
+        request=getattr(first, "request", "") if first else "",
+        response=getattr(first, "response", "") if first else "",
+        comparison="\n\n".join(item.render() for item in items[1:])
+                   if len(items) > 1 else "",
+        observed=(getattr(first, "note", "") if first else "")
+                 or getattr(scan_finding, "detail_extra", ""),
+        raw=scan_finding.evidence_text()
+            if hasattr(scan_finding, "evidence_text") else "",
+    )
+    # The oracles put the payload in the rendered request rather than in a
+    # field of its own; recover it so the PoC can name it.
+    if not proof.payload and first is not None:
+        proof.payload = _payload_from(getattr(first, "label", ""))
+    finding = _finding_from(
+        getattr(scan_finding, "issue", ""),
+        getattr(scan_finding, "where", ""),
+        stage=stage, proof=proof,
+        severity=getattr(scan_finding, "severity", "") or "",
+    )
+    finding.revalidate(detector_confirmed=str(
+        getattr(scan_finding, "confidence", "")).lower() == "confirmed")
+    return finding
+
+
+def _payload_from(label):
+    """Pull the payload out of an oracle's evidence label, if it named one."""
+    match = re.search(r"payload[: ]+(.+)$", str(label or ""), re.I)
+    return match.group(1).strip() if match else ""
 
 #: Headers that say more about the server than the operator meant to.
 LEAKY_HEADERS = ("server", "x-powered-by", "x-aspnet-version",
@@ -1239,20 +1362,27 @@ class CoffeeBreakMixin:
                     (finding.title, finding.stage))
             if not same:
                 continue
-            changed = existing.add_instance(finding.where, finding.evidence)
+            # Same library key is necessary but NOT sufficient. Two findings
+            # only merge when their evidence is about the same subject as
+            # well — otherwise de-duplication is a second route by which one
+            # finding acquires another's proof.
+            if not self._cb_compatible(existing, finding):
+                continue
+            changed = existing.add_instance(finding.where, finding.evidence,
+                                            finding.proof)
             if existing.add_source(finding.stage):
                 changed = True
-                # Corroboration by a second tool raises confidence, never
-                # severity: two scanners agreeing is better evidence, not a
-                # worse problem.
-                if existing.confidence == "tentative":
-                    existing.confidence = "firm"
             # The more serious assessment of the same issue wins.
             if cb_issues.worst(existing.severity, finding.severity) != \
                     existing.severity:
                 existing.severity = cb_issues.worst(existing.severity,
                                                     finding.severity)
                 changed = True
+            # Corroboration raises confidence, never severity, and only
+            # through the validator — which will refuse if the classification
+            # is in dispute.
+            if changed:
+                existing.revalidate()
             if changed:
                 self._cb_ui_call("_cb_ui_refresh", existing)
             return
@@ -1261,11 +1391,40 @@ class CoffeeBreakMixin:
             finding.sources = [finding.stage]
         self._cb_findings.append(finding)
         self._cb_ui_call("_cb_ui_finding", finding)
+        # The console line says the state as well as the severity, so a
+        # CRITICAL that nothing has actually confirmed cannot be mistaken for
+        # one that has.
         self.console.append_ansi(
-            f"    {SEV_TAG.get(finding.severity, '[INFO]')} "
+            f"    [{finding.state}] {SEV_TAG.get(finding.severity, '[INFO]')} "
             f"{finding.title} — {finding.where}\n")
+        if finding.validation and not \
+                finding.validation.classification_consistent:
+            self.console.append_ansi(
+                f"      ⚠ CLASSIFICATION/EVIDENCE MISMATCH — "
+                f"manual validation required\n")
 
-    def _cb_issue(self, key, where, evidence="", stage="", **override):
+    @staticmethod
+    def _cb_compatible(existing, incoming):
+        """May these two findings become one?
+
+        Only when the evidence behind both is about the same subject. A
+        genuine command injection proved by ``uid=0(root)`` and a passive
+        alert carrying a CSP header share a library key in the failure mode
+        this guards against; they must not share a row, because merging them
+        would hand the passive alert the exploited one's proof.
+        """
+        first = cb_evidence.topics_in(existing.proof.evidence_text())
+        second = cb_evidence.topics_in(incoming.proof.evidence_text())
+        if not first or not second:
+            return True                     # nothing to disagree about
+        if first & second:
+            return True
+        # Disjoint subjects. Only merge if neither is an exploitation claim,
+        # where the evidence is the whole finding.
+        return existing.key not in cb_evidence.EXPLOIT_REQUIRED
+
+    def _cb_issue(self, key, where, evidence="", stage="", proof=None,
+                  **override):
         """Build a finding from the named-issue library.
 
         Everything the library knows — the settled title, the severity, the
@@ -1273,12 +1432,27 @@ class CoffeeBreakMixin:
         problem reads the same way whichever tool happened to spot it.
         """
         issue = ISSUES.get(key) or ISSUES["tls_generic"]
+        # Every finding gets its OWN evidence object. Callers that pass one in
+        # get a copy of it, so nothing upstream can still hold a reference and
+        # mutate a finding's proof after the fact.
+        if proof is None:
+            proof = Evidence(target=getattr(self, "target", ""), url=where,
+                             detector=stage, raw=evidence,
+                             observed=override.pop("observed", ""))
+        else:
+            proof = proof.copy()
+            if not proof.url:
+                proof.url = where
+            if not proof.detector:
+                proof.detector = stage
         fields = dict(
             severity=issue["severity"], title=issue["title"],
             where=where, detail=issue["detail"],
             remediation=issue["remediation"], cwe=issue["cwe"],
-            references=list(issue["references"]), evidence=evidence,
-            stage=stage, key=key, sources=[stage] if stage else [])
+            references=list(issue["references"]),
+            evidence=evidence or proof.raw,
+            stage=stage, key=key, sources=[stage] if stage else [],
+            proof=proof)
         fields.update({k: v for k, v in override.items() if v})
         return CBFinding(**fields)
 
@@ -1607,6 +1781,29 @@ class CoffeeBreakMixin:
             return base + match.group(1)
         return self._cb_target_url()
 
+    @staticmethod
+    def _cb_nuclei_observation(template, name, matched, extracted, matcher):
+        """§14 — why nuclei raised this, said in terms of what it saw.
+
+        Built only from things nuclei actually reported. If it reported
+        nothing but a template id, that is what this says; it does not
+        describe an interaction that was never observed.
+        """
+        if not template and not name:
+            return ""
+        sentence = (f"nuclei template '{template or name}' matched at "
+                    f"{matched}.")
+        if matcher:
+            sentence += f" Matcher: {matcher}."
+        if extracted:
+            sentence += (" It extracted: "
+                         + ", ".join(str(x) for x in extracted)[:300] + ".")
+        else:
+            sentence += (" The template's own match is the whole of the "
+                         "evidence; no request, parameter or payload was "
+                         "recorded.")
+        return sentence
+
     def _cb_parse_nuclei(self, stage, text):
         produced = 0
         lines = []
@@ -1637,7 +1834,11 @@ class CoffeeBreakMixin:
             # library exactly that way, so a publicly reachable Umbraco or
             # phpMyAdmin login page vanished into "Technology fingerprint".
             # An unnamed template can be inventory; a named issue never is.
-            key, issue = cb_issues.for_nuclei(template, name, description)
+            # Classification comes from the template's identity alone. The
+            # description is metadata about the class of issue, written for a
+            # human — feeding it in here is what turned weak-csp-detect into
+            # a CRITICAL CWE-78.
+            key, issue = cb_issues.for_nuclei(template, name)
 
             if not key and cb_issues.is_fingerprint(template):
                 entry = f"{name} — {matched}"
@@ -1647,11 +1848,41 @@ class CoffeeBreakMixin:
 
             references = [r for r in (info.get("reference") or []) if r][:6] \
                 if isinstance(info.get("reference"), list) else []
-            evidence = ((row.get("extracted-results") and
-                         ", ".join(row["extracted-results"])[:400])
+            extracted = [str(x) for x in (row.get("extracted-results") or [])]
+            evidence = (", ".join(extracted)[:400]
                         or row.get("matcher-name", "") or line[:300])
             if template:
                 evidence = f"nuclei template: {template}\n{evidence}"
+
+            # §11 — everything nuclei told us, kept with the result it came
+            # from. The description lives here as template metadata and is
+            # never fed back into classification.
+            proof = Evidence(
+                target=self.target,
+                url=matched,
+                method=str(row.get("type", "")).upper()
+                       if str(row.get("type", "")).lower() in ("get", "post")
+                       else "",
+                detector="nuclei",
+                template_id=template,
+                template_name=name,
+                template_author=", ".join(info.get("author") or [])
+                                if isinstance(info.get("author"), list)
+                                else str(info.get("author") or ""),
+                template_severity=severity,
+                template_tags=[t for t in (info.get("tags") or [])]
+                              if isinstance(info.get("tags"), list) else [],
+                template_path=str(row.get("template-path", "")
+                                  or row.get("template", "")),
+                matcher=str(row.get("matcher-name", "")),
+                extracted=extracted,
+                request=str(row.get("request", "") or ""),
+                response=str(row.get("response", "") or "")[:2000],
+                raw=line[:1200],
+                observed=self._cb_nuclei_observation(
+                    template, name, matched, extracted,
+                    row.get("matcher-name", "")),
+            )
 
             if key == "robots_disclosure" and \
                     not self._cb_robots_worth_reporting():
@@ -1662,9 +1893,10 @@ class CoffeeBreakMixin:
                         self._cb_artifacts.get("robots_entries") or []) \
                         or evidence
                 finding = self._cb_issue(
-                    key, matched, evidence, stage["key"],
+                    key, matched, evidence, stage["key"], proof=proof,
                     severity=cb_issues.severity_for(
                         key, severity if severity in SEVERITIES else ""),
+                    scanner_severity=severity,
                     detail=issue["detail"] + (f"\n\nnuclei: {name}"
                                               if name else ""))
                 for reference in references:
@@ -1682,7 +1914,12 @@ class CoffeeBreakMixin:
                     remediation=" ".join(
                         info.get("remediation", "").split())[:600],
                     references=references,
+                    # nuclei's own CWE, kept as the SCANNER's claim. It is
+                    # presented as metadata on an unclassified detection, not
+                    # as this tool's confirmed classification.
                     cwe=self._cb_cwe_from(info),
+                    scanner_severity=severity,
+                    proof=proof,
                     stage=stage["key"]))
             produced += 1
 
@@ -1822,6 +2059,62 @@ class CoffeeBreakMixin:
         return str(path)
 
     # ── export ───────────────────────────────────────────────────────────
+    @staticmethod
+    def _cb_evidence_block(finding):
+        """The observed-evidence part of a report entry.
+
+        Kept strictly apart from the generic description and the remediation
+        advice, because a reader has to be able to tell what was seen from
+        what a library says about this kind of issue in general.
+        """
+        proof = finding.proof or cb_evidence.Evidence()
+        validation = finding.validation or cb_evidence.Validation()
+        lines = ["", "**Why this was detected:**",
+                 "", (validation.rationale
+                      or "Detection rationale unavailable."), ""]
+
+        lines.append("**Observed evidence:**")
+        lines.append("")
+        lines.append("```")
+        lines += cb_evidence.evidence_checklist(finding.key, proof)
+        lines.append("```")
+
+        section = cb_evidence.poc_section(finding.key, proof)
+        lines += ["", "**Proof of concept:**", ""]
+        if proof.poc() or len(section) > 1:
+            lines += ["```"] + section + ["```"]
+        else:
+            lines += section
+
+        burp = proof.burp_request()
+        if burp:
+            lines += ["", "**Replay in Burp:**", "", "```", burp, "```"]
+
+        lines += ["", "**Validation:**", "",
+                  f"- Evidence sufficient: "
+                  f"{'Yes' if validation.evidence_sufficient else 'No'}",
+                  f"- Classification consistent: "
+                  f"{'Yes' if validation.classification_consistent else 'No'}"]
+        for conflict in validation.conflicts:
+            lines.append(f"- ⚠ {conflict}")
+        if validation.false_positive_indicators:
+            lines += ["", "**Potential false-positive indicators:**", ""]
+            lines += [f"- {item}"
+                      for item in validation.false_positive_indicators]
+
+        raw = proof.raw_detection()
+        if raw.strip() != "RAW DETECTION":
+            lines += ["", "**Raw detection (what the tool actually said):**",
+                      "", "```", raw, "```"]
+        for extra in finding.instance_proof[:10]:
+            extra_raw = extra.raw_detection()
+            if extra_raw.strip() != "RAW DETECTION":
+                lines += ["", f"_Instance at {extra.url}:_",
+                          "", "```", extra_raw, "```"]
+        if validation.action:
+            lines += ["", f"**Next step:** {validation.action}"]
+        return lines
+
     def coffee_break_report(self):
         """The findings as Markdown, ready to paste into a report."""
         lines = [f"# Coffee Break — {self.target}", ""]
@@ -1846,19 +2139,27 @@ class CoffeeBreakMixin:
                     if len(finding.instances) > 25:
                         lines.append(f"    - … and "
                                      f"{len(finding.instances) - 25} more")
+                lines.append(f"- **Status:** {finding.state}")
                 lines.append(f"- **Stage:** {finding.stage}")
                 lines.append(f"- **Confidence:** {finding.confidence}")
+                lines.append(f"- **Severity (tool-assessed):** "
+                             f"{finding.severity}")
+                if finding.scanner_severity:
+                    lines.append(f"- **Severity (scanner-reported):** "
+                                 f"{finding.scanner_severity}")
                 if finding.cwe:
                     lines.append(f"- **Classification:** {finding.cwe}")
                 if finding.references:
                     lines.append("- **References:** "
                                  + ", ".join(str(r) for r in finding.references))
+                lines += self._cb_evidence_block(finding)
                 if finding.detail:
-                    lines.append(f"\n{finding.detail}\n")
-                if finding.evidence:
-                    lines.append("```\n" + finding.evidence.strip() + "\n```")
+                    lines.append("\n**What this class of issue means "
+                                 "(generic description):**\n")
+                    lines.append(finding.detail + "\n")
                 if finding.remediation:
-                    lines.append(f"**Fix:** {finding.remediation}")
+                    lines.append(f"**Recommended remediation:** "
+                                 f"{finding.remediation}")
                 lines.append("")
         table = self._cb_artifacts.get("bypass_table") or []
         if table:
