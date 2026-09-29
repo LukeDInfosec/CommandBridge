@@ -487,6 +487,96 @@ def main():
         check("Lucky 13 carries the CVE",
               "CVE-2013-0169" in by_key["lucky13"].references)
 
+        print("\n\033[1mThe library is the scoring policy\033[0m")
+        # A tool's rating no longer overrides the library's, in either
+        # direction. testssl rates SSLv3 "HIGH"; the house scoring says
+        # deprecated protocols are MEDIUM, and the report has to be
+        # consistent whichever tool happened to notice.
+        from command_bridge.modules.cb_issues import severity_for, TOOL_RATED
+        check("Lucky 13 is Low", cb_issues.ISSUES["lucky13"]["severity"],
+              "LOW")
+        check("deprecated protocols are Medium",
+              cb_issues.ISSUES["obsolete_protocol"]["severity"], "MEDIUM")
+        check("RC4 is Medium", cb_issues.ISSUES["rc4"]["severity"], "MEDIUM")
+        check("a tool cannot escalate a named issue",
+              severity_for("obsolete_protocol", "HIGH"), "MEDIUM")
+        check("nor lower one", severity_for("info_page_exposed", "LOW"),
+              "MEDIUM")
+        check("but a CVE passthrough still takes the tool's rating",
+              severity_for("known_cve", "CRITICAL"), "CRITICAL")
+        check("and an unknown key falls back to it",
+              severity_for("no_such_issue", "HIGH"), "HIGH")
+        check("the passthrough list is short and deliberate",
+              sorted(TOOL_RATED),
+              ["known_cve", "scan_information", "tls_generic"])
+
+        engine = Engine(base)
+        records = [
+            {"id": "SSLv3", "severity": "HIGH", "finding": "offered (NOT ok)"},
+            {"id": "TLS1", "severity": "LOW",
+             "finding": "offered (deprecated)"},
+            {"id": "LUCKY13", "severity": "LOW", "cve": "CVE-2013-0169",
+             "finding": "potentially VULNERABLE, uses TLS CBC ciphers"},
+            {"id": "RC4", "severity": "HIGH", "cve": "CVE-2013-2566",
+             "finding": "VULNERABLE (NOT ok): RC4-SHA"},
+        ]
+        path = engine.output_dir / "scored.json"
+        path.write_text(json.dumps(records))
+        engine._cb_parse_testssl(
+            {"key": "testssl", "artefact_file": str(path)}, "")
+        scored = {f.key: f.severity for f in engine._cb_findings}
+        check("SSLv3 rated high by testssl is reported Medium",
+              scored.get("obsolete_protocol"), "MEDIUM")
+        check("Lucky 13 is reported Low", scored.get("lucky13"), "LOW")
+        check("RC4 rated high by testssl is reported Medium",
+              scored.get("rc4"), "MEDIUM")
+
+        print("\n\033[1mDiscovered Parameters.txt\033[0m")
+        from command_bridge.modules.coffee_break import strip_parameter_values
+        check("a value is stripped, the name kept",
+              strip_parameter_values("https://example.com/search?q=Test"),
+              "https://example.com/search?q=")
+        check("every parameter on the URL is kept",
+              strip_parameter_values("https://example.com/i?id=7&sort=name"),
+              "https://example.com/i?id=&sort=")
+        check("order is preserved, not sorted",
+              strip_parameter_values("https://example.com/i?z=1&a=2"),
+              "https://example.com/i?z=&a=")
+        check("a repeated name appears once",
+              strip_parameter_values("http://example.com/a?x=1&x=2"),
+              "http://example.com/a?x=")
+        check("a fragment is dropped",
+              strip_parameter_values("https://example.com/p?a=1#top"),
+              "https://example.com/p?a=")
+        check("a URL with no parameters produces nothing",
+              strip_parameter_values("https://example.com/plain"), "")
+        check("and neither does rubbish",
+              strip_parameter_values("not a url at all"), "")
+
+        engine = Engine(base)
+        engine._cb_artifacts["endpoints"] = [
+            f"{base}/search?q=Test", f"{base}/item?id=7"]
+        engine._cb_parse_params({"key": "params"},
+                                f"{base}/view?page=2&id=99\n")
+        written = Path(engine.output_dir) / "Discovered Parameters.txt"
+        check("the file is written, under that name", written.is_file())
+        lines = written.read_text().strip().splitlines()
+        check("one line per parameter shape", len(lines), 3)
+        check("values are gone",
+              [line for line in lines if line.rstrip().endswith(("7", "2", "99",
+                                                                "Test"))], [])
+        check("the search parameter is there",
+              any(line.endswith("/search?q=") for line in lines))
+        check("and a two-parameter URL keeps both",
+              any(line.endswith("/view?page=&id=") for line in lines))
+        check("the traversal stage still gets the real values",
+              any("id=7" in u for u in engine._cb_artifacts["param_urls"]))
+        check("and the path is recorded for the report",
+              engine._cb_artifacts.get("parameter_file"), str(written))
+        engine._cb_parse_params({"key": "params"}, "")
+        check("a second pass does not duplicate the lines",
+              len(written.read_text().strip().splitlines()), 3)
+
         print("\n\033[1mtestssl becomes named issues\033[0m")
         # The JSON testssl writes, in the shape it writes it. Three of these
         # four records are the scanner saying the host is *fine*, which is what
