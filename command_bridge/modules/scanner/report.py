@@ -20,7 +20,7 @@ import html
 import json
 import time
 
-from command_bridge.modules import cb_issues
+from command_bridge.modules import cb_evidence, cb_issues
 
 SEVERITY_ORDER = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")
 SEVERITY_COLOUR = {"CRITICAL": "#c1121f", "HIGH": "#e35d2b",
@@ -85,22 +85,51 @@ def as_markdown(result):
 
     for finding in sorted_findings(result):
         issue = cb_issues.ISSUES.get(finding.issue, {})
-        lines.append(f"## [{severity_of(finding)}] {title_of(finding)}")
+        # The same evidence chain and verdict the Findings screens show, so
+        # the written report and the screen cannot disagree.
+        proof, validation = cb_evidence.assess_scan(finding)
+        lines.append(f"## [{validation.state}] [{severity_of(finding)}] "
+                     f"{title_of(finding)}")
         lines.append("")
         lines.append(f"- **Where:** {finding.where}")
         lines.append(f"- **Parameter:** {finding.point}")
-        lines.append(f"- **Confidence:** {finding.confidence}")
+        lines.append(f"- **Status:** {validation.state}")
+        lines.append(f"- **Confidence:** {validation.confidence} "
+                     f"(scanner said: {finding.confidence})")
         if issue.get("cwe"):
             lines.append(f"- **Classification:** {issue['cwe']}")
         lines.append("")
         if issue.get("detail"):
             lines.append(issue["detail"])
             lines.append("")
-        if finding.detail_extra:
-            lines.append(f"**How it was confirmed.** {finding.detail_extra}")
+        lines.append("### Why this was detected")
+        lines.append("")
+        lines.append(validation.rationale
+                     or "Detection rationale unavailable.")
+        lines.append("")
+        lines.append("### Observed evidence")
+        lines.append("")
+        lines.append("```")
+        lines += cb_evidence.evidence_checklist(finding.issue, proof)
+        lines.append("```")
+        lines.append("")
+        lines.append("### Proof of concept")
+        lines.append("")
+        lines.append("```")
+        lines += cb_evidence.poc_section(finding.issue, proof)
+        lines.append("```")
+        lines.append("")
+        if validation.false_positive_indicators:
+            lines.append("### Potential false-positive indicators")
+            lines.append("")
+            lines += [f"- {item}"
+                      for item in validation.false_positive_indicators]
+            lines.append("")
+        for conflict in validation.conflicts:
+            lines.append(f"> ⚠ {conflict}")
             lines.append("")
         if finding.evidence:
-            lines.append("### Evidence")
+            lines.append("### Raw detection")
             lines.append("")
             lines.append("```http")
             lines.append(finding.evidence_text())
