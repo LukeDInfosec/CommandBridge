@@ -45,7 +45,8 @@ from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QMessageBox
 
 from command_bridge.constants import BASE_DIR
-from command_bridge.modules import cb_evidence, cb_issues
+from command_bridge.modules import cb_control, cb_evidence, cb_issues
+from command_bridge.modules.cb_control import RunGate, Stopped
 from command_bridge.modules.cb_evidence import Evidence
 from command_bridge.modules.cb_issues import ISSUES, clean_title
 
@@ -228,6 +229,10 @@ class _CBWorker(QObject):
         try:
             findings, artefacts = self._func(self._context, self.progress.emit)
             self.finished.emit(findings or [], artefacts or {}, "")
+        except Stopped:
+            # Not a failure. The operator stopped the run, or closed the
+            # window, while this stage was mid-flight.
+            self.finished.emit([], {}, "")
         except Exception as exc:                       # noqa: BLE001
             self.finished.emit([], {}, f"{type(exc).__name__}: {exc}")
 
@@ -393,7 +398,12 @@ def _session(context):
         urllib3.disable_warnings()
     except Exception:
         pass
-    return session
+    # Every probe reaches the network through here, so gating the session is
+    # what makes Pause mean "stop touching the target" for the Python stages
+    # too. Before this, Pause suspended the external tool and held the chain,
+    # and the header/JavaScript/traversal/bypass probes carried right on
+    # making requests.
+    return cb_control.gate_session(session, context.get("gate"))
 
 
 def probe_headers(context, report):
@@ -778,6 +788,15 @@ class CoffeeBreakMixin:
         self._cb_skip_requested = False
         self._cb_paused = False
         self._cb_resume_pending = False
+        # One gate per run, shared with whatever probe is on the worker
+        # thread. Reused rather than replaced, so a stage that is already
+        # blocked on the old one cannot be left holding a gate nothing will
+        # ever release.
+        if getattr(self, "_cb_gate", None) is None:
+            self._cb_gate = RunGate()
+        else:
+            self._cb_gate.stop()        # release anything still waiting
+            self._cb_gate = RunGate()
         self._cb_current_command = ""
         self._cb_muted = self._cb_load_muted()
 
@@ -1032,6 +1051,15 @@ class CoffeeBreakMixin:
         if not getattr(self, "_cb_active", False):
             return
         self._cb_active = False
+        # Release the probe thread first, and make sure it is released even
+        # if the run was paused: a SIGSTOP'd process ignores SIGTERM until it
+        # is continued, and a gate nobody resumes blocks for ever.
+        try:
+            self._cb_gate.stop()
+        except Exception:                               # noqa: BLE001
+            pass
+        self._cb_paused = False
+        self._cb_signal_process("SIGCONT")
         try:
             self.runner.stop()
         except Exception:
@@ -1053,16 +1081,23 @@ class CoffeeBreakMixin:
             return False
         self._cb_paused = not getattr(self, "_cb_paused", False)
         if self._cb_paused:
+            # Three things, not one. The external tool is suspended, the
+            # chain is held, and the gate stops the Python probes at their
+            # next request — which is the part that was missing, and the
+            # reason a paused scan used to keep hitting the target.
+            self._cb_gate.pause()
             self._cb_signal_process("SIGSTOP")
             self.console.append_ansi(
-                "\n[*] Coffee Break paused. The running step is suspended and "
-                "nothing further will start until you resume.\n")
+                "\n[*] Coffee Break paused. The running step is suspended, "
+                "in-flight checks are held at their next request, and nothing "
+                "further will start until you resume.\n")
             try:
                 self.set_status_state("paused")
                 self.update_status_bar("paused", self._cb_current_command)
             except Exception:                           # noqa: BLE001
                 pass
         else:
+            self._cb_gate.resume()
             self._cb_signal_process("SIGCONT")
             self.console.append_ansi("\n[*] Coffee Break resumed.\n")
             self._cb_assert_running()
@@ -1168,14 +1203,24 @@ class CoffeeBreakMixin:
             self._cb_assert_running()
             self._cb_start_worker(stage)
 
-    def _cb_start_worker(self, stage):
-        context = {
+    def _cb_worker_context(self):
+        """What a probe is handed when it runs.
+
+        Its own method so the wiring — in particular that the run's gate
+        reaches the probe — can be checked without starting a thread.
+        """
+        return {
             "url": self._cb_target_url(),
             "output_dir": str(self.output_dir),
             "headers": self._cb_extra_headers(),
             "timeout": 15,
+            # Pause and Stop reach the probe through this.
+            "gate": self._cb_gate,
             **self._cb_artifacts,
         }
+
+    def _cb_start_worker(self, stage):
+        context = self._cb_worker_context()
         self._cb_thread = QThread()
         self._cb_worker = _CBWorker(stage["probe"], context)
         self._cb_worker.moveToThread(self._cb_thread)
