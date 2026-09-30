@@ -32,6 +32,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 from command_bridge.modules import cb_issues
+from command_bridge.modules.cb_control import RunGate, Stopped
 from command_bridge.modules.scanner import oracles
 from command_bridge.modules.scanner.crawl import Crawler, Scope
 from command_bridge.modules.scanner.model import (
@@ -105,14 +106,24 @@ PROFILES = {"safe": Profile.safe, "standard": Profile.standard,
 
 
 class Pacer:
-    """A shared speed limit, so threads do not add up to a denial of service."""
+    """A shared speed limit, so threads do not add up to a denial of service.
 
-    def __init__(self, rate):
+    It is also where the run's pause lives. Every request the scanner makes
+    passes through ``Session._send_once``, which calls this — so holding it
+    here holds the whole scanner, thread pool and all, without any check
+    having to know that pausing exists.
+    """
+
+    def __init__(self, rate, gate=None):
         self.interval = 1.0 / rate if rate > 0 else 0.0
         self._lock = threading.Lock()
         self._next = 0.0
+        self.gate = gate
 
     def wait(self):
+        if self.gate is not None and not self.gate.wait():
+            # Stopped, not merely paused. Unwind rather than send.
+            raise Stopped("the scan was stopped")
         if not self.interval:
             return
         with self._lock:
@@ -164,7 +175,11 @@ class ScanEngine:
         self.on_progress = on_progress or (lambda phase, done, total: None)
         self.on_finding = on_finding or (lambda finding: None)
         self._stop = threading.Event()
-        self.pacer = Pacer(self.profile.rate)
+        #: Pause/stop for this run. The engine's own stop flag stays as it
+        #: was so nothing that reads it has to change; the gate is what
+        #: reaches the threads that are already mid-request.
+        self.gate = RunGate()
+        self.pacer = Pacer(self.profile.rate, self.gate)
         self.scope = scope or Scope([self.target])
         self.result = ScanResult(target=self.target,
                                  profile=self.profile.name)
@@ -174,9 +189,29 @@ class ScanEngine:
 
     def stop(self):
         self._stop.set()
+        # Wakes any worker blocked on a pause, so a paused scan can still be
+        # stopped — and so closing the window does not wait on a resume that
+        # is never coming.
+        self.gate.stop()
 
     def stopped(self):
         return self._stop.is_set()
+
+    # ── pause ────────────────────────────────────────────────────────────
+    def pause(self):
+        """Hold every worker at its next request. Reversible."""
+        return self.gate.pause()
+
+    def resume(self):
+        return self.gate.resume()
+
+    def toggle_pause(self):
+        """Returns True when the scan is now paused."""
+        return self.gate.toggle()
+
+    @property
+    def paused(self):
+        return self.gate.paused
 
     # ── the run ──────────────────────────────────────────────────────────
     def run(self):
@@ -252,6 +287,11 @@ class ScanEngine:
                     try:
                         for finding in future.result() or []:
                             self._record(finding)
+                    except Stopped:
+                        # Every worker still in flight raises this once the
+                        # run is stopped. It is the stop working, not a
+                        # failure, and it must not fill the log.
+                        pass
                     except Exception as exc:            # noqa: BLE001
                         self.on_log(f"[scan] a check failed: {exc}")
                     if self.stopped():
@@ -351,6 +391,10 @@ class ScanEngine:
 
     def _test_point(self, context, point, checks):
         if self.stopped():
+            return []
+        # Block here while paused, so a pause takes hold even between the
+        # scheduling of a point and its first request.
+        if not self.gate.wait():
             return []
         baseline = oracles.take_baseline(
             context.auth, point.request, self.profile.baseline_samples)
