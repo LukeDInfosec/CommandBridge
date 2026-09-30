@@ -19,6 +19,80 @@ HOW TO USE THIS FILE
  CHANGELOG (most recent first)
 ================================================================================
 
+## 2026-09-30 — PAUSE MEANS STOP, AND CLOSING MEANS STOP (6.5.0)
+
+AUDIT FIRST. Three gaps, two of them real:
+
+  1. Coffee Break's Pause suspended the external tool (SIGSTOP) and held the
+     chain, and that was all. The Python probe stages — headers, redirects,
+     JavaScript, traversal, 403 bypass — kept running and kept making
+     requests to the target after the operator had pressed Pause and walked
+     away. Pause stopped the progress bar, not the traffic.
+  2. The Active Scan had no pause at all. Stop only.
+  3. closeEvent() terminated the shared CommandRunner child and the CORS PoC
+     server, and nothing else. A live Coffee Break chain, its probe thread
+     and the Active Scan engine and its thread all survived the window
+     closing — still sending, with no interface left to stop them — and Qt
+     was left tearing down running QThreads.
+     Also: a SIGSTOP'd child cannot act on SIGTERM, so closing after a Pause
+     stalled for the full 1.5s timeout before the SIGKILL that was always
+     going to be needed.
+
+NEW MODULE: command_bridge/modules/cb_control.py — RunGate, the one object
+both engines use to mean pause and stop. No Qt, no network, so it works the
+same on the interface thread, on a worker thread and inside the scanner's
+thread pool.
+
+  * paused is reversible and blocks work where it stands; stopped is not and
+    wakes everything immediately. STOPPING ALWAYS WINS — a stopped gate never
+    blocks, so a paused run can be shut down without being resumed first.
+    That is what makes closing the window after a Pause safe rather than a
+    hang.
+  * wait() blocks while paused and returns False when the run should stop.
+    With a timeout it returns False if still paused when time is up — the
+    question is "may I send?", and while paused the answer is no however long
+    the caller waits.
+  * gate_session(session, gate) wraps requests.Session.request, so one
+    chokepoint covers a whole family of probes and none of them has to know
+    the gate exists. The probe that forgets to check is the one that keeps
+    hammering a client's server.
+
+coffee_break.py
+
+  * _session() gates every probe session; _cb_worker_context() (extracted, so
+    the wiring is testable without a thread) carries the run's gate.
+  * _CBWorker treats Stopped as an ordinary early finish, not a failure.
+  * pause_coffee_break() now does three things, not two: gate, SIGSTOP, hold
+    the chain. stop_coffee_break() stops the gate and SIGCONTs the child
+    first, so a paused run can be stopped.
+  * _cb_reset() gives each run a fresh gate and stops the old one.
+
+scanner/engine.py — Pacer gained the gate. Every scanner request passes
+through Session._send_once → pace(), so holding it there holds the crawl, the
+thread pool and the stored-payload sweep without any check knowing pause
+exists. Engine gained pause()/resume()/toggle_pause()/paused; stop() also
+stops the gate. In-flight workers raise Stopped, which the executor loop
+swallows quietly rather than logging once per point.
+
+tabs_scan.py — a Pause button beside Stop, same as Coffee Break: enabled
+while running, toggles to Resume, logs what it is doing, and Stop clears it.
+
+window_controls.py — closeEvent() now tears down in a deliberate order and
+does not return until it is done: gates down first (releasing anything
+blocked or paused), then SIGCONT and kill the child, then join the worker
+threads with _join_worker_threads(). A QThread destroyed while running takes
+the process with it, and its in-flight requests would land after the window
+had gone.
+
+TESTS: 288 (coffee break, +20 — including a live server proving 0 requests
+are sent during a pause, measured, and that stopping while paused releases
+the worker) / 121 (scanner, +17 — engine pause/resume/toggle, a blocked
+worker released by stop, and a real run stopped mid-flight) / 183 (GUI, +22 —
+the Pause button's states, Stop on a paused scan, and a window closed with a
+paused engine and a blocked probe thread behind it, asserting the probe is
+released, never sends, and the close does not hang) / 13 (chain).
+
+
 ## 2026-09-30 — ONE FINDINGS SCREEN, TWO TOOLS (6.4.0)
 
 The Active Scan tab now presents its findings exactly as Coffee Break does,
