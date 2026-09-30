@@ -15,6 +15,7 @@ caught more mistakes during this build than the other one.
 """
 
 import json
+import threading
 import re
 import sys
 import time
@@ -487,6 +488,89 @@ def main():
                                                     base + "/search?q=test"), 2))
             check("the evidence says the script actually ran",
                   "executed" in confirmed[0].detail_extra)
+
+        # ─────────────────────────────────────────────────────────────────
+        #  Pause, and closing while a scan is live
+        # ─────────────────────────────────────────────────────────────────
+        #
+        # Pausing has to mean the scanner stops sending, not that the
+        # progress bar stops moving. Every request goes through the pacer, so
+        # that is where the run is held; these prove it holds, that a paused
+        # scan can still be stopped without being resumed first, and that a
+        # real run stops promptly when told to.
+
+        print("\n\033[1mPause and stop\033[0m")
+        paused_profile = Profile.standard()
+        paused_profile.use_browser = False
+        paused_profile.rate = 60
+        engine = ScanEngine(base, auth=AuthConfig("none"),
+                            profile=paused_profile, scope=build_scope(base))
+        check("a new engine is not paused", engine.paused, False)
+        check("and not stopped", engine.stopped(), False)
+        check("pausing reports paused", engine.pause(), True)
+        check("the engine agrees", engine.paused)
+        check("the pacer is held by the same gate",
+              engine.pacer.gate is engine.gate)
+        check("a held gate answers 'no, do not send' rather than waiting "
+              "for ever", engine.gate.wait(timeout=0.2), False)
+        check("resuming clears it", engine.resume() and not engine.paused)
+        check("toggle pauses", engine.toggle_pause(), True)
+        check("and toggles back", engine.toggle_pause(), False)
+
+        # Stop while paused: the worker must be released, not left waiting on
+        # a resume that is never coming. This is what makes closing the
+        # window safe after somebody has pressed Pause.
+        engine.pause()
+        released = {"done": False}
+
+        def blocked():
+            # The pacer raises Stopped rather than returning, which is how a
+            # worker mid-request unwinds instead of sending.
+            try:
+                engine.pacer.wait()
+            except Exception:                           # noqa: BLE001
+                pass
+            released["done"] = True
+
+        waiter = threading.Thread(target=blocked, daemon=True)
+        waiter.start()
+        time.sleep(0.3)
+        check("a worker blocks while the scan is paused",
+              released["done"], False)
+        engine.stop()
+        waiter.join(timeout=5)
+        check("stopping while paused releases it", waiter.is_alive(), False)
+        check("the engine is stopped", engine.stopped())
+        check("and its gate is too", engine.gate.stopped)
+
+        # And the same thing against a live run: a scan told to stop must
+        # stop, promptly, without an exception reaching the caller.
+        live_profile = Profile.standard()
+        live_profile.use_browser = False
+        live_profile.rate = 40
+        live = ScanEngine(base, auth=AuthConfig("none"),
+                          profile=live_profile, scope=build_scope(base))
+        outcome = {}
+
+        def run_it():
+            try:
+                outcome["result"] = live.run()
+            except Exception as exc:                    # noqa: BLE001
+                outcome["error"] = exc
+
+        runner = threading.Thread(target=run_it, daemon=True)
+        runner.start()
+        time.sleep(2.0)
+        sent_before = live.result.requests_seen
+        live.stop()
+        stopped_at = time.time()
+        runner.join(timeout=30)
+        check("a running scan stops when told to", runner.is_alive(), False)
+        check("and does so promptly", time.time() - stopped_at < 25)
+        check("with no exception escaping run()", "error" not in outcome,
+              True)
+        check("it still returns a result", "result" in outcome)
+        del sent_before
 
     finally:
         server.shutdown()

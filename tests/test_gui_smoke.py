@@ -30,7 +30,7 @@ def check(label, got, want=True):
 
 
 def main():
-    from PyQt6.QtCore import Qt
+    from PyQt6.QtCore import Qt, QThread
     from PyQt6.QtWidgets import (
         QApplication, QPushButton, QLabel, QSplitter)
     from command_bridge.constants import TABS, RAIL_SECTIONS
@@ -614,6 +614,94 @@ def main():
         hurt.close()
     finally:
         coffee_module.CoffeeBreakTabMixin.create_coffee_break_tab = original
+
+    # ── pause and shutdown ───────────────────────────────────────────────
+    # Closing the window has to mean the tool stops touching the target.
+    # Anything still running at that point is a scan against somebody else's
+    # network with no interface left to stop it.
+    print("\n\033[1mPause, and closing with work in flight\033[0m")
+    import threading
+    import time as _t
+    from command_bridge.modules.cb_control import RunGate
+    from command_bridge.modules.scanner import ScanEngine
+    from command_bridge.modules.scanner.session import AuthConfig
+
+    window.goto_tab("scan")
+    check("the Scan tab has a Pause button", hasattr(window, "as_pause_btn"))
+    check("it is disabled until a scan is running",
+          window.as_pause_btn.isEnabled(), False)
+    check("and it reads 'Pause'", window.as_pause_btn.text(), "Pause")
+    check("pausing with nothing running does nothing",
+          window.pause_active_scan(), False)
+
+    engine = ScanEngine("https://127.0.0.1:9", auth=AuthConfig("none"))
+    window._as_engine = engine
+    window._as_thread = object()          # enough for the guard
+    window._as_reset("https://127.0.0.1:9", "standard")
+    check("starting a scan enables Pause", window.as_pause_btn.isEnabled())
+    window._as_engine = engine
+    window._as_thread = object()
+    check("pressing it pauses the engine", window.pause_active_scan(), True)
+    check("the engine is held", engine.paused)
+    check("and the button offers to resume",
+          window.as_pause_btn.text(), "Resume")
+    check("pressing it again resumes", window.pause_active_scan(), False)
+    check("the engine is running", engine.paused, False)
+
+    # Stop must work while paused, or the window cannot be closed after one.
+    window.pause_active_scan()
+    window.stop_active_scan()
+    check("Stop works on a paused scan", engine.stopped())
+    check("and releases its gate", engine.gate.stopped)
+    check("the button goes back to 'Pause'",
+          window.as_pause_btn.text(), "Pause")
+
+    # Now the real thing: a window closed with a live worker thread and a
+    # paused engine behind it. Nothing may be left running.
+    live = ScanEngine("https://127.0.0.1:9", auth=AuthConfig("none"))
+    window._as_engine = live
+    live.pause()
+    check("the engine is paused before the close", live.paused)
+
+    window._cb_active = True
+    window._cb_gate = RunGate()
+    window._cb_gate.pause()
+    check("and so is the Coffee Break gate", window._cb_gate.paused)
+
+    landed = []
+
+    class _Slow(QThread):
+        """Stands in for a probe thread blocked on a paused gate."""
+
+        def __init__(self, gate):
+            super().__init__()
+            self.gate = gate
+
+        def run(self):
+            # Exactly what a probe does: block until allowed to send.
+            if self.gate.wait():
+                landed.append("sent")
+            landed.append("finished")
+
+    worker = _Slow(window._cb_gate)
+    worker.start()
+    _t.sleep(0.3)
+    check("the probe thread is blocked, not sending",
+          landed, [])
+
+    closed_at = _t.time()
+    window.close()
+    took = _t.time() - closed_at
+
+    check("closing stops the Active Scan engine", live.stopped())
+    check("closing stops the Coffee Break gate", window._cb_gate.stopped)
+    check("the blocked probe was released", "finished" in landed)
+    check("and it did NOT send after the close was requested",
+          "sent" in landed, False)
+    worker.wait(3000)
+    check("the probe thread has ended", worker.isRunning(), False)
+    check("and the close did not hang", took < 10)
+    window._cb_active = False
 
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0

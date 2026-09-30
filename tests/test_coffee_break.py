@@ -18,11 +18,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+import time                                                  # noqa: E402
+from command_bridge.modules import cb_control                # noqa: E402
+from command_bridge.modules.cb_control import Stopped        # noqa: E402
 from command_bridge.modules import cb_evidence               # noqa: E402
 from command_bridge.modules import cb_issues                 # noqa: E402
 from command_bridge.modules.cb_evidence import Evidence      # noqa: E402
 from command_bridge.modules.coffee_break import (          # noqa: E402
     CBFinding, SEVERITIES, SEV_ORDER, CoffeeBreakMixin, finding_from_scan,
+    _session,
     probe_headers, probe_redirects, probe_traversal, probe_403_bypass,
     BYPASS_TRICKS, TRAVERSAL_PAYLOADS,
 )
@@ -61,7 +65,12 @@ class Handler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
+    #: Every request lands here, so a test can prove that pausing really
+    #: stops traffic instead of trusting a flag.
+    hits = []
+
     def do_GET(self):
+        Handler.hits.append(time.time())
         parsed = urllib.parse.urlparse(self.path)
         query = dict(urllib.parse.parse_qsl(parsed.query))
         path = parsed.path
@@ -126,6 +135,28 @@ class Engine(CoffeeBreakMixin):
 
     def sanitize_target_for_filename(self, value):
         return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
+
+    # The status bar and the command runner belong to the window. The stub
+    # records what it was told rather than pretending to be either, so the
+    # pause and stop paths can be exercised without one.
+    def set_status_state(self, state, tool=""):
+        self.states = getattr(self, "states", [])
+        self.states.append(state)
+
+    def update_status_bar(self, *args, **kwargs):
+        pass
+
+    @property
+    def runner(self):
+        engine = self
+
+        class _NoRunner:
+            process = type("P", (), {"processId": staticmethod(lambda: 0)})()
+
+            @staticmethod
+            def stop():
+                engine.stopped_runner = True
+        return _NoRunner()
 
     # The real window gets this from StatusMixin; the stub mirrors it so the
     # re-run behaviour can be tested.
@@ -1227,6 +1258,91 @@ def main():
         check("and spells out what is missing",
               "Injection point: NOT IDENTIFIED" in report_line
               and "Payload: NOT CAPTURED" in report_line)
+
+        # ─────────────────────────────────────────────────────────────────
+        #  Pause means stop touching the target
+        # ─────────────────────────────────────────────────────────────────
+        #
+        # Pause used to suspend the external tool and hold the chain, and
+        # that was all — the Python probes (headers, JavaScript, traversal,
+        # 403 bypass) carried on making requests to the client's server after
+        # the operator had pressed Pause and walked away. These hold the line
+        # that Pause stops ALL of it.
+
+        print("\n\033[1mPause stops the Python probes too\033[0m")
+        gate = cb_control.RunGate()
+        check("a fresh gate is running", gate.running)
+        check("and is not paused", gate.paused, False)
+        check("nor stopped", gate.stopped, False)
+
+        probe_session = _session({"gate": gate})
+        hits = Handler.hits
+        del hits[:]
+
+        stop_flag = {"go": True}
+        errors = []
+
+        def hammer():
+            try:
+                while stop_flag["go"]:
+                    probe_session.get(base + "/", timeout=5)
+            except Stopped:
+                pass                     # the stop working, not a failure
+            except Exception as exc:                    # noqa: BLE001
+                errors.append(exc)
+
+        worker = threading.Thread(target=hammer, daemon=True)
+        worker.start()
+        time.sleep(0.4)
+        while_running = len(hits)
+        check("requests flow while the gate is open", while_running > 0)
+
+        gate.pause()
+        time.sleep(0.3)                 # let anything in flight land
+        at_pause = len(hits)
+        time.sleep(1.0)
+        check("NOTHING is sent to the target while paused",
+              len(hits) - at_pause, 0)
+        check("and the gate says so", gate.paused)
+
+        gate.resume()
+        time.sleep(0.4)
+        check("and it picks up again on resume", len(hits) > at_pause)
+
+        # Stopping while paused must release the thread. Otherwise closing
+        # the window after a pause hangs waiting on a resume that is never
+        # coming — which is the whole reason stop() sets the resume event.
+        gate.pause()
+        time.sleep(0.2)
+        released = time.time()
+        gate.stop()
+        worker.join(timeout=5)
+        check("stopping while paused releases the worker",
+              worker.is_alive(), False)
+        check("and does so immediately", time.time() - released < 2.0)
+        check("with no exception escaping the probe", errors, [])
+        check("a stopped gate never blocks again", gate.wait(), False)
+        check("even though it is not 'paused'", gate.paused, False)
+        stop_flag["go"] = False
+        del Handler.hits[:]
+
+        print("\n\033[1mThe chain wires the gate to Pause and Stop\033[0m")
+        engine = Engine(base)
+        engine._cb_active = True
+        check("the engine has a gate", isinstance(engine._cb_gate,
+                                                  cb_control.RunGate))
+        check("which starts open", engine._cb_gate.running)
+        engine.pause_coffee_break()
+        check("pausing the chain closes it", engine._cb_gate.paused)
+        check("and the probe context carries that same gate",
+              engine._cb_worker_context()["gate"] is engine._cb_gate)
+        engine.pause_coffee_break()
+        check("resuming opens it again", engine._cb_gate.running)
+        engine.pause_coffee_break()
+        engine.stop_coffee_break()
+        check("stopping while paused stops the gate", engine._cb_gate.stopped)
+        check("and clears the paused flag", engine._cb_paused, False)
+        check("so nothing is left waiting", engine._cb_gate.wait(), False)
 
     finally:
         server.shutdown()
