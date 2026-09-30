@@ -34,6 +34,8 @@ def main():
     from PyQt6.QtWidgets import (
         QApplication, QPushButton, QLabel, QSplitter)
     from command_bridge.constants import TABS, RAIL_SECTIONS
+    from command_bridge.modules import cb_evidence
+    from command_bridge.ui import tabs_scan
     from command_bridge.ui.navigation import _TAB_BUILDERS, _SAFE_BUILD_ORDER
     from command_bridge.ui.window import CommandBridgeV5
 
@@ -165,6 +167,74 @@ def main():
     check("it starts empty", window.as_table.rowCount(), 0)
     check("the severity column is centred and roomy",
           window.as_table.columnWidth(0) > 80)
+
+    # ── the two findings screens are one screen ──────────────────────────
+    # Coffee Break and the Active Scan reach their findings by completely
+    # different routes, but what a reader needs from a finding is the same
+    # either way. These assert they have not been allowed to drift.
+    scan_splitter = window.as_table.parent()
+    while scan_splitter is not None and not isinstance(scan_splitter,
+                                                       QSplitter):
+        scan_splitter = scan_splitter.parent()
+    check("the Scan findings are laid out side by side too",
+          scan_splitter.orientation(), Qt.Orientation.Horizontal)
+    check("its detail pane starts wider than its list",
+          scan_splitter.sizes()[1] > scan_splitter.sizes()[0])
+    check("and is tall enough to read without dragging",
+          window.as_detail.minimumHeight() >= 320)
+    for column, name in ((2, "where"), (3, "parameter"), (4, "confidence")):
+        check(f"the Scan {name} column moves to the detail pane",
+              window.as_table.isColumnHidden(column), True)
+    check("both screens take their severity colours from one place",
+          tabs_scan.SEV_COLOURS is cb_evidence.SEV_COLOURS)
+
+    from command_bridge.modules.scanner import ScanFinding, Evidence as SEv
+    proved = ScanFinding(
+        issue="command_injection", where="https://t.example/ping",
+        point="host", confidence="confirmed",
+        evidence=[SEv(label="injected payload: 127.0.0.1;id",
+                      request="GET /ping?host=127.0.0.1%3Bid HTTP/1.1",
+                      response="HTTP/1.1 200 OK\n\nuid=33(www-data)",
+                      note="';id' returned uid=33(www-data); the baseline "
+                           "did not.")])
+    shared = window._as_shared(proved)
+    check("a scan result becomes the same kind of finding",
+          shared.__class__.__name__, "CBFinding")
+    check("it keeps the library's title", shared.title, "OS command injection")
+    check("and the library's CWE", shared.cwe, "CWE-78")
+    check("the scanner having reproduced it makes it CONFIRMED",
+          shared.state, cb_evidence.CONFIRMED)
+    check("its evidence carries the parameter", shared.proof.parameter, "host")
+    check("and the payload", shared.proof.payload, "127.0.0.1;id")
+    poc = shared.proof.poc()
+    check("so a PoC can be rendered from it", bool(poc))
+    check("naming the parameter", "host" in poc)
+    check("showing the payload", "127.0.0.1;id" in poc)
+    check("and the observed result", "uid=33(www-data)" in poc)
+    check("the PoC is not titled twice",
+          poc.lower().count("proof of concept"), 0)
+    detail = cb_evidence.detail_html(shared)
+    for section in ("Why this was detected", "Observed evidence",
+                    "Proof of concept", "Replay in Burp",
+                    "Recommended remediation"):
+        check(f"the Scan detail pane shows '{section}'", section in detail)
+    check("the caching is per finding, not shared",
+          window._as_shared(proved) is shared)
+
+    # A scanner result with nothing behind it must not read as proven, even
+    # though the scanner itself called it firm.
+    unproved = ScanFinding(issue="xss_reflected", where="https://t.example/s",
+                           point="q", confidence="firm", evidence=[])
+    weak = window._as_shared(unproved)
+    check("an unevidenced scan result is not confirmed",
+          weak.state != cb_evidence.CONFIRMED)
+    check("it asks for manual validation",
+          weak.validation.needs_manual_validation)
+    check("and no PoC is invented for it", weak.proof.poc(), "")
+    check("the Scan detail pane says so",
+          "PoC unavailable" in cb_evidence.detail_html(weak))
+    window._as_shared_cache.clear()
+
     check("every authentication method is offered",
           [window.as_auth_mode.itemData(i)
            for i in range(window.as_auth_mode.count())],
