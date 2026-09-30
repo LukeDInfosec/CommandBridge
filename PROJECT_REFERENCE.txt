@@ -19,6 +19,63 @@ HOW TO USE THIS FILE
  CHANGELOG (most recent first)
 ================================================================================
 
+## 2026-09-30 — ONE FINDINGS SCREEN, TWO TOOLS (6.4.0)
+
+The Active Scan tab now presents its findings exactly as Coffee Break does,
+from the same code. Coffee Break and the Active Scan reach their findings by
+completely different routes — one reads other people's tools, the other
+exploits things itself — but what a reader needs from a finding is the same
+either way, and writing that twice is how the two screens drift apart.
+
+MOVED INTO cb_evidence.py (the shared home; it has no Qt, so the scanner's
+own headless report writer can use it too):
+
+  * SEV_COLOURS and STATE_COLOURS — one palette, both screens. tabs_scan and
+    tabs_coffee now alias them rather than each keeping a copy.
+  * detail_html(finding) — the whole detail pane, lifted out of
+    tabs_coffee._cb_show_detail: state badge, both severities, the
+    classification-conflict warning, "why this was detected", the evidence
+    checklist, the PoC (or its absence), the Burp request, the
+    false-positive indicators, the next step, corroborating tools, other
+    affected locations, the generic description, RAW DETECTION, the
+    remediation, the CWE and the references. Both tabs call it.
+  * evidence_from_scan() / assess_scan() — the ScanFinding → Evidence
+    conversion, moved out of coffee_break.finding_from_scan() so that
+    scanner/report.py can build the same sections without importing Qt.
+    finding_from_scan() is now a thin wrapper that adds the library fields.
+  * Evidence.poc() no longer emits its own "Proof of Concept" title; every
+    caller prints its own heading and two of them were printing it twice.
+    render() adds the heading instead.
+
+tabs_scan.py
+
+  * The Findings splitter is Horizontal, sized [340, 860], not collapsible;
+    table min width 260, detail min width 320 and min height 360 — the same
+    numbers as Coffee Break.
+  * Where / Parameter / Confidence are hidden columns; all three appear in
+    the detail pane. The filter, the sort and the export still read them.
+  * Each ScanFinding gets a CBFinding built from it once and cached by id
+    (_as_shared / _as_shared_cache, cleared on reset), so the row and the
+    detail pane read the same validated object.
+  * The row shows the validator's confidence, puts the state in the tooltip,
+    and italicises anything still needing manual validation — so a scanner
+    result the scanner called "firm" but that carries no evidence cannot be
+    mistaken for one it actually reproduced.
+
+scanner/report.py — the Markdown report gained Status, the tool-assessed
+confidence next to the scanner's own, "Why this was detected", "Observed
+evidence", "Proof of concept", the false-positive indicators, any
+classification conflict, and renamed the old evidence block to "Raw
+detection". The verdict is computed once per finding and the heading carries
+the state.
+
+TESTS: 161 (GUI, +28 — the Scan splitter and hidden columns, the shared
+colour table, a ScanFinding converting to a CONFIRMED CBFinding with a real
+PoC, the per-finding cache, every section appearing in the Scan detail pane,
+and an unevidenced scan result that must not read as proven) / 268 (coffee
+break) / 104 (scanner) / 13 (chain).
+
+
 ## 2026-09-29 — FINDINGS SIDE BY SIDE, AND DIM TEXT YOU CAN SEE (6.3.1)
 
 TWO THINGS A SMALL LAPTOP SCREEN MADE OBVIOUS.
