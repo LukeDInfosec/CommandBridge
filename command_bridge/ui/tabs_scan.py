@@ -26,12 +26,11 @@ from PyQt6.QtWidgets import (
     QLineEdit, QCheckBox, QFileDialog, QMessageBox, QSizePolicy, QGroupBox,
 )
 
-from command_bridge.modules import cb_issues
+from command_bridge.modules import cb_evidence, cb_issues
+from command_bridge.modules.coffee_break import finding_from_scan
 
-SEV_COLOURS = {
-    "CRITICAL": "#ff3b5c", "HIGH": "#ff6b4a", "MEDIUM": "#f6b73c",
-    "LOW": "#4f8cff", "INFO": "#8b9bb4",
-}
+#: Shared with Coffee Break so the two findings screens cannot drift apart.
+SEV_COLOURS = cb_evidence.SEV_COLOURS
 SEV_RANK = {name: index for index, name in
             enumerate(("INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"))}
 
@@ -97,6 +96,8 @@ class ActiveScanTabMixin:
         self._as_engine = None
         self._as_result = None
         self._as_findings = []
+        #: ScanFinding id → the shared CBFinding built from it.
+        self._as_shared_cache = {}
         self._as_started = 0.0
         self._as_timer = QTimer(self)
         self._as_timer.setInterval(1000)
@@ -316,7 +317,10 @@ class ActiveScanTabMixin:
         controls.addWidget(self.as_count)
         box.addLayout(controls)
 
-        splitter = QSplitter(Qt.Orientation.Vertical)
+        # Side by side, exactly as Coffee Break lays it out: the list is an
+        # index, the evidence gets the height of the card. Stacked, the pane
+        # showing the PoC was a few lines tall on a laptop.
+        splitter = QSplitter(Qt.Orientation.Horizontal)
         self.as_table = QTableWidget(0, 5)
         self.as_table.setHorizontalHeaderLabels(
             ["Severity", "Finding", "Where", "Parameter", "Confidence"])
@@ -338,18 +342,26 @@ class ActiveScanTabMixin:
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
         self.as_table.setColumnWidth(4, 104)
+        # Where, parameter and confidence all appear in the detail pane, so
+        # in a narrow left-hand column they cost width and earn nothing.
+        for column in (2, 3, 4):
+            self.as_table.setColumnHidden(column, True)
         self.as_table.itemSelectionChanged.connect(self._as_show_detail)
         self.as_table.setMinimumHeight(260)
+        self.as_table.setMinimumWidth(260)
         splitter.addWidget(self.as_table)
 
         self.as_detail = QTextEdit()
         self.as_detail.setReadOnly(True)
-        self.as_detail.setMinimumHeight(200)
+        self.as_detail.setMinimumHeight(360)
+        self.as_detail.setMinimumWidth(320)
         self.as_detail.setPlaceholderText(
             "Select a finding to see the evidence that confirmed it.")
         splitter.addWidget(self.as_detail)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([340, 860])
+        splitter.setChildrenCollapsible(False)
         box.addWidget(splitter)
 
         card.layout().addLayout(box)
@@ -459,6 +471,7 @@ class ActiveScanTabMixin:
         self.as_table.setRowCount(0)
         self.as_detail.clear()
         self._as_findings = []
+        self._as_shared_cache = {}
         self._as_result = None
         self._as_started = time.time()
         self.as_progress.setValue(0)
@@ -562,11 +575,23 @@ class ActiveScanTabMixin:
         cell.setFont(font)
         cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        title = QTableWidgetItem(issue.get("title", finding.issue))
-        title.setToolTip(issue.get("title", finding.issue))
+        shared = self._as_shared(finding)
+        name = issue.get("title", finding.issue)
+        title = QTableWidgetItem(name)
+        state = getattr(shared, "state", "")
+        title.setToolTip(f"[{state}] {name}" if state else name)
+        # Same convention as Coffee Break: anything a human still has to
+        # confirm is italic, so it cannot be mistaken at a glance for
+        # something the scanner actually reproduced.
+        validation = getattr(shared, "validation", None)
+        if validation is not None and validation.needs_manual_validation:
+            unsettled = QtGui.QFont(title.font())
+            unsettled.setItalic(True)
+            title.setFont(unsettled)
         where = QTableWidgetItem(finding.where)
         where.setToolTip(finding.where)
-        confidence = QTableWidgetItem(finding.confidence)
+        confidence = QTableWidgetItem(getattr(shared, "confidence",
+                                              finding.confidence))
         confidence.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
         index = self._as_findings.index(finding)
@@ -608,31 +633,26 @@ class ActiveScanTabMixin:
         if index is None or index >= len(self._as_findings):
             return
         finding = self._as_findings[index]
-        issue = cb_issues.ISSUES.get(finding.issue, {})
-        severity = self._as_severity(finding)
-        colour = SEV_COLOURS.get(severity, "#8b9bb4")
-        html = [
-            f"<h3 style='margin:0 0 4px 0'>"
-            f"{_esc(issue.get('title', finding.issue))}</h3>",
-            f"<div style='color:{colour};font-weight:600'>{severity}"
-            f" &nbsp;·&nbsp; <span style='color:palette(mid);font-weight:400'>"
-            f"{_esc(finding.confidence)}"
-            + (f" · {issue['cwe']}" if issue.get("cwe") else "")
-            + "</span></div>",
-            f"<p><b>Where:</b> <code>{_esc(finding.where)}</code><br>"
-            f"<b>Parameter:</b> {_esc(finding.point)}</p>",
-        ]
-        if issue.get("detail"):
-            html.append(f"<p>{_esc(issue['detail'])}</p>")
-        if finding.detail_extra:
-            html.append(f"<p><b>How it was confirmed.</b> "
-                        f"{_esc(finding.detail_extra)}</p>")
-        if finding.evidence:
-            html.append("<p><b>Evidence</b></p><pre style='white-space:pre-wrap'>"
-                        f"{_esc(finding.evidence_text())}</pre>")
-        if issue.get("remediation"):
-            html.append(f"<p><b>Fix:</b> {_esc(issue['remediation'])}</p>")
-        self.as_detail.setHtml("".join(html))
+        # Rendered by the same function Coffee Break uses, from the same
+        # evidence objects, so a finding reads identically whichever tool
+        # produced it — state, rationale, observed evidence, PoC, Burp
+        # request, false-positive indicators, raw detection and all.
+        self.as_detail.setHtml(
+            cb_evidence.detail_html(self._as_shared(finding)))
+
+    def _as_shared(self, finding):
+        """The shared finding object for one of the scanner's results.
+
+        Built once and cached: the conversion carries the parameter, the
+        payload, the request, the response and the oracle's own note into an
+        evidence chain, and re-running the validator on every selection would
+        be wasted work.
+        """
+        cached = self._as_shared_cache.get(id(finding))
+        if cached is None:
+            cached = finding_from_scan(finding)
+            self._as_shared_cache[id(finding)] = cached
+        return cached
 
     # ── export ───────────────────────────────────────────────────────────
     def _as_export(self):
