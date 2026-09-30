@@ -355,34 +355,14 @@ def _finding_from(key, where, evidence="", stage="", proof=None, **override):
 def finding_from_scan(scan_finding, stage="active-scan"):
     """Turn one of the active scanner's results into a CBFinding.
 
-    The active scanner does not guess: by the time it emits a
-    :class:`~command_bridge.modules.scanner.model.ScanFinding` it has already
-    put a payload into a named insertion point and watched what came back.
-    That whole chain is carried across here — parameter, payload, request,
-    response, and the oracle's own words for what it saw — so the finding
-    that reaches the report can show its working, and the validator can check
-    it rather than take anyone's word for it.
+    The evidence chain itself is built by
+    :func:`cb_evidence.evidence_from_scan`, which the scanner's own report
+    writer also uses — it has to stay free of Qt, and this module is not.
+    What happens here is only the part that needs the library: the title,
+    the severity, the explanation and the fix.
     """
-    items = list(getattr(scan_finding, "evidence", []) or [])
-    first = items[0] if items else None
-    proof = Evidence(
-        url=getattr(scan_finding, "where", ""),
-        parameter=getattr(scan_finding, "point", ""),
-        detector=stage,
-        payload=getattr(first, "payload", "") if first else "",
-        request=getattr(first, "request", "") if first else "",
-        response=getattr(first, "response", "") if first else "",
-        comparison="\n\n".join(item.render() for item in items[1:])
-                   if len(items) > 1 else "",
-        observed=(getattr(first, "note", "") if first else "")
-                 or getattr(scan_finding, "detail_extra", ""),
-        raw=scan_finding.evidence_text()
-            if hasattr(scan_finding, "evidence_text") else "",
-    )
-    # The oracles put the payload in the rendered request rather than in a
-    # field of its own; recover it so the PoC can name it.
-    if not proof.payload and first is not None:
-        proof.payload = _payload_from(getattr(first, "label", ""))
+    proof = cb_evidence.evidence_from_scan(scan_finding)
+    proof.detector = stage
     finding = _finding_from(
         getattr(scan_finding, "issue", ""),
         getattr(scan_finding, "where", ""),
@@ -392,13 +372,6 @@ def finding_from_scan(scan_finding, stage="active-scan"):
     finding.revalidate(detector_confirmed=str(
         getattr(scan_finding, "confidence", "")).lower() == "confirmed")
     return finding
-
-
-def _payload_from(label):
-    """Pull the payload out of an oracle's evidence label, if it named one."""
-    match = re.search(r"payload[: ]+(.+)$", str(label or ""), re.I)
-    return match.group(1).strip() if match else ""
-
 #: Headers that say more about the server than the operator meant to.
 LEAKY_HEADERS = ("server", "x-powered-by", "x-aspnet-version",
                  "x-aspnetmvc-version", "x-generator", "x-drupal-cache",

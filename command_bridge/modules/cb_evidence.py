@@ -250,8 +250,9 @@ class Evidence:
         """
         if not (self.has_injection_point() and self.has_payload()):
             return ""
-        lines = ["Proof of Concept", ""]
-        lines.append("Endpoint:")
+        # No title line: every caller prints its own heading, and two of them
+        # were printing "Proof of concept" immediately above this one's.
+        lines = ["Endpoint:"]
         lines.append(f"  {self.url or self.endpoint or self.target}")
         if self.method:
             lines += ["", "Method:", f"  {self.method}"]
@@ -669,6 +670,202 @@ def evidence_checklist(key, evidence):
     return lines
 
 
+#: One colour per severity, picked to read on every theme in the app rather
+#: than to match any single one. Lives here because both findings screens
+#: draw from it and they must not drift apart.
+SEV_COLOURS = {
+    "CRITICAL": "#ff3b5c",
+    "HIGH": "#ff6b4a",
+    "MEDIUM": "#f6b73c",
+    "LOW": "#4f8cff",
+    "INFO": "#8b9bb4",
+}
+
+#: One colour per state, on the same principle.
+STATE_COLOURS = {
+    CONFIRMED: "#3fb950",
+    VALIDATED: "#58a6ff",
+    POTENTIAL: "#d29922",
+    DETECTED: "#8b9bb4",
+    INCONCLUSIVE: "#d29922",
+    FALSE_POSITIVE: "#6e7681",
+}
+
+
+def _esc(text):
+    """HTML-escape, the way both tabs need it."""
+    return (str(text or "").replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;"))
+
+
+def detail_html(finding):
+    """One finding, rendered for a detail pane.
+
+    Both findings screens call this. Coffee Break and the Active Scan reach
+    their findings by completely different routes — one reads other people's
+    tools, the other exploits things itself — but what a reader needs from a
+    finding is the same either way: what state it is in, why it was raised,
+    what was actually observed, how to reproduce it, and what might make it
+    wrong. Writing that twice is how the two screens drift apart, which is
+    what this exists to prevent.
+
+    ``finding`` is a CBFinding, or anything with the same shape.
+    """
+    severity = getattr(finding, "severity", "INFO")
+    colour = SEV_COLOURS.get(severity, "#8b9bb4")
+    state = getattr(finding, "state", "")
+    validation = getattr(finding, "validation", None)
+    proof = getattr(finding, "proof", None) or Evidence()
+    stage = getattr(finding, "stage", "")
+
+    html = [f"<h3 style='margin:0 0 4px 0'>"
+            f"{_esc(getattr(finding, 'title', ''))}</h3>"]
+    if state:
+        html.append(f"<div style='color:{STATE_COLOURS.get(state, '#8b9bb4')};"
+                    f"font-weight:700'>[{_esc(state)}]</div>")
+    html.append(
+        f"<div style='color:{colour};font-weight:600'>{_esc(severity)}"
+        f" &nbsp;·&nbsp; <span style='color:palette(mid);font-weight:400'>"
+        f"{_esc(stage)} · {_esc(getattr(finding, 'confidence', ''))} "
+        f"confidence</span></div>")
+    html.append(f"<p><b>Where:</b> "
+                f"<code>{_esc(getattr(finding, 'where', ''))}</code></p>")
+    if proof.parameter:
+        html.append(f"<p><b>Parameter:</b> <code>{_esc(proof.parameter)}</code>"
+                    + (f" [{_esc(proof.location)}]" if proof.location else "")
+                    + "</p>")
+
+    scanner_severity = getattr(finding, "scanner_severity", "")
+    if scanner_severity and scanner_severity != severity:
+        html.append(
+            f"<p><b>Severity:</b> {_esc(severity)} (tool-assessed) "
+            f"&nbsp;·&nbsp; {_esc(scanner_severity)} (reported by "
+            f"{_esc(stage)}). The scanner's rating is kept as metadata; it "
+            f"does not set ours.</p>")
+
+    if validation is not None:
+        if not validation.classification_consistent:
+            html.append(
+                "<p style='color:#d29922'><b>⚠ Classification / evidence "
+                "mismatch.</b> "
+                + "<br>".join(_esc(c) for c in validation.conflicts) + "</p>")
+        html.append("<p><b>Why this was detected</b><br>"
+                    + _esc(validation.rationale
+                           or "Detection rationale unavailable.") + "</p>")
+        checklist = evidence_checklist(getattr(finding, "key", ""), proof)
+        if checklist:
+            html.append("<p><b>Observed evidence</b></p>"
+                        "<pre style='white-space:pre-wrap'>"
+                        + _esc("\n".join(checklist)) + "</pre>")
+        html.append("<p><b>Proof of concept</b></p>"
+                    "<pre style='white-space:pre-wrap'>"
+                    + _esc("\n".join(poc_section(
+                        getattr(finding, "key", ""), proof))) + "</pre>")
+        burp = proof.burp_request()
+        if burp:
+            html.append("<p><b>Replay in Burp</b></p>"
+                        f"<pre style='white-space:pre-wrap'>{_esc(burp)}</pre>")
+        if validation.false_positive_indicators:
+            html.append("<p><b>Potential false-positive indicators</b></p><ul>"
+                        + "".join(f"<li>{_esc(i)}</li>"
+                                  for i in
+                                  validation.false_positive_indicators)
+                        + "</ul>")
+        if validation.action:
+            html.append(f"<p><b>Next step:</b> {_esc(validation.action)}</p>")
+
+    sources = [s for s in (getattr(finding, "sources", []) or [stage]) if s]
+    if len(sources) > 1:
+        html.append(
+            f"<p><b>Detected by {len(sources)} tools:</b> "
+            f"{_esc(', '.join(sources))} — independent agreement, which is "
+            f"why this is worth more than a single signature match.</p>")
+
+    instances = list(getattr(finding, "instances", []) or [])
+    if instances:
+        shown = "".join(f"<li><code>{_esc(u)}</code></li>"
+                        for u in instances[:30])
+        more = (f"<li>… and {len(instances) - 30} more</li>"
+                if len(instances) > 30 else "")
+        html.append(f"<p><b>Also affects {len(instances)} other "
+                    f"location(s)</b></p><ul>{shown}{more}</ul>")
+
+    detail = getattr(finding, "detail", "")
+    if detail:
+        html.append("".join(f"<p>{_esc(para)}</p>"
+                            for para in str(detail).split("\n\n")))
+
+    raw = proof.raw_detection()
+    if raw.strip() != "RAW DETECTION":
+        html.append("<p><b>Raw detection</b> — exactly what the tool "
+                    "reported, before interpretation</p>"
+                    f"<pre style='white-space:pre-wrap'>{_esc(raw)}</pre>")
+    elif getattr(finding, "evidence", ""):
+        html.append("<p><b>Evidence</b></p><pre style='white-space:pre-wrap'>"
+                    f"{_esc(finding.evidence)}</pre>")
+
+    if getattr(finding, "remediation", ""):
+        html.append(f"<p><b>Recommended remediation:</b> "
+                    f"{_esc(finding.remediation)}</p>")
+    if getattr(finding, "cwe", ""):
+        html.append(f"<p><b>Classification:</b> {_esc(finding.cwe)}</p>")
+    references = list(getattr(finding, "references", []) or [])
+    if references:
+        html.append("<p><b>References:</b> "
+                    + ", ".join(_esc(r) for r in references[:8]) + "</p>")
+    return "".join(html)
+
+
+def evidence_from_scan(scan_finding):
+    """The evidence chain behind one of the active scanner's results.
+
+    The scanner does not guess: by the time it emits a result it has put a
+    payload into a named insertion point and watched what came back. This
+    lifts that chain — parameter, payload, request, response, and the
+    oracle's own words for what it saw — into the same shape Coffee Break
+    uses, so the report, the detail pane and the validator can all read it
+    without caring which tool produced it.
+
+    Kept here rather than beside CBFinding because the scanner's own report
+    writer needs it and must stay free of Qt.
+    """
+    items = list(getattr(scan_finding, "evidence", []) or [])
+    first = items[0] if items else None
+    proof = Evidence(
+        url=getattr(scan_finding, "where", ""),
+        parameter=getattr(scan_finding, "point", ""),
+        detector="active-scan",
+        payload=getattr(first, "payload", "") if first else "",
+        request=getattr(first, "request", "") if first else "",
+        response=getattr(first, "response", "") if first else "",
+        comparison="\n\n".join(item.render() for item in items[1:])
+                   if len(items) > 1 else "",
+        observed=(getattr(first, "note", "") if first else "")
+                 or getattr(scan_finding, "detail_extra", ""),
+        raw=scan_finding.evidence_text()
+            if hasattr(scan_finding, "evidence_text") else "",
+    )
+    if not proof.payload and first is not None:
+        proof.payload = payload_from_label(getattr(first, "label", ""))
+    return proof
+
+
+def payload_from_label(label):
+    """Pull the payload out of an oracle's evidence label, if it named one."""
+    match = re.search(r"payload[: ]+(.+)$", str(label or ""), re.I)
+    return match.group(1).strip() if match else ""
+
+
+def assess_scan(scan_finding):
+    """``(evidence, validation)`` for one active-scan result."""
+    proof = evidence_from_scan(scan_finding)
+    validation = assess(
+        getattr(scan_finding, "issue", ""), proof,
+        detector_confirmed=str(
+            getattr(scan_finding, "confidence", "")).lower() == "confirmed")
+    return proof, validation
+
+
 def poc_section(key, evidence):
     """The proof-of-concept lines, or an honest statement that there are none.
 
@@ -738,7 +935,7 @@ def render(title, severity, key, evidence, validation, *,
         lines += [f"  - {item}"
                   for item in validation.false_positive_indicators]
 
-    lines += [""] + poc_section(key, evidence)
+    lines += ["", "Proof of concept:"] + poc_section(key, evidence)
 
     lines += ["", evidence.raw_detection()]
 
