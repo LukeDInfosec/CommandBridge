@@ -96,6 +96,7 @@ class ActiveScanTabMixin:
         self._as_engine = None
         self._as_result = None
         self._as_findings = []
+        self._as_paused = False
         #: ScanFinding id → the shared CBFinding built from it.
         self._as_shared_cache = {}
         self._as_started = 0.0
@@ -127,6 +128,18 @@ class ActiveScanTabMixin:
             QtGui.QCursor(Qt.CursorShape.PointingHandCursor))
         self.as_start_btn.clicked.connect(self.start_active_scan)
         row.addWidget(self.as_start_btn)
+
+        # Same control set as Coffee Break, in the same order.
+        self.as_pause_btn = QPushButton("Pause")
+        self.as_pause_btn.setObjectName("secondaryButton")
+        self.as_pause_btn.setMinimumHeight(42)
+        self.as_pause_btn.setEnabled(False)
+        self.as_pause_btn.setToolTip(
+            "Hold every worker at its next request. Nothing further is sent "
+            "to the target until you resume, and the scan picks up where it "
+            "left off.")
+        self.as_pause_btn.clicked.connect(self.pause_active_scan)
+        row.addWidget(self.as_pause_btn)
 
         self.as_stop_btn = QPushButton("Stop")
         self.as_stop_btn.setObjectName("secondaryButton")
@@ -464,8 +477,41 @@ class ActiveScanTabMixin:
 
     def stop_active_scan(self):
         if self._as_engine is not None:
+            # stop() also releases a pause, so a paused scan can be stopped
+            # without being resumed first.
             self._as_engine.stop()
+            self._as_paused = False
+            self.as_pause_btn.setText("Pause")
             self._as_log("[scan] stopping after the current step…")
+
+    def pause_active_scan(self):
+        """Hold the scan where it is, or let it go again.
+
+        Every request the scanner makes passes through the pacer, so this
+        holds the whole thread pool — crawl, parameter testing, stored-payload
+        sweep and all. Nothing further reaches the target until it is
+        resumed, and the scan continues from the same point rather than
+        starting the phase again.
+        """
+        if self._as_engine is None or self._as_thread is None:
+            return False
+        self._as_paused = self._as_engine.toggle_pause()
+        self.as_pause_btn.setText("Resume" if self._as_paused else "Pause")
+        if self._as_paused:
+            self._as_log("[scan] paused — nothing further will be sent to "
+                         "the target until you resume.")
+            self.as_progress.setFormat("paused")
+            try:
+                self.set_status_state("paused")
+            except Exception:                           # noqa: BLE001
+                pass
+        else:
+            self._as_log("[scan] resumed.")
+            try:
+                self.set_status_state("running", tool="Active Scan")
+            except Exception:                           # noqa: BLE001
+                pass
+        return self._as_paused
 
     def _as_reset(self, target, profile_name):
         self.as_table.setRowCount(0)
@@ -481,6 +527,9 @@ class ActiveScanTabMixin:
         self.as_count.setText("")
         self.as_start_btn.setEnabled(False)
         self.as_stop_btn.setEnabled(True)
+        self.as_pause_btn.setEnabled(True)
+        self.as_pause_btn.setText("Pause")
+        self._as_paused = False
         self._as_timer.start()
         try:
             self.goto_tab("scan")
@@ -514,6 +563,9 @@ class ActiveScanTabMixin:
         self._as_timer.stop()
         self.as_start_btn.setEnabled(True)
         self.as_stop_btn.setEnabled(False)
+        self.as_pause_btn.setEnabled(False)
+        self.as_pause_btn.setText("Pause")
+        self._as_paused = False
         if self._as_thread is not None:
             self._as_thread.quit()
             self._as_thread.wait(3000)

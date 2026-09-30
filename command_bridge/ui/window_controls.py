@@ -241,19 +241,43 @@ class WindowControlsMixin:
         return None
 
     def closeEvent(self, event):
-        """Save window geometry and clean up background helpers before closing"""
-        # Don't leave a scan orphaned: a running nmap/ffuf child would keep
-        # writing into the output directory after the window is gone, with no
-        # way left to stop it.
+        """Save window geometry and kill everything still running.
+
+        Closing the window has to mean the tool stops touching the target.
+        Anything still in flight at this point is a scan against someone
+        else's network with nobody watching it and no interface left to stop
+        it — so this tears down in a deliberate order and does not return
+        until it is done.
+
+        The order matters. The gates come down first, because they are what
+        releases threads that are blocked mid-request or held on a pause; a
+        thread waiting on a pause that will never be resumed would otherwise
+        hang the wait below. Only then are the child processes killed and the
+        threads joined.
+        """
+        # 1 ── tell every engine to stop, and release anything paused.
+        self._stop_everything()
+
+        # 2 ── the external tool. A SIGSTOP'd child cannot act on SIGTERM, so
+        # anything paused is continued first; otherwise terminate() is
+        # swallowed and the close stalls for the full timeout before the
+        # SIGKILL that was always going to be needed.
         try:
             runner = getattr(self, "runner", None)
             if runner is not None and runner.process.state() != QProcess.ProcessState.NotRunning:
+                self._resume_stopped_child(runner)
                 runner.process.terminate()
                 if not runner.process.waitForFinished(1500):
                     runner.process.kill()
                     runner.process.waitForFinished(500)
         except Exception:
             pass
+
+        # 3 ── the Python worker threads. Joined, not abandoned: a QThread
+        # destroyed while running takes the process down with it, and the
+        # requests it has in flight would otherwise land after the window has
+        # gone.
+        self._join_worker_threads()
 
         # Stop local CORS PoC server if running
         try:
@@ -273,6 +297,73 @@ class WindowControlsMixin:
 
         self.save_window_geometry()
         event.accept()
+
+    # ── shutdown ─────────────────────────────────────────────────────────
+    def _stop_everything(self):
+        """Stop every engine that could still be talking to the target.
+
+        Each step is wrapped on its own: a tab that failed to build, or an
+        engine that is halfway through its own teardown, must not stop the
+        others from being shut down.
+        """
+        # Coffee Break: ends the chain, releases the probe gate, and SIGCONTs
+        # a suspended child so the terminate below can be delivered.
+        try:
+            if getattr(self, "_cb_active", False):
+                self.stop_coffee_break()
+        except Exception:                               # noqa: BLE001
+            pass
+        try:
+            gate = getattr(self, "_cb_gate", None)
+            if gate is not None:
+                gate.stop()
+        except Exception:                               # noqa: BLE001
+            pass
+
+        # The Active Scan engine. stop() sets its flag and releases its gate,
+        # which is what wakes workers blocked on a pause.
+        try:
+            engine = getattr(self, "_as_engine", None)
+            if engine is not None:
+                engine.stop()
+        except Exception:                               # noqa: BLE001
+            pass
+
+    @staticmethod
+    def _resume_stopped_child(runner):
+        """SIGCONT a child that Pause left suspended, so it can be killed."""
+        try:
+            import os
+            import signal
+            pid = runner.process.processId()
+            if pid and hasattr(signal, "SIGCONT"):
+                os.kill(pid, signal.SIGCONT)
+        except Exception:                               # noqa: BLE001
+            pass
+
+    def _join_worker_threads(self):
+        """Wait for the background threads to unwind, then let them go.
+
+        The gates are already down by the time this runs, so a thread is at
+        most one in-flight HTTP request away from noticing. The timeout is
+        generous enough for that request to time out on its own and short
+        enough that closing the window never feels stuck; anything still
+        alive after it is left to the process exiting.
+        """
+        for name in ("_cb_thread", "_as_thread"):
+            thread = getattr(self, name, None)
+            if thread is None:
+                continue
+            try:
+                if thread.isRunning():
+                    thread.quit()
+                    thread.wait(4000)
+            except Exception:                           # noqa: BLE001
+                pass
+            try:
+                setattr(self, name, None)
+            except Exception:                           # noqa: BLE001
+                pass
 
     def save_window_geometry(self):
         """Save window position and size to config file"""
