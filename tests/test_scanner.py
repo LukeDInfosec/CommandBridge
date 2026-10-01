@@ -15,6 +15,7 @@ caught more mistakes during this build than the other one.
 """
 
 import json
+import tempfile
 import threading
 import re
 import sys
@@ -324,8 +325,18 @@ def main():
         profile.delay_seconds = 2
         profile.rate = 80
         started = time.time()
+        # Capture the live progress detail so it can be asserted against the
+        # scan that actually produced it.
+        progress_detail, progress_counts = [], []
+
+        def record_progress(phase, done, total, detail=None):
+            progress_counts.append((done, total))
+            if detail:
+                progress_detail.append(detail)
+
         engine = ScanEngine(base, auth=config, second_auth=second,
-                            profile=profile, scope=build_scope(base))
+                            profile=profile, scope=build_scope(base),
+                            on_progress=record_progress)
         result = engine.run()
         elapsed = time.time() - started
 
@@ -511,6 +522,110 @@ def main():
         # the tests passed while every genuine confirmed finding came out as
         # "POTENTIAL — Payload: NOT CAPTURED" with no PoC. A fixture tests
         # the assumption; this tests the data.
+        # ─────────────────────────────────────────────────────────────────
+        #  Authentication: the verdict must match reality
+        # ─────────────────────────────────────────────────────────────────
+        #
+        # The reported bug: correct credentials, a reachable verification
+        # URL, and the scan still said "Unauthenticated". Three causes, each
+        # pinned below.
+        print("\n\033[1mAuthentication is judged on evidence\033[0m")
+
+        profile_page = (
+            '<h1>My profile</h1><p>Welcome alice</p>'
+            '<h2>Change password</h2><form method="post">'
+            '<input type="password" name="new_password">'
+            '<input type="password" name="confirm">'
+            '<button>Update</button></form>'
+            '<a href="/logout">Sign out</a>')
+        login_page = ('<form method="post" action="/login">'
+                      '<input name="username">'
+                      '<input type="password" name="password">'
+                      '<button>Sign in</button></form>')
+
+        bare = Authenticator(AuthConfig("none"))
+        # CAUSE 1 — an account/profile page offers "change password", and a
+        # password input was being read as proof of a login page. That is
+        # the page people give as the verification URL.
+        check("a change-password form is NOT a logged-out page",
+              bare.judge(FakeResponse(profile_page))[0])
+        check("but a real login form is",
+              bare.judge(FakeResponse(login_page))[0], False)
+        check("and it says why",
+              "login form" in bare.judge(FakeResponse(login_page))[1])
+        check("'please log in' is still recognised",
+              bare.judge(FakeResponse("<p>Please log in to continue</p>"))[0],
+              False)
+        check("so is a 401", bare.judge(FakeResponse("ok", 401))[0], False)
+
+        # CAUSE 2 — an unfollowed redirect to the login page. Once requests
+        # has followed it the status is 200 and the clue is gone, so the
+        # check now looks before following.
+        redirecting = FakeResponse("", 302)
+        redirecting.headers = {"Location": "/login?next=/account"}
+        check("a redirect towards login is caught before it is followed",
+              bare.judge(redirecting)[0], False)
+
+        # CAUSE 3 — with no check_url, verification used to fall back to the
+        # LOGIN page, which can only ever answer "not logged in".
+        live = AuthConfig("form", login_url=base + "/login",
+                          username="alice", password="wonderland",
+                          check_url=base + "/dashboard", name="alice")
+        worked = Authenticator(live)
+        check("a correct form login is confirmed", worked.login())
+        check("the outcome state is 'ok'", worked.outcome.state, "ok")
+        check("the method is named for the tester",
+              worked.outcome.method, "Username/Password")
+        check("the indicator text is the one asked for",
+              worked.outcome.summary(), "Authentication Successful")
+        steps = "\n".join(worked.outcome.lines)
+        for expected in ("Authentication method:", "Login URL:",
+                         "Login response:", "Session established",
+                         "Verification URL:", "Verification:"):
+            check(f"the log records '{expected.rstrip(':')}'",
+                  expected in steps)
+        check("and NEVER the password",
+              "wonderland" not in steps and "wonderland" not in
+              str(worked.outcome.as_dict()))
+
+        unverifiable = Authenticator(AuthConfig(
+            "form", login_url=base + "/login", username="alice",
+            password="wonderland", name="alice"))
+        check("no verification URL is 'unverified', not 'successful'",
+              unverifiable.login() and unverifiable.outcome.state,
+              "unverified")
+        check("and says so plainly",
+              unverifiable.outcome.summary(), "Authentication Unverified")
+
+        rejected = Authenticator(AuthConfig(
+            "form", login_url=base + "/login", username="alice",
+            password="nonsense", check_url=base + "/dashboard", name="x"))
+        check("wrong credentials fail", rejected.login(), False)
+        check("the indicator says Failed",
+              rejected.outcome.summary(), "Authentication Failed")
+        check("and the reason is useful, not just 'unauthenticated'",
+              len(rejected.outcome.reason) > 20)
+
+        unreachable = Authenticator(AuthConfig(
+            "static", cookies={"sid": "nope"},
+            check_url="http://127.0.0.1:9/nothing", name="x"))
+        check("an unreachable verification URL fails", unreachable.login(),
+              False)
+        check("and says it could not be reached",
+              "could not be reached" in unreachable.outcome.reason)
+
+        # Cookie authentication must keep working, and reach the same states.
+        cookie_auth = Authenticator(AuthConfig(
+            "static", cookies=dict(worked.session.cookies),
+            check_url=base + "/dashboard", name="pasted"))
+        check("pasted cookies still authenticate", cookie_auth.login())
+        check("with the same 'ok' state", cookie_auth.outcome.state, "ok")
+        check("and are named as the method used",
+              cookie_auth.outcome.method, "Pasted cookies/headers")
+        empty_static = Authenticator(AuthConfig("static", name="x"))
+        check("static mode with nothing pasted fails",
+              empty_static.login(), False)
+
         print("\n\033[1mReal findings carry a replayable PoC\033[0m")
         confirmed_real = [f for f in result.findings
                           if f.confidence == "confirmed"]
@@ -558,6 +673,67 @@ def main():
         for part in ("Endpoint:", "Parameter:", "Test input:", "Request:",
                      "Response:", "Observation:"):
             check(f"the PoC has a '{part.rstrip(':')}' section", part in poc)
+
+        # ─────────────────────────────────────────────────────────────────
+        #  Progress, and the discovered-parameter list
+        # ─────────────────────────────────────────────────────────────────
+        print("\n\033[1mProgress reports the real operation\033[0m")
+        check("the scan reported live detail", len(progress_detail) > 0)
+        check("every entry names the URL being tested",
+              all(d.get("url") for d in progress_detail))
+        check("every entry names the parameter",
+              all(d.get("parameter") for d in progress_detail))
+        check("every entry names the check running",
+              all(d.get("check") for d in progress_detail))
+        reported_checks = {d["check"] for d in progress_detail}
+        check("several different checks were reported, not one label",
+              len(reported_checks) >= 3)
+        check("the names are the ones a tester uses",
+              "SQL injection" in reported_checks)
+        # The detail must come from the scan, not be invented: every URL
+        # reported must be one the crawl actually found.
+        crawled = set(result.discovered_parameters or {})
+        check("every reported URL was really discovered",
+              {d["url"] for d in progress_detail} <= crawled)
+        check("progress never exceeds the total",
+              all(0 <= d_done <= d_total
+                  for d_done, d_total in progress_counts))
+        check("and the running item is counted from one, not zero",
+              all(d_done >= 1 for d_done, _ in progress_counts
+                  if _ > 1))
+
+        print("\n\033[1mThe discovered-parameter file\033[0m")
+        out_dir = Path(tempfile.mkdtemp())
+        written = engine.write_parameter_file(out_dir)
+        check("it is written where the other output goes",
+              Path(written).parent, out_dir)
+        check("under the name asked for", Path(written).name,
+              "Active_Scan_Discovered_Parameters.txt")
+        check("and the result records the path", result.parameter_file,
+              written)
+        body = Path(written).read_text()
+        lines = [l for l in body.splitlines()
+                 if l and not l.startswith("#")]
+        check("it lists the parameterised URLs", len(lines) >= 5)
+        check("every line carries a method and a URL",
+              all(l.split()[0] in ("GET", "POST", "PUT", "PATCH")
+                  for l in lines))
+        check("parameter names are preserved", "[id]" in body)
+        check("so are example values", "item?id=1" in body)
+        check("body parameters are marked as such", "body:" in body)
+        check("there are no duplicates",
+              len(lines), len(set(lines)))
+        urls = [l.split()[1] for l in lines]
+        check("entries are in a stable order", urls, sorted(urls))
+        check("nothing the scan never saw is in it",
+              all(url in crawled for url in urls))
+        check("a URL with no parameters is left out",
+              not any(u.rstrip('/').endswith(base.rstrip('/')) for u in urls))
+
+        empty = ScanEngine(base, auth=AuthConfig("none"),
+                           profile=Profile.safe(), scope=build_scope(base))
+        check("a scan that found nothing writes no misleading file",
+              empty.write_parameter_file(out_dir), "")
 
         print("\n\033[1mPause and stop\033[0m")
         paused_profile = Profile.standard()

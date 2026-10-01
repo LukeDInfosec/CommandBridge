@@ -235,6 +235,67 @@ def main():
           "PoC unavailable" in cb_evidence.detail_html(weak))
     window._as_shared_cache.clear()
 
+    # ── the authentication indicator ─────────────────────────────────────
+    # It must show the state the SCAN is using, taken from the
+    # authenticator's own verdict — not from whether the username box has
+    # text in it.
+    from command_bridge.modules.scanner.session import AuthOutcome
+    check("the Scan tab has an authentication indicator",
+          hasattr(window, "as_auth_light"))
+    check("it starts as 'not configured'",
+          "not configured" in window.as_auth_light.text())
+
+    for state, expected in (("checking", "Checking authentication"),
+                            ("ok", "Authentication Successful"),
+                            ("unverified", "Authentication Unverified"),
+                            ("failed", "Authentication Failed")):
+        window._as_set_auth_state(state, reason="because", method="m")
+        check(f"'{state}' shows '{expected}'",
+              expected in window.as_auth_light.text())
+        check(f"and '{state}' is coloured",
+              "color:" in window.as_auth_light.styleSheet())
+    check("the reason goes in the tooltip, not the label",
+          "because" in window.as_auth_light.toolTip()
+          and "because" not in window.as_auth_light.text())
+
+    good = AuthOutcome("Username/Password").finish(True, "verified")
+    window._as_show_auth_outcome(good)
+    check("a real outcome drives the indicator",
+          "Successful" in window.as_auth_light.text())
+    bad = AuthOutcome("Username/Password").finish(
+        False, "the credentials were rejected")
+    window._as_show_auth_outcome(bad)
+    check("and a failure does too",
+          "Failed" in window.as_auth_light.text())
+    check("with the reason available on hover",
+          "rejected" in window.as_auth_light.toolTip())
+
+    # ── live progress detail ─────────────────────────────────────────────
+    check("the Scan tab has a detail line",
+          hasattr(window, "as_detail_line"))
+    window._as_on_progress("Testing parameters", 27, 268, {
+        "url": "https://example.com/book?BookingID=7",
+        "point": "query parameter 'BookingID'",
+        "parameter": "BookingID",
+        "check": "SQL injection"})
+    shown = window.as_detail_line.text()
+    for part in ("example.com/book?BookingID=7", "BookingID",
+                 "SQL injection"):
+        check(f"the detail line shows {part!r}", part in shown)
+    check("and the headline counts correctly",
+          "27 of 268" in window.as_phase.text())
+    window._as_on_progress("Testing parameters", 27, 268, {
+        "url": "https://example.com/book?BookingID=7",
+        "point": "query parameter 'BookingID'", "check": "Cross-site scripting"})
+    check("it updates to the next check on the same parameter",
+          "Cross-site scripting" in window.as_detail_line.text())
+    window._as_on_progress("Crawling", 0, 1, None)
+    check("and clears when there is no detail to show",
+          window.as_detail_line.text(), "")
+
+    check("there is a place to announce the parameter file",
+          hasattr(window, "as_param_file"))
+
     check("every authentication method is offered",
           [window.as_auth_mode.itemData(i)
            for i in range(window.as_auth_mode.count())],
