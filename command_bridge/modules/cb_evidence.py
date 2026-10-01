@@ -118,6 +118,12 @@ class Evidence:
 
     # ── the exchange ─────────────────────────────────────────────────────
     request: str = ""
+    #: The same request as a raw HTTP/1.1 message — request line, Host, every
+    #: header including the session cookies, a blank line, the body. This is
+    #: what pastes into Burp Repeater and comes back with the same response,
+    #: which is the difference between a proof of concept and a description
+    #: of one.
+    raw_request: str = ""
     response: str = ""
     status_code: object = None
     response_headers: dict = field(default_factory=dict)
@@ -302,10 +308,25 @@ class Evidence:
         return "\n".join(lines)
 
     def burp_request(self):
-        """§16 — the request in a form that pastes into Burp Repeater."""
-        if self.request:
-            return self.request.strip()
-        return ""
+        """§16 — the request in a form that pastes into Burp Repeater.
+
+        Returns the raw HTTP message when one was captured, and otherwise
+        nothing. The human-readable ``request`` summary is deliberately not
+        offered as a substitute: "GET http://host/path?id=1" is not a request
+        Burp will accept, and handing it to somebody under a button marked
+        "Copy Burp Request" wastes their time twice — once pasting it and
+        once working out why it did not work.
+        """
+        if not self.raw_request:
+            return ""
+        # Leading whitespace goes; trailing does not. The blank line at the
+        # end is what terminates the header block, and stripping it produces
+        # a request that looks right and that Repeater will not send.
+        raw = self.raw_request.lstrip()
+        return raw if "\r\n\r\n" in raw else raw.rstrip("\r\n") + "\r\n\r\n"
+
+    def has_burp_request(self):
+        return bool(self.raw_request and self.raw_request.strip())
 
 
 def _indent(text, width=2):
@@ -795,8 +816,12 @@ def detail_html(finding):
                         getattr(finding, "key", ""), proof))) + "</pre>")
         burp = proof.burp_request()
         if burp:
-            html.append("<p><b>Replay in Burp</b></p>"
-                        f"<pre style='white-space:pre-wrap'>{_esc(burp)}</pre>")
+            html.append(
+                "<p><b>Replay in Burp</b> — the complete request, exactly as "
+                "it was sent. Use the <b>Copy Burp Request</b> button below, "
+                "or select the block and paste it into Repeater.</p>"
+                "<pre style='white-space:pre-wrap;border-left:3px solid "
+                f"#3d7eff;padding-left:8px'>{_esc(burp)}</pre>")
         if validation.false_positive_indicators:
             html.append("<p><b>Potential false-positive indicators</b></p><ul>"
                         + "".join(f"<li>{_esc(i)}</li>"
@@ -848,6 +873,19 @@ def detail_html(finding):
     return "".join(html)
 
 
+def burp_request_for(finding):
+    """The raw HTTP request behind a finding, for the clipboard.
+
+    Takes a CBFinding or anything with a ``proof``. Returns "" when there is
+    nothing to copy, which is the UI's cue to disable the button rather than
+    put an empty clipboard in front of somebody about to paste.
+    """
+    proof = getattr(finding, "proof", None)
+    if proof is None:
+        return ""
+    return proof.burp_request()
+
+
 def evidence_from_scan(scan_finding):
     """The evidence chain behind one of the active scanner's results.
 
@@ -868,14 +906,26 @@ def evidence_from_scan(scan_finding):
     # did *not* do anything is actively misleading.
     lead = next((item for item in items if getattr(item, "decisive", False)),
                 items[0] if items else None)
-    payload = next((getattr(item, "payload", "") for item in items
-                    if getattr(item, "payload", "")), "")
+    # The payload named in the PoC must be the one in the request the PoC
+    # shows. Taking the first payload recorded anywhere in the chain reads
+    # fine until the lead step is a different request from the first — then
+    # the report prints one payload above a request containing another, and
+    # whoever tries to reproduce it gets a different result.
+    payload = (getattr(lead, "payload", "") if lead else "") or next(
+        (getattr(item, "payload", "") for item in items
+         if getattr(item, "payload", "")), "")
     proof = Evidence(
         url=getattr(scan_finding, "where", ""),
         parameter=getattr(scan_finding, "point", ""),
         detector="active-scan",
         payload=payload or payload_from_label(getattr(lead, "label", "")),
         request=getattr(lead, "request", "") if lead else "",
+        # Prefer the decisive step's wire form; fall back to any step that
+        # captured one, so a finding whose lead step never got a response
+        # still offers something that can be replayed.
+        raw_request=(getattr(lead, "raw_request", "") if lead else "")
+                    or next((getattr(item, "raw_request", "") for item in items
+                             if getattr(item, "raw_request", "")), ""),
         response=getattr(lead, "response", "") if lead else "",
         # Every step, in order, including the one chosen as the lead. A
         # multi-request proof is only a proof if the reader can see all of it.
