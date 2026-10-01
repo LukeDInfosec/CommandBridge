@@ -72,6 +72,11 @@ class Profile:
     #: Requests per second, across all threads.
     rate: float = 12.0
     timing_checks: bool = True
+    #: Report command injection that rests on a delay and nothing else.
+    #: Off by default: on a slow application these are mostly the application
+    #: being slow, and a report full of them costs more to validate than it
+    #: is worth. Execution-proved command injection is always reported.
+    report_timing_only: bool = False
     delay_seconds: int = 5
     use_browser: bool = True
     browser_crawl: bool = False
@@ -357,7 +362,15 @@ class ScanEngine:
         elif "access" in self.profile.checks and not self.stopped():
             anonymous = anonymous_identity(auth)
             anonymous.pace = self.pacer.wait
-            access = AccessControlCheck(anonymous, second)
+            access = AccessControlCheck(
+                anonymous, second,
+                # What the second account is relative to the first decides
+                # whether a shared response is an IDOR or a privilege
+                # escalation. The operator declares it; the scanner does not
+                # guess, because guessing it wrong mislabels every finding
+                # this check produces.
+                role=getattr(self.second_auth_config, "role", "same")
+                if self.second_auth_config else "same")
             total = max(1, len(requests))
             for index, request in enumerate(requests, 1):
                 if self.stopped():

@@ -177,7 +177,11 @@ class AuthConfig:
                           ["logout", "signout", "sign-out", "log-out",
                            "/exit", "deactivate", "delete-account"])
         self.name = options.get("name", "user")
-        self.role = options.get("role", "")      # 'low' / 'high' for IDOR work
+        #: For a second identity: what it is *relative to the first* — 'same'
+        #: (peer, so a shared record is an IDOR), 'lower' (so a shared record
+        #: is a privilege escalation) or 'higher' (the first account is the
+        #: unprivileged one and the test runs in the other direction).
+        self.role = options.get("role", "same")
 
     def as_dict(self):
         data = dict(self.__dict__)
