@@ -117,6 +117,135 @@ class Request:
         return text
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  The request as it went out on the wire
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# `describe()` above is for a human reading a report. This is for a tool. Burp
+# Repeater, ZAP and curl all accept a raw HTTP/1.1 message, and a tester who
+# can select one block and paste it has reproduced the finding in about four
+# seconds. Reconstructing it from the pieces is where this usually goes wrong —
+# the session cookie gets left off, the Content-Length disagrees with the body,
+# the payload gets double-encoded — so the preferred source is the
+# PreparedRequest that `requests` actually sent, which carries the session's
+# cookies and headers already merged in.
+
+#: Headers requests/urllib3 add for transport and which Burp will set itself.
+#: Leaving them in produces a request that is subtly wrong when replayed.
+_TRANSPORT_HEADERS = ("content-length", "transfer-encoding", "connection",
+                      "proxy-connection", "host")
+
+
+def origin_form(url):
+    """The request-target: path and query only, as it appears on the wire."""
+    parts = urllib.parse.urlparse(url)
+    target = parts.path or "/"
+    if parts.query:
+        target += "?" + parts.query
+    return target
+
+
+def raw_http(prepared, body_limit=8000):
+    """A ``requests`` PreparedRequest rendered as a raw HTTP/1.1 message.
+
+    This is the authoritative version: it is literally what went to the
+    server, session cookies and all, so what the tester pastes into Repeater
+    is the request that produced the finding rather than an approximation of
+    it.
+    """
+    if prepared is None:
+        return ""
+    host = urllib.parse.urlparse(prepared.url).netloc
+    lines = [f"{prepared.method} {origin_form(prepared.url)} HTTP/1.1",
+             f"Host: {host}"]
+    for name, value in (prepared.headers or {}).items():
+        if name.lower() in _TRANSPORT_HEADERS:
+            continue
+        lines.append(f"{name}: {value}")
+    body = prepared.body
+    if isinstance(body, bytes):
+        body = body.decode("utf-8", "replace")
+    if body:
+        # Content-Length is recomputed rather than copied: an edited body in
+        # Repeater needs a correct length, and a stale one is the single most
+        # common reason a pasted request comes back 400.
+        lines.append(f"Content-Length: {len(body.encode('utf-8', 'replace'))}")
+        lines.append("")
+        lines.append(body[:body_limit])
+    else:
+        # A request with no body still ends with the blank line that closes
+        # the header block. Without it Repeater shows the last header as
+        # unterminated and some servers hold the connection open.
+        lines.append("")
+        lines.append("")
+    return "\r\n".join(lines)
+
+
+def raw_http_from_request(request, auth=None, body_limit=8000):
+    """The same thing, built from a model Request when no response exists.
+
+    Used for the handful of steps that record a request they never got an
+    answer to. Cookies and default headers are read off the live session so
+    the block is still complete and still replayable.
+    """
+    if request is None:
+        return ""
+    headers = {}
+    session = getattr(auth, "session", None)
+    if session is not None:
+        for name, value in (session.headers or {}).items():
+            if value is not None and name.lower() not in _TRANSPORT_HEADERS:
+                headers[name] = value
+    headers.update(request.headers or {})
+    jar = []
+    if session is not None:
+        jar = [f"{c.name}={c.value}" for c in session.cookies]
+    if jar:
+        existing = headers.get("Cookie", "")
+        headers["Cookie"] = "; ".join(
+            ([existing] if existing else []) + jar)
+
+    body = ""
+    if request.json_body is not None:
+        body = json.dumps(request.json_body)
+        headers.setdefault("Content-Type", "application/json")
+    elif request.data is not None:
+        body = urllib.parse.urlencode(request.data)
+        headers.setdefault("Content-Type",
+                           "application/x-www-form-urlencoded")
+
+    host = urllib.parse.urlparse(request.url).netloc
+    lines = [f"{request.method} {origin_form(request.url)} HTTP/1.1",
+             f"Host: {host}"]
+    lines += [f"{name}: {value}" for name, value in headers.items()
+              if name.lower() not in _TRANSPORT_HEADERS]
+    if body:
+        lines.append(f"Content-Length: {len(body.encode('utf-8', 'replace'))}")
+        lines.append("")
+        lines.append(body[:body_limit])
+    else:
+        # A request with no body still ends with the blank line that closes
+        # the header block. Without it Repeater shows the last header as
+        # unterminated and some servers hold the connection open.
+        lines.append("")
+        lines.append("")
+    return "\r\n".join(lines)
+
+
+def wire(request, response=None, auth=None):
+    """The best raw request available for this exchange.
+
+    Prefers what was actually sent; falls back to a reconstruction. Never
+    returns a half-built request: if there is nothing to render it returns
+    "" and the caller says the PoC is unavailable rather than inventing one.
+    """
+    prepared = getattr(response, "request", None) if response is not None \
+        else None
+    if prepared is not None:
+        return raw_http(prepared)
+    return raw_http_from_request(request, auth)
+
+
 def json_points(node, prefix=""):
     """Every scalar inside a JSON document, as (dotted path, value)."""
     found = []
@@ -281,6 +410,10 @@ class Evidence:
     #: proves itself with a pair of requests, and the one worth putting at the
     #: top of a PoC is the one that came back *true*, not the control.
     decisive: bool = False
+    #: The same request as a raw HTTP/1.1 message, ready to paste into Burp
+    #: Repeater. Stored rather than derived at display time because by then
+    #: the live session — and its cookies — is gone.
+    raw_request: str = ""
 
     def render(self):
         parts = [f"── {self.label} " + "─" * max(0, 60 - len(self.label))]
@@ -312,6 +445,26 @@ class ScanFinding:
 
     def evidence_text(self):
         return "\n\n".join(item.render() for item in self.evidence)
+
+
+def step(label, request, response=None, *, auth=None, payload="",
+         decisive=False, note="", body_limit=400):
+    """One evidence step, with its wire form captured at the same moment.
+
+    Every check builds its evidence through this so that no finding can be
+    recorded without the raw request that produced it. That is what makes
+    "Copy Burp Request" always work rather than working for whichever checks
+    happened to remember.
+    """
+    return Evidence(
+        label=label,
+        payload=payload,
+        decisive=decisive,
+        note=note,
+        request=request.describe() if request is not None else "",
+        raw_request=wire(request, response, auth),
+        response=response_summary(response, body_limit)
+        if response is not None else "")
 
 
 def response_summary(response, body_limit=700):

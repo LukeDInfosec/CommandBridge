@@ -289,8 +289,22 @@ class Timing:
         if not (scaled and proportional):
             return None
 
+        # One more, at zero. An application that is slow in proportion to how
+        # much work a request asks for — a search, a report, an export — can
+        # pass both tests above without any injection at all. If asking for a
+        # zero-second sleep *also* takes several seconds, the delay was never
+        # ours. This is cheap and it removes the commonest false positive on
+        # a laggy application.
+        control_request = point.build(template.format(d=0), mode)
+        control_time, control_response = self.measure(control_request)
+        if control_response is not None and control_time > max(
+                ceiling, short * 0.5):
+            return None
+
         return {
             "confirmed": True,
+            "auth": self.auth,
+            "control_time": round(control_time, 2),
             # Named so a report can print what was sent, not just how long
             # it took.
             "short_payload": template.format(d=short),
@@ -334,6 +348,91 @@ DB_ERRORS = (
 COMMAND_ERRORS = re.compile(
     r"sh: \d+:|/bin/(ba)?sh:|command not found|Syntax error: |"
     r"'.*' is not recognized as an internal or external command", re.I)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Command output
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# The strongest proof of command injection is the command's own output coming
+# back in the response. It is also the only proof that makes a useful
+# screenshot: a report page showing `uid=0(root) gid=0(root)` or the contents
+# of /etc/passwd ends an argument, and a paragraph explaining that a request
+# took nine seconds instead of four does not.
+#
+# Timing is kept, but demoted. On a laggy application it is the single largest
+# source of false positives in this scanner, and a tester who has to re-verify
+# every one of them by hand is being given work rather than findings.
+#
+# Each signature is a pattern that effectively cannot appear in a normal
+# response by accident, paired with the command that produces it. Every match
+# is checked against the baseline body as well: an application whose own
+# documentation page contains `root:x:0:0` must not be reported because the
+# scanner found its own example text.
+
+#: (command, platform, description, pattern)
+COMMAND_SIGNATURES = (
+    ("id", "unix", "the output of `id`",
+     re.compile(r"uid=\d+\([^)]{1,32}\)\s+gid=\d+\([^)]{1,32}\)")),
+    ("whoami", "unix", "a username returned by `whoami`",
+     re.compile(r"(?m)^[a-z_][a-z0-9_-]{0,30}\$?$")),
+    ("cat /etc/passwd", "unix", "the contents of /etc/passwd",
+     re.compile(r"root:[x*!]?:0:0:")),
+    ("uname -a", "unix", "the output of `uname -a`",
+     re.compile(r"\b(Linux|Darwin|FreeBSD|SunOS)\b[^\n]{0,80}\b"
+                r"(GNU/Linux|x86_64|aarch64|arm64|amd64)\b")),
+    ("pwd", "unix", "an absolute path returned by `pwd`",
+     re.compile(r"(?m)^/(usr|var|home|opt|srv|app|tmp|root)(/[\w.-]+)*/?$")),
+    ("whoami", "windows", "a Windows account name",
+     re.compile(r"(?m)\bnt authority\\(system|network service|"
+                r"local service)\b|^[\w.-]{1,24}\\[\w.$-]{1,24}$", re.I)),
+    ("ver", "windows", "the output of `ver`",
+     re.compile(r"Microsoft Windows \[Version [\d.]+\]", re.I)),
+    ("type C:\\windows\\win.ini", "windows", "the contents of win.ini",
+     re.compile(r"\[fonts\]|for 16-bit app support", re.I)),
+    ("dir C:\\", "windows", "a Windows directory listing",
+     re.compile(r"Volume in drive [A-Z] |Directory of [A-Z]:\\", re.I)),
+)
+
+#: Signatures loose enough that they must never stand alone. `whoami` returning
+#: a bare word and `pwd` returning a path both match ordinary page text far too
+#: easily, so they corroborate and never confirm.
+WEAK_SIGNATURES = {"whoami", "pwd"}
+
+
+def command_output(body, baseline_body="", payload=""):
+    """Which command signatures are in this response and not in the baseline.
+
+    Returns ``[(command, platform, description, matched text)]``. A match that
+    is also present in the baseline is dropped — it was already on the page
+    before anything was sent, so the scanner did not cause it. A match that
+    is part of the payload being reflected is dropped for the same reason:
+    echoing a request is not executing it.
+    """
+    body = body or ""
+    baseline_body = baseline_body or ""
+    found = []
+    for command, platform, description, pattern in COMMAND_SIGNATURES:
+        match = pattern.search(body)
+        if not match:
+            continue
+        text = match.group(0).strip()
+        if not text:
+            continue
+        if text in baseline_body:
+            continue                    # the page already said this
+        if payload and text in payload:
+            continue                    # we are reading our own input back
+        found.append((command, platform, description, text[:200]))
+    return found
+
+
+def decisive_command_output(matches):
+    """The first match strong enough to confirm on its own, if there is one."""
+    for item in matches:
+        if item[0] not in WEAK_SIGNATURES:
+            return item
+    return None
 
 
 def database_error(text):
