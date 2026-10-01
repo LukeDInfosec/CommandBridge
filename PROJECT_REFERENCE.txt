@@ -19,6 +19,51 @@ HOW TO USE THIS FILE
  CHANGELOG (most recent first)
 ================================================================================
 
+## 2026-10-01 — THE POC NAMES THE PAYLOAD (6.5.1)
+
+FOUND BY RUNNING THE SCANNER FOR REAL. An authenticated scan of the test
+application confirms nine findings including the SQL injection — and every
+one of them rendered as "[POTENTIAL] ... Payload: NOT CAPTURED ... PoC
+unavailable". The scan was right; the evidence layer added in 6.4.0 was
+throwing the proof away.
+
+Two causes, both mine:
+
+  1. model.Evidence had no payload field. evidence_from_scan() recovered the
+     payload by regex from the human-written label (`payload[: ]+(.+)$`), and
+     the checks label their steps "Condition true — page returned as normal",
+     "Injected with ';'" and so on. It never matched. The 6.4.0 test passed
+     because its fixture was hand-written with the label "injected payload:
+     ;id" — it tested the assumption, not the data.
+  2. The lead evidence was items[0], which for a boolean SQL injection can be
+     the FALSE control. A PoC headed by the request that deliberately did
+     nothing is worse than no PoC.
+
+FIXED
+
+  * model.Evidence gains `payload` (what was sent) and `decisive` (the step
+    that demonstrates the issue). Set throughout checks/sqli.py,
+    checks/injection.py, checks/files.py and checks/xss.py; oracles now carry
+    the payloads out of the differential and timing results rather than
+    discarding them.
+  * evidence_from_scan() takes the payload from the first step that records
+    one, leads with the decisive step, and keeps EVERY step in `comparison`
+    so a multi-request proof can be read in full.
+  * payload_from_label() survives only as a last resort, with a comment
+    saying why it must not be relied on.
+  * Access control is proved by replaying one request as two identities, not
+    by sending a payload. It has its own entry in EVIDENCE_REQUIREMENTS
+    (observation + differential) and Evidence._differential_poc() renders a
+    reproduction for it. It was being marked unproven for lacking a payload
+    it was never going to have.
+
+TESTS: 139 (scanner, +18). The new block runs against the findings the engine
+ACTUALLY produced — every confirmed finding must name its payload, render a
+PoC and reach CONFIRMED — rather than against a fixture. That distinction is
+the lesson: a fixture tests the assumption, the real run tests the data.
+183 (GUI) / 288 (coffee break) / 13 (chain) unchanged.
+
+
 ## 2026-09-30 — PAUSE MEANS STOP, AND CLOSING MEANS STOP (6.5.0)
 
 AUDIT FIRST. Three gaps, two of them real:
