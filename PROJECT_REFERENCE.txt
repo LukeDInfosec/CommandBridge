@@ -19,6 +19,73 @@ HOW TO USE THIS FILE
  CHANGELOG (most recent first)
 ================================================================================
 
+## 2026-10-01 — THE SCAN SAYS WHAT IT IS DOING (6.6.0)
+
+AUTHENTICATION: WHY A GOOD LOGIN REPORTED "UNAUTHENTICATED". Reproduced
+against a server that behaves like a real application. Three separate causes,
+all in session.py:
+
+  1. LOGGED_OUT_SIGNS treated `<input type="password">` as proof of a login
+     page. Every account, profile and settings page in existence offers
+     "change your password" — and those are exactly the pages a tester gives
+     as the verification URL. A correct session on a reachable /my-profile
+     was being read as logged out.
+  2. verify_session() followed redirects. Once requests has followed a 302 to
+     the login page the status is 200 and the only surviving clue is the
+     body, so a redirect straight to /login looked like a healthy response.
+  3. verify_session() fell back to the LOGIN URL when no check_url was given.
+     Checking the login page for signs of being logged in can only ever
+     answer "no".
+  And separately: _login_form() never looked at the login response at all, so
+  rejected credentials proceeded silently and the failure surfaced much later
+  as a bare "unauthenticated".
+
+FIXED
+
+  * judge(response) -> (verdict, reason) replaces the old boolean heuristic,
+    weighing evidence in order of what it proves: an explicit signature,
+    401/403, an UNFOLLOWED redirect towards login, the final URL after
+    redirects being a login page, logged-out prose, and only then form shape.
+  * LOGIN_FORM_SHAPE matches a password field beside a username/email field
+    IN THE SAME FORM. A change-password form has no username field and no
+    longer counts. LOGGED_IN_SIGNS carry positive evidence.
+  * check_session() never falls back to the login URL, requests without
+    following first so a 302 is visible as a 302, and returns the reason.
+  * _login_form() inspects the login response: rejected credentials and
+    landing back on the login page are both caught at the point they happen.
+  * AuthOutcome records every step, the method, the verdict and the reason.
+    Three states, not two — 'ok', 'failed', and 'unverified' for when no
+    verification URL was supplied, because claiming success for something
+    nothing checked is the habit that caused this.
+  * [AUTH] logging throughout. Passwords are never written: as_dict() masks
+    them and no step line carries credential material.
+
+UI (tabs_scan.py)
+
+  * An authentication indicator beside Save report, driven by the
+    authenticator's own verdict via a new on_auth callback that fires as soon
+    as login resolves — not by whether the username box has text in it.
+    Amber while checking, green Successful, amber Unverified, red Failed,
+    with the reason on hover.
+  * Progress carries live detail: the URL, the parameter and the check
+    currently running, announced by _announce_check() as each check STARTS.
+    The count reads as "27 of 268" while the 27th is being tested.
+  * Discovered Parameters label with a click-to-open link.
+
+Active_Scan_Discovered_Parameters.txt — written by the engine into the
+output directory when a scan finishes, from the requests and insertion points
+the scan actually used, so it cannot contain a URL the crawl never reached.
+Methods, parameter names and example values preserved, de-duplicated, sorted,
+split into tested and found-but-not-tested. Nothing written when nothing was
+found. The Markdown report names the file and now carries the authentication
+method and reason instead of a bare yes/no.
+
+TESTS: 189 (scanner, +50) / 205 (GUI, +22) / 288 (coffee break) / 13 (chain).
+The authentication block pins each of the three causes with the page shapes
+that triggered them, asserts no password reaches the log, and covers pasted
+cookies reaching the same states.
+
+
 ## 2026-10-01 — THE POC NAMES THE PAYLOAD (6.5.1)
 
 FOUND BY RUNNING THE SCANNER FOR REAL. An authenticated scan of the test
