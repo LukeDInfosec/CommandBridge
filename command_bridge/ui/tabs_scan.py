@@ -19,6 +19,7 @@ import urllib.parse
 
 from PyQt6 import QtCore, QtGui
 from PyQt6.QtCore import Qt, QObject, QThread, QTimer, pyqtSignal
+from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
     QFrame, QScrollArea, QProgressBar, QTableWidget, QTableWidgetItem,
@@ -311,10 +312,39 @@ class ActiveScanTabMixin:
         second.addWidget(self.as_username2, 0, 1)
         second.addWidget(QLabel("Password"), 0, 2)
         second.addWidget(self.as_password2, 0, 3)
-        self._as_second_widgets = [self.as_username2, self.as_password2]
+
+        # Which test this is depends entirely on what the second account is,
+        # and the scanner cannot work it out: the same observation — account
+        # B saw account A's page — is a data leak between peers and a
+        # privilege escalation between levels. So it is declared here, and
+        # the explanation sits underneath rather than in a tooltip, because
+        # getting it wrong mislabels every finding the check produces.
+        self.as_second_role = QComboBox()
+        for label, value in (
+                ("Same level as the first account — tests for IDOR",
+                 "same"),
+                ("Lower privilege than the first — tests for privilege "
+                 "escalation", "lower"),
+                ("Higher privilege than the first — tests the first account "
+                 "for escalation", "higher")):
+            self.as_second_role.addItem(label, value)
+        self.as_second_role.currentIndexChanged.connect(self._as_role_help)
+        second.addWidget(QLabel("Second account is"), 1, 0)
+        second.addWidget(self.as_second_role, 1, 1, 1, 3)
+
+        self._as_second_widgets = [self.as_username2, self.as_password2,
+                                   self.as_second_role]
         for widget in self._as_second_widgets:
             widget.setEnabled(False)
         box.addLayout(second)
+
+        self.as_role_help = QLabel("")
+        self.as_role_help.setWordWrap(True)
+        self.as_role_help.setTextFormat(Qt.TextFormat.RichText)
+        self.as_role_help.setStyleSheet(
+            "color: palette(mid); padding: 6px 2px 2px 2px;")
+        box.addWidget(self.as_role_help)
+        self._as_role_help()
 
         card.layout().addLayout(box)
         self._as_auth_mode()
@@ -350,6 +380,21 @@ class ActiveScanTabMixin:
         grid.addWidget(self.as_subdomains, 2, 0, 1, 2)
         grid.addWidget(self.as_browser, 2, 2, 1, 2)
         grid.addWidget(self.as_browser_crawl, 3, 0, 1, 2)
+
+        self.as_timing_only = QCheckBox(
+            "Report time-based-only command injection")
+        self.as_timing_only.setToolTip(
+            "Off by default. Command injection is proved by running `id`, "
+            "`whoami`, `uname -a` and `cat /etc/passwd` and finding the "
+            "output in the response — that is always reported and is what "
+            "makes a usable screenshot.\n\n"
+            "This switch is about the other case: a payload asking the "
+            "server to sleep, where the delay scaled but no command output "
+            "came back. On an application that is slow, or slow in "
+            "proportion to the work a request asks for, that pattern occurs "
+            "without any injection, so these are reported as POTENTIAL and "
+            "need validating by hand.")
+        grid.addWidget(self.as_timing_only, 3, 2, 1, 2)
 
         card.layout().addLayout(grid)
         return card
@@ -413,7 +458,26 @@ class ActiveScanTabMixin:
         self.as_detail.setMinimumWidth(320)
         self.as_detail.setPlaceholderText(
             "Select a finding to see the evidence that confirmed it.")
-        splitter.addWidget(self.as_detail)
+
+        # The detail pane and its one action, kept together so the button is
+        # beside what it copies rather than in a toolbar at the top of the
+        # tab where it reads as applying to the whole scan.
+        right = QWidget()
+        right_box = QVBoxLayout(right)
+        right_box.setContentsMargins(0, 0, 0, 0)
+        right_box.setSpacing(6)
+        right_box.addWidget(self.as_detail)
+        self.as_burp_btn = QPushButton("Copy Burp Request")
+        self.as_burp_btn.setObjectName("secondaryButton")
+        self.as_burp_btn.setToolTip(
+            "Copies the complete request — request line, Host, every header "
+            "including the session cookies, and the body — as raw HTTP/1.1. "
+            "Paste straight into Burp Repeater.")
+        self.as_burp_btn.setEnabled(False)
+        self.as_burp_btn.clicked.connect(self._as_copy_burp)
+        right_box.addWidget(self.as_burp_btn,
+                            alignment=Qt.AlignmentFlag.AlignLeft)
+        splitter.addWidget(right)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([340, 860])
@@ -440,6 +504,62 @@ class ActiveScanTabMixin:
     def _as_second_toggle(self):
         for widget in self._as_second_widgets:
             widget.setEnabled(self.as_second_user.isChecked())
+        self._as_role_help()
+
+    #: What each role means, what to put in the boxes, and what the scanner
+    #: will do with it. Written out in full because "second account" on its
+    #: own leaves the tester guessing which way round to enter the two logins,
+    #: and the two orders produce different findings.
+    _ROLE_HELP = {
+        "same": (
+            "<b>Horizontal — Insecure Direct Object Reference (IDOR).</b> "
+            "Both accounts are ordinary users of equal standing: two "
+            "customers, two staff members on the same team. Put either one "
+            "above and the other here.<br><br>"
+            "The scanner crawls as the first account, then replays every "
+            "request that names a record — <code>?id=</code>, "
+            "<code>/invoice/4471</code>, <code>account_id</code> — as the "
+            "second. It reports only when the second account gets the same "
+            "record <i>and</i> that response still contains something "
+            "belonging to the first (their username or email address), so a "
+            "dashboard both users are meant to see is not reported."),
+        "lower": (
+            "<b>Vertical — privilege escalation.</b> The account above is "
+            "the privileged one (admin, manager, support); the account here "
+            "is the restricted one (standard user, read-only, customer). "
+            "<b>Enter the admin above and the low-privileged user here.</b>"
+            "<br><br>"
+            "The scanner crawls as the privileged account — so it reaches "
+            "the administrative pages — then replays each of those requests "
+            "as the restricted account. Anything the restricted account gets "
+            "back unchanged is a broken access control: authentication is "
+            "enforced, authorisation is not. Hits on administrative paths "
+            "(<code>/admin</code>, <code>/manage</code>, "
+            "<code>/users/…/roles</code>, <code>/billing</code>) are raised "
+            "as CRITICAL; the rest as HIGH."),
+        "higher": (
+            "<b>Vertical — privilege escalation, reversed.</b> Use this when "
+            "the account above is "
+            "the restricted one and the account here is the admin. The "
+            "scanner swaps the direction automatically: the privileged "
+            "response is taken from <i>this</i> account and replayed as the "
+            "first one.<br><br>"
+            "Prefer the option above where you can — the scan crawls as the "
+            "first account, so entering the admin first discovers more "
+            "privileged endpoints to test. Use this one when the first "
+            "account is fixed for another reason."),
+    }
+
+    def _as_role_help(self):
+        if not self.as_second_user.isChecked():
+            self.as_role_help.setText(
+                "<i>Tick the box above to test for IDOR and privilege "
+                "escalation. These need two logins and cannot be done with "
+                "one; they are also where the worst findings usually "
+                "are.</i>")
+            return
+        self.as_role_help.setText(
+            self._ROLE_HELP.get(self.as_second_role.currentData(), ""))
 
     # ── running ──────────────────────────────────────────────────────────
     def start_active_scan(self):
@@ -490,11 +610,13 @@ class ActiveScanTabMixin:
                 password=self.as_password2.text(),
                 check_url=self.as_check_url.text().strip(),
                 logged_in_signature=self.as_signature.text().strip(),
+                role=self.as_second_role.currentData(),
                 name=self.as_username2.text().strip() or "second user")
 
         profile = PROFILES[self.as_profile.currentData()]()
         profile.use_browser = self.as_browser.isChecked()
         profile.browser_crawl = self.as_browser_crawl.isChecked()
+        profile.report_timing_only = self.as_timing_only.isChecked()
 
         target = self.target
         if not target.startswith(("http://", "https://")):
@@ -849,8 +971,23 @@ class ActiveScanTabMixin:
         # evidence objects, so a finding reads identically whichever tool
         # produced it — state, rationale, observed evidence, PoC, Burp
         # request, false-positive indicators, raw detection and all.
-        self.as_detail.setHtml(
-            cb_evidence.detail_html(self._as_shared(finding)))
+        shared = self._as_shared(finding)
+        self.as_detail.setHtml(cb_evidence.detail_html(shared))
+        self._as_burp = cb_evidence.burp_request_for(shared)
+        self.as_burp_btn.setEnabled(bool(self._as_burp))
+        self.as_burp_btn.setText(
+            "Copy Burp Request" if self._as_burp
+            else "No request captured for this finding")
+
+    def _as_copy_burp(self):
+        if not getattr(self, "_as_burp", ""):
+            return
+        QGuiApplication.clipboard().setText(self._as_burp)
+        # Confirm in the button itself rather than a dialog: a dialog here
+        # costs a click on something the tester is about to do thirty times.
+        self.as_burp_btn.setText("Copied — paste into Repeater")
+        QTimer.singleShot(
+            2000, lambda: self.as_burp_btn.setText("Copy Burp Request"))
 
     def _as_shared(self, finding):
         """The shared finding object for one of the scanner's results.

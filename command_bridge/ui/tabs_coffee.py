@@ -423,7 +423,23 @@ class CoffeeBreakTabMixin:
         self.cb_detail.setMinimumWidth(320)
         self.cb_detail.setPlaceholderText(
             "Select a finding to see what it means, the evidence, and the fix.")
-        splitter.addWidget(self.cb_detail)
+
+        right = QWidget()
+        right_box = QVBoxLayout(right)
+        right_box.setContentsMargins(0, 0, 0, 0)
+        right_box.setSpacing(6)
+        right_box.addWidget(self.cb_detail)
+        self.cb_burp_btn = QPushButton("Copy Burp Request")
+        self.cb_burp_btn.setObjectName("secondaryButton")
+        self.cb_burp_btn.setToolTip(
+            "Copies the complete request as raw HTTP/1.1 — request line, "
+            "Host, every header including session cookies, and the body. "
+            "Paste straight into Burp Repeater.")
+        self.cb_burp_btn.setEnabled(False)
+        self.cb_burp_btn.clicked.connect(self._cb_copy_burp)
+        right_box.addWidget(self.cb_burp_btn,
+                            alignment=Qt.AlignmentFlag.AlignLeft)
+        splitter.addWidget(right)
         # The list is a fixed-ish index; the evidence takes the rest.
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
@@ -693,6 +709,19 @@ class CoffeeBreakTabMixin:
         # The Active Scan tab renders its findings with this same
         # function. Two screens, one description of what a finding is.
         self.cb_detail.setHtml(cb_evidence.detail_html(finding))
+        self._cb_burp = cb_evidence.burp_request_for(finding)
+        self.cb_burp_btn.setEnabled(bool(self._cb_burp))
+        self.cb_burp_btn.setText(
+            "Copy Burp Request" if self._cb_burp
+            else "No request captured for this finding")
+
+    def _cb_copy_burp(self):
+        if not getattr(self, "_cb_burp", ""):
+            return
+        QApplication.clipboard().setText(self._cb_burp)
+        self.cb_burp_btn.setText("Copied — paste into Repeater")
+        QTimer.singleShot(
+            2000, lambda: self.cb_burp_btn.setText("Copy Burp Request"))
 
     # ── right-click ──────────────────────────────────────────────────────
     def _cb_finding_at(self, row):
