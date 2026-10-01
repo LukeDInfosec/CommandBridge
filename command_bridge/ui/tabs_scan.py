@@ -17,7 +17,7 @@ from __future__ import annotations
 import time
 import urllib.parse
 
-from PyQt6 import QtGui
+from PyQt6 import QtCore, QtGui
 from PyQt6.QtCore import Qt, QObject, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
@@ -27,6 +27,7 @@ from PyQt6.QtWidgets import (
 )
 
 from command_bridge.modules import cb_evidence, cb_issues
+from command_bridge.modules.scanner.engine import PARAMETER_FILENAME
 from command_bridge.modules.coffee_break import finding_from_scan
 
 #: Shared with Coffee Break so the two findings screens cannot drift apart.
@@ -50,8 +51,12 @@ class _ScanWorker(QObject):
     """Runs one scan off the interface thread."""
 
     log = pyqtSignal(str)
-    progress = pyqtSignal(str, int, int)
+    #: phase, done, total, detail — the detail says which URL, which
+    #: parameter and which check, so the tester sees the actual operation
+    #: rather than a bare number.
+    progress = pyqtSignal(str, int, int, object)
     finding = pyqtSignal(object)
+    auth = pyqtSignal(object)
     finished = pyqtSignal(object, str)
 
     def __init__(self, engine):
@@ -61,8 +66,11 @@ class _ScanWorker(QObject):
     def run(self):
         try:
             self.engine.on_log = self.log.emit
-            self.engine.on_progress = self.progress.emit
+            self.engine.on_progress = (
+                lambda phase, done, total, detail=None:
+                self.progress.emit(phase, done, total, detail))
             self.engine.on_finding = self.finding.emit
+            self.engine.on_auth = self.auth.emit
             result = self.engine.run()
             self.finished.emit(result, "")
         except Exception as exc:                        # noqa: BLE001
@@ -154,6 +162,19 @@ class ActiveScanTabMixin:
         self.as_export_btn.setMinimumHeight(42)
         self.as_export_btn.clicked.connect(self._as_export)
         row.addWidget(self.as_export_btn)
+
+        # The authentication indicator sits beside Save report, because the
+        # question "was this scan actually logged in?" decides whether the
+        # report means anything. It shows the state the SCAN is using, taken
+        # from the authenticator's own verdict — not from whether the
+        # username box has text in it.
+        self.as_auth_light = QLabel("")
+        self.as_auth_light.setObjectName("authIndicator")
+        self.as_auth_light.setMinimumHeight(42)
+        self.as_auth_light.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        row.addWidget(self.as_auth_light)
+        self._as_set_auth_state(None)
         box.addLayout(row)
 
         self.as_progress = QProgressBar()
@@ -172,6 +193,28 @@ class ActiveScanTabMixin:
         self.as_elapsed.setStyleSheet("color: palette(mid);")
         status.addWidget(self.as_elapsed)
         box.addLayout(status)
+
+        # What is being tested right now: the URL, the parameter and the
+        # check. Filled from the engine's live state.
+        self.as_detail_line = QLabel("")
+        self.as_detail_line.setTextFormat(Qt.TextFormat.RichText)
+        self.as_detail_line.setWordWrap(True)
+        self.as_detail_line.setStyleSheet(
+            "font-size: 11.5px; font-family: ui-monospace, Menlo, Consolas, "
+            "monospace;")
+        self.as_detail_line.setMinimumHeight(32)
+        box.addWidget(self.as_detail_line)
+
+        # Where the discovered-parameter list ended up.
+        self.as_param_file = QLabel("")
+        self.as_param_file.setTextFormat(Qt.TextFormat.RichText)
+        self.as_param_file.setStyleSheet(
+            "color: palette(mid); font-size: 11.5px;")
+        self.as_param_file.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextBrowserInteraction)
+        self.as_param_file.setOpenExternalLinks(False)
+        self.as_param_file.linkActivated.connect(self._as_open_param_file)
+        box.addWidget(self.as_param_file)
 
         self.as_tally = QLabel("")
         self.as_tally.setStyleSheet("font-size: 12px;")
@@ -472,6 +515,7 @@ class ActiveScanTabMixin:
         self._as_worker.log.connect(self._as_log)
         self._as_worker.progress.connect(self._as_on_progress)
         self._as_worker.finding.connect(self._as_on_finding)
+        self._as_worker.auth.connect(self._as_show_auth_outcome)
         self._as_worker.finished.connect(self._as_on_finished)
         self._as_thread.start()
 
@@ -483,6 +527,92 @@ class ActiveScanTabMixin:
             self._as_paused = False
             self.as_pause_btn.setText("Pause")
             self._as_log("[scan] stopping after the current step…")
+
+    # ── discovered parameters ────────────────────────────────────────────
+    def _as_write_parameter_file(self, result):
+        """Drop the discovered-parameter list beside the other scan output.
+
+        Written by the engine, which is the only thing that knows what the
+        crawl actually reached, so the file cannot contain a URL the scan
+        never saw.
+        """
+        engine = self._as_engine
+        if engine is None or result is None:
+            return ""
+        try:
+            path = engine.write_parameter_file(self.output_dir)
+        except Exception as exc:                        # noqa: BLE001
+            self._as_log(f"[scan] could not write the parameter list: {exc}")
+            return ""
+        if not path:
+            self.as_param_file.setText(
+                "<i>No parameterised URLs were discovered.</i>")
+            return ""
+        count = len(getattr(result, "discovered_parameters", {}) or {})
+        self.as_param_file.setText(
+            f"Discovered Parameters: "
+            f"<a href='open'>{_esc(PARAMETER_FILENAME)}</a> "
+            f"— {count} parameterised URL(s)")
+        self.as_param_file.setToolTip(path)
+        return path
+
+    def _as_open_param_file(self, _link=""):
+        """Open the parameter list with whatever the desktop uses for .txt."""
+        path = self.as_param_file.toolTip()
+        if not path:
+            return
+        try:
+            QtGui.QDesktopServices.openUrl(
+                QtCore.QUrl.fromLocalFile(str(path)))
+        except Exception:                               # noqa: BLE001
+            self.show_themed_message(
+                "Discovered parameters",
+                f"The list is at:\n\n{path}",
+                QMessageBox.Icon.Information)
+
+    # ── authentication indicator ─────────────────────────────────────────
+    #: state → (text, background, foreground). One place, so the colours and
+    #: the words cannot drift apart.
+    _AUTH_STYLES = {
+        None:          ("Auth: not configured", "transparent", "#8b9bb4"),
+        "none":        ("Unauthenticated scan", "transparent", "#8b9bb4"),
+        "checking":    ("Checking authentication…", "#3a2f10", "#f6b73c"),
+        "ok":          ("Authentication Successful", "#102a16", "#3fb950"),
+        "unverified":  ("Authentication Unverified", "#3a2f10", "#f6b73c"),
+        "failed":      ("Authentication Failed", "#2e1115", "#ff3b5c"),
+    }
+
+    def _as_set_auth_state(self, state, reason="", method=""):
+        """Show the authentication state the scan is actually using.
+
+        ``state`` is one of the keys above, or None before anything has been
+        attempted. The reason goes in the tooltip rather than the label, so a
+        long explanation cannot push the buttons around.
+        """
+        text, background, colour = self._AUTH_STYLES.get(
+            state, self._AUTH_STYLES[None])
+        self.as_auth_light.setText(f"  ●  {text}  ")
+        self.as_auth_light.setStyleSheet(
+            f"background-color: {background}; color: {colour}; "
+            f"border: 1px solid {colour}; border-radius: 8px; "
+            f"font-weight: 600; padding: 0 10px;")
+        tip = []
+        if method:
+            tip.append(f"Method: {method}")
+        if reason:
+            tip.append(reason)
+        if state in (None, "none"):
+            tip.append("Choose a login method above to scan as a logged-in "
+                       "user.")
+        self.as_auth_light.setToolTip("\n".join(tip))
+        self._as_auth_state = state
+
+    def _as_show_auth_outcome(self, outcome):
+        """Reflect an Authenticator's verdict, whatever produced it."""
+        if outcome is None:
+            return
+        self._as_set_auth_state(outcome.state, outcome.reason,
+                                getattr(outcome, "method", ""))
 
     def pause_active_scan(self):
         """Hold the scan where it is, or let it go again.
@@ -530,6 +660,10 @@ class ActiveScanTabMixin:
         self.as_pause_btn.setEnabled(True)
         self.as_pause_btn.setText("Pause")
         self._as_paused = False
+        self.as_detail_line.setText("")
+        self.as_param_file.setText("")
+        mode = self.as_auth_mode.currentData()
+        self._as_set_auth_state("none" if mode == "none" else "checking")
         self._as_timer.start()
         try:
             self.goto_tab("scan")
@@ -548,11 +682,32 @@ class ActiveScanTabMixin:
     def _as_log(self, line):
         self.console.append_ansi(line + "\n")
 
-    def _as_on_progress(self, phase, done, total):
-        self.as_phase.setText(phase)
+    def _as_on_progress(self, phase, done, total, detail=None):
+        """Show what the scan is doing, from the scan's own state."""
         if total:
             self.as_progress.setValue(int(done / total * 100))
             self.as_progress.setFormat(f"{phase} — {done} of {total}")
+        headline = f"{phase} {done} of {total}" if total else phase
+
+        if not detail:
+            self.as_phase.setText(headline)
+            self.as_detail_line.setText("")
+            return
+        url = str(detail.get("url", ""))
+        # The query string is where the parameter lives, so keep it; trim
+        # only when it would push the rest of the line off the card.
+        if len(url) > 110:
+            url = url[:107] + "…"
+        parameter = detail.get("point") or detail.get("parameter") or ""
+        check = detail.get("check", "")
+        self.as_phase.setText(headline)
+        self.as_detail_line.setText(
+            f"<span style='color:palette(mid)'>Target:</span> "
+            f"<code>{_esc(url)}</code>"
+            + (f" &nbsp;<span style='color:palette(mid)'>Parameter:</span> "
+               f"<b>{_esc(parameter)}</b>" if parameter else "")
+            + (f"<br><span style='color:palette(mid)'>Testing:</span> "
+               f"<b>{_esc(check)}</b>" if check else ""))
 
     def _as_on_finding(self, finding):
         self._as_findings.append(finding)
@@ -580,6 +735,11 @@ class ActiveScanTabMixin:
                                      QMessageBox.Icon.Warning)
             return
 
+        self.as_detail_line.setText("")
+        # The outcome from the run itself, in case the scan finished before
+        # the live signal was processed.
+        self._as_show_auth_outcome(getattr(result, "auth_outcome", None))
+        self._as_write_parameter_file(result)
         self.as_progress.setValue(100)
         self.as_progress.setFormat("finished")
         minutes, seconds = divmod(int(result.duration), 60)
