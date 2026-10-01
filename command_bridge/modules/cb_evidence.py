@@ -249,7 +249,10 @@ class Evidence:
         "PoC unavailable" in that case; neither of us invents a request.
         """
         if not (self.has_injection_point() and self.has_payload()):
-            return ""
+            # Some classes are not proved by sending anything — access
+            # control is proved by replaying one request as two identities.
+            # Those have a reproduction, just not a payload-shaped one.
+            return self._differential_poc()
         # No title line: every caller prints its own heading, and two of them
         # were printing "Proof of concept" immediately above this one's.
         lines = ["Endpoint:"]
@@ -272,6 +275,30 @@ class Evidence:
             lines += ["", "Observation:", f"  {self.observed}"]
         elif self.comparison:
             lines += ["", "Observation:", f"  {self.comparison}"]
+        return "\n".join(lines)
+
+    def _differential_poc(self):
+        """A reproduction for findings proved by comparison, not by payload.
+
+        Returns ``""`` unless there really is a before/after to show, so a
+        finding with nothing behind it still says the PoC is unavailable.
+        """
+        if not self.has_differential():
+            return ""
+        lines = ["Endpoint:", f"  {self.url or self.endpoint or self.target}"]
+        if self.method:
+            lines += ["", "Method:", f"  {self.method}"]
+        lines += ["", "How to reproduce:",
+                  "  Send the same request as each identity below and compare "
+                  "what comes back.", ""]
+        if self.request:
+            lines += ["Request:"] + _indent(self.request)
+        if self.response:
+            lines += ["", "Response:"] + _indent(self.response)
+        if self.comparison:
+            lines += ["", "Comparison:"] + _indent(self.comparison)
+        if self.observed:
+            lines += ["", "Observation:", f"  {self.observed}"]
         return "\n".join(lines)
 
     def burp_request(self):
@@ -426,6 +453,11 @@ EVIDENCE_REQUIREMENTS = {
     "xss_reflected": ("injection_point", "payload", "observation"),
     "ssrf": ("injection_point", "payload", "oob_or_differential"),
     "xxe": ("injection_point", "payload", "oob_or_differential"),
+    # Access control is not proved by sending a payload. It is proved by
+    # sending the SAME request as two different identities and showing that
+    # one got something it should not have. Demanding a payload here was
+    # marking genuine, fully evidenced findings as unproven.
+    "access_control": ("observation", "differential"),
 }
 
 
@@ -830,28 +862,42 @@ def evidence_from_scan(scan_finding):
     writer needs it and must stay free of Qt.
     """
     items = list(getattr(scan_finding, "evidence", []) or [])
-    first = items[0] if items else None
+    # The step that demonstrates the issue, not simply the first one recorded.
+    # A boolean SQL injection proves itself with a true/false pair and the
+    # control is sometimes listed first; leading a PoC with the request that
+    # did *not* do anything is actively misleading.
+    lead = next((item for item in items if getattr(item, "decisive", False)),
+                items[0] if items else None)
+    payload = next((getattr(item, "payload", "") for item in items
+                    if getattr(item, "payload", "")), "")
     proof = Evidence(
         url=getattr(scan_finding, "where", ""),
         parameter=getattr(scan_finding, "point", ""),
         detector="active-scan",
-        payload=getattr(first, "payload", "") if first else "",
-        request=getattr(first, "request", "") if first else "",
-        response=getattr(first, "response", "") if first else "",
-        comparison="\n\n".join(item.render() for item in items[1:])
+        payload=payload or payload_from_label(getattr(lead, "label", "")),
+        request=getattr(lead, "request", "") if lead else "",
+        response=getattr(lead, "response", "") if lead else "",
+        # Every step, in order, including the one chosen as the lead. A
+        # multi-request proof is only a proof if the reader can see all of it.
+        comparison="\n\n".join(item.render() for item in items)
                    if len(items) > 1 else "",
-        observed=(getattr(first, "note", "") if first else "")
-                 or getattr(scan_finding, "detail_extra", ""),
+        observed=getattr(scan_finding, "detail_extra", "")
+                 or (getattr(lead, "note", "") if lead else ""),
         raw=scan_finding.evidence_text()
             if hasattr(scan_finding, "evidence_text") else "",
     )
-    if not proof.payload and first is not None:
-        proof.payload = payload_from_label(getattr(first, "label", ""))
     return proof
 
 
 def payload_from_label(label):
-    """Pull the payload out of an oracle's evidence label, if it named one."""
+    """Last resort: pull the payload out of a label that happens to name one.
+
+    The checks record the payload as a field. This only catches a label of
+    the form "Payload: …" from anything that has not been updated to, and it
+    is deliberately not relied upon — recovering a payload by parsing
+    human-written prose is guesswork that fails silently, which is exactly
+    how confirmed findings came to be printed with "Payload: NOT CAPTURED".
+    """
     match = re.search(r"payload[: ]+(.+)$", str(label or ""), re.I)
     return match.group(1).strip() if match else ""
 
