@@ -44,12 +44,110 @@ PUBLIC_BY_NATURE = re.compile(
     r"/(login|log-in|signin|sign-in|logout|sign-out|register|signup|"
     r"password|forgot|reset)(/|$|\?)", re.I)
 
-LOGGED_OUT_SIGNS = (
-    re.compile(r"<input[^>]+type=[\"']password[\"']", re.I),
-    re.compile(r"\b(please (log|sign) ?in|session (has )?expired|"
-               r"your session has timed out|you must be logged in|"
-               r"authentication required)\b", re.I),
+#: Prose that only appears when the application is telling you to log in.
+#: Strong evidence: an application does not say this to a logged-in user.
+LOGGED_OUT_PROSE = re.compile(
+    r"\b(please (log|sign) ?in|session (has )?expired|"
+    r"your session has timed out|you must be logged ?in|"
+    r"authentication required|not authori[sz]ed|access denied|"
+    r"invalid (username|password|credentials)|login failed)\b", re.I)
+
+#: A password field on its own means nothing. Every account page, profile
+#: page and settings page in the world offers "change your password" — and
+#: those are exactly the pages a tester supplies as the verification URL.
+#: Treating a password input as proof of being logged out is what made a
+#: perfectly good session report as unauthenticated.
+#:
+#: What actually indicates a login form is a password field sitting beside a
+#: username or email field in the same form. A change-password form has a
+#: password field (often two) and no username.
+LOGIN_FORM_SHAPE = re.compile(
+    r"<form[^>]*>(?:(?!</form>).)*?"
+    r"<input[^>]+(?:name|id)\s*=\s*[\"']?[^\"'>]*"
+    r"(?:user|email|login|account)[^\"'>]*[\"']?[^>]*>"
+    r"(?:(?!</form>).)*?"
+    r"<input[^>]+type\s*=\s*[\"']?password[\"']?"
+    r"|"
+    # …or the same two the other way round.
+    r"<form[^>]*>(?:(?!</form>).)*?"
+    r"<input[^>]+type\s*=\s*[\"']?password[\"']?"
+    r"(?:(?!</form>).)*?"
+    r"<input[^>]+(?:name|id)\s*=\s*[\"']?[^\"'>]*"
+    r"(?:user|email|login|account)[^\"'>]*[\"']?",
+    re.I | re.S)
+
+#: Things only a logged-in page shows. Weighed against the above.
+LOGGED_IN_SIGNS = (
+    re.compile(r"\b(log ?out|sign ?out)\b", re.I),
+    re.compile(r"href=[\"'][^\"']*(logout|signout|sign-out|log-out)", re.I),
+    re.compile(r"\b(my (account|profile|dashboard)|welcome back)\b", re.I),
 )
+
+#: Kept so anything importing it still works; the detection no longer
+#: depends on it.
+LOGGED_OUT_SIGNS = (LOGGED_OUT_PROSE,)
+
+
+#: What to call each strategy when talking to a human.
+METHOD_NAMES = {
+    "none": "None",
+    "form": "Username/Password",
+    "browser": "Username/Password (browser)",
+    "static": "Pasted cookies/headers",
+    "bearer": "Bearer token",
+}
+
+
+class AuthOutcome:
+    """What happened when we tried to log in, step by step.
+
+    The scan is only worth running if the session is real, so when it is not
+    the person running it needs to know which step failed — not merely that
+    the result was "unauthenticated". Nothing here ever holds a password.
+    """
+
+    def __init__(self, method=""):
+        self.method = method
+        self.ok = False
+        #: Whether a verification URL actually proved it. Without one the
+        #: scan still runs with whatever session the login produced, but
+        #: saying "Authentication Successful" would be a claim nothing
+        #: checked — so this gets its own state rather than being rounded up.
+        self.verified = False
+        self.reason = ""
+        self.lines = []
+        self.finished = False
+
+    def step(self, line):
+        """Record one step. Returns the line, so callers can log it too."""
+        self.lines.append(f"[AUTH] {line}")
+        return line
+
+    def finish(self, ok, reason, verified=True):
+        self.ok = bool(ok)
+        self.verified = bool(ok and verified)
+        self.reason = reason
+        self.finished = True
+        return self
+
+    @property
+    def state(self):
+        if not self.finished:
+            return "checking"
+        if not self.ok:
+            return "failed"
+        return "ok" if self.verified else "unverified"
+
+    def summary(self):
+        return {"checking": "Checking authentication…",
+                "ok": "Authentication Successful",
+                "unverified": "Authentication Unverified",
+                "failed": "Authentication Failed"}[self.state]
+
+    def as_dict(self):
+        return {"method": self.method, "ok": self.ok,
+                "verified": self.verified, "reason": self.reason,
+                "state": self.state, "lines": list(self.lines)}
 
 
 class AuthConfig:
@@ -124,27 +222,96 @@ class Authenticator:
 
     # ── logging in ───────────────────────────────────────────────────────
     def login(self):
-        """Establish the session. Returns True when it looks authenticated."""
+        """Establish the session. Returns True when it looks authenticated.
+
+        Every step is reported, so that when it fails the person running the
+        scan can see which one failed rather than only that something did.
+        No credential material is ever logged.
+        """
         strategy = self.config.strategy
+        self.outcome = AuthOutcome(method=METHOD_NAMES.get(strategy, strategy))
+        step = self.outcome.step
+
+        if strategy == "none":
+            self.logged_in = True
+            self.outcome.finish(True, "no authentication was requested")
+            return True
+
+        step(f"Authentication method: {self.outcome.method}")
         with self._lock:
-            if strategy == "none":
-                self.logged_in = True
-                return True
-            if strategy == "static":
-                self._apply_static()
-            elif strategy == "form":
-                self._login_form()
-            elif strategy == "browser":
-                self._login_browser()
-            elif strategy == "bearer":
-                self._mint_token()
-            else:
-                raise ValueError(f"unknown auth strategy: {strategy}")
-        self.logged_in = self.verify_session(force=True)
-        self.report(f"[auth] {self.config.name}: "
-                    + ("logged in" if self.logged_in
-                       else "could NOT confirm a logged-in session"))
+            try:
+                if strategy == "static":
+                    self._apply_static()
+                    step(f"Applied {len(self.config.cookies or {})} cookie(s) "
+                         f"and {len(self.config.headers or {})} header(s)")
+                    if not (self.config.cookies or self.config.headers):
+                        self.logged_in = False
+                        self.outcome.finish(
+                            False, "no cookies or headers were supplied")
+                        self._announce()
+                        return False
+                elif strategy == "form":
+                    if not self.config.login_url:
+                        self.logged_in = False
+                        self.outcome.finish(False, "no login URL was given")
+                        self._announce()
+                        return False
+                    if not self._login_form():
+                        self.logged_in = False
+                        self._announce()
+                        return False
+                elif strategy == "browser":
+                    step(f"Login URL: {self.config.login_url}")
+                    self._login_browser()
+                    step("Browser login finished; cookies harvested")
+                elif strategy == "bearer":
+                    step(f"Token endpoint: {self.config.token_url}")
+                    self._mint_token()
+                    step("Access token obtained" if self._token
+                         else "No access token was returned")
+                else:
+                    raise ValueError(f"unknown auth strategy: {strategy}")
+            except Exception as exc:                    # noqa: BLE001
+                self.logged_in = False
+                self.outcome.finish(
+                    False, f"the login attempt raised "
+                           f"{type(exc).__name__}: {exc}")
+                self._announce()
+                return False
+
+        if self.session.cookies or \
+                self.session.headers.get("Authorization"):
+            names = ", ".join(sorted(c.name for c in self.session.cookies)[:6])
+            step(f"Session established ({names or 'bearer token'})")
+        else:
+            step("No session cookie or token was set by the login")
+
+        # The verification URL is the actual test. A 200 from the login
+        # endpoint proves nothing: applications return 200 with "invalid
+        # credentials" on the same page all the time.
+        if self.config.check_url:
+            step(f"Verification URL: {self.config.check_url}")
+        ok, reason = self.check_session()
+        self._last_check = time.time()
+        step(("Verification: " if ok else "Verification indicates an "
+              "unauthenticated session: ") + reason)
+        self.logged_in = ok
+        self.outcome.finish(ok, reason,
+                            verified=bool(self.config.check_url))
+        self._announce()
         return self.logged_in
+
+    def _announce(self):
+        for line in self.outcome.lines:
+            self.report(line)
+        verdict = {"ok": "AUTHENTICATION CONFIRMED",
+                   "unverified": "AUTHENTICATION UNVERIFIED — "
+                                 "no verification URL was given, so the "
+                                 "session was never actually tested",
+                   "failed": f"AUTHENTICATION FAILED — {self.outcome.reason}",
+                   "checking": "authentication still in progress"}
+        self.report(f"[auth] {self.config.name}: "
+                    f"{verdict[self.outcome.state]}")
 
     def _apply_static(self):
         for name, value in (self.config.cookies or {}).items():
@@ -158,17 +325,22 @@ class Authenticator:
         login form is the usual reason a hand-rolled form login silently
         fails, and a failed login that is not noticed produces an empty scan.
         """
+        step = self.outcome.step
         self._apply_static()
         fields = dict(self.config.extra_fields)
         username_field = self.config.username_field or "username"
         password_field = self.config.password_field or "password"
         action = self.config.login_url
+        hidden_fields = {}
 
+        step(f"Login URL: {self.config.login_url}")
         try:
             page = self.session.get(self.config.login_url,
                                     timeout=self.timeout)
+            step(f"Login page: HTTP {page.status_code}")
             hidden, guessed, form_action = _read_login_form(page.text,
                                                             page.url)
+            hidden_fields = hidden
             fields.update(hidden)
             if not self.config.username_field and guessed[0]:
                 username_field = guessed[0]
@@ -181,8 +353,41 @@ class Authenticator:
 
         fields[username_field] = self.config.username
         fields[password_field] = self.config.password
-        self.session.post(action, data=fields, timeout=self.timeout,
-                          allow_redirects=True)
+        step(f"Submitting credentials to {action} "
+             f"(fields: {username_field}/{password_field}"
+             + (f", {len(hidden_fields)} hidden" if hidden_fields else "")
+             + ")")
+        try:
+            response = self.session.post(action, data=fields,
+                                         timeout=self.timeout,
+                                         allow_redirects=True)
+        except Exception as exc:                        # noqa: BLE001
+            self.outcome.finish(
+                False, f"the login request failed: "
+                       f"{type(exc).__name__}: {exc}")
+            return False
+        step(f"Login response: HTTP {response.status_code} "
+             f"at {str(response.url)}")
+
+        # A 200 from the login endpoint is not success. Applications re-serve
+        # the login page with an error message on the same status code, and
+        # treating that as a win is how a scan runs entirely logged out while
+        # claiming otherwise.
+        landed_back = (str(response.url).split("?")[0].rstrip("/") ==
+                       self.config.login_url.split("?")[0].rstrip("/"))
+        rejected = LOGGED_OUT_PROSE.search(response.text or "")
+        if rejected:
+            self.outcome.finish(
+                False, f"the credentials were rejected — the application "
+                       f"replied {rejected.group(0).strip()!r}")
+            return False
+        if landed_back and LOGIN_FORM_SHAPE.search(response.text or ""):
+            self.outcome.finish(
+                False, "the login request returned the login page again, "
+                       "which usually means the credentials were refused or "
+                       "a required field was missing")
+            return False
+        return True
 
     def _login_browser(self):
         """Log in with a real browser, then take the cookies it earned."""
@@ -255,28 +460,103 @@ class Authenticator:
         if not force and time.time() - self._last_check < 15:
             return self.logged_in
         self._last_check = time.time()
-        url = self.config.check_url or self.config.login_url
+        ok, _reason = self.check_session()
+        return ok
+
+    def check_session(self):
+        """``(logged_in, reason)`` from one request to the verification URL.
+
+        Never falls back to the login URL. It used to, and checking the login
+        page for signs of being logged in can only ever answer "no" — which
+        is why a correct username and password with no verification URL came
+        out as unauthenticated.
+        """
+        url = (self.config.check_url or "").strip()
         if not url:
-            return True
+            return True, ("no verification URL was given, so the session "
+                          "could not be confirmed either way")
         try:
+            # Unfollowed first, so a 302 to the login page is visible as a
+            # 302 rather than as a 200 on a page that happens to look fine.
             response = self.session.get(url, timeout=self.timeout,
-                                        allow_redirects=True)
-        except Exception:                               # noqa: BLE001
-            return self.logged_in
-        return self.looks_logged_in(response)
+                                        allow_redirects=False)
+            if 300 <= response.status_code < 400:
+                verdict, reason = self.judge(response)
+                if not verdict:
+                    return False, reason
+                response = self.session.get(url, timeout=self.timeout,
+                                            allow_redirects=True)
+        except Exception as exc:                        # noqa: BLE001
+            return False, (f"the verification URL could not be reached: "
+                           f"{type(exc).__name__}: {exc}")
+        verdict, reason = self.judge(response)
+        return verdict, f"HTTP {response.status_code} — {reason}"
 
     def looks_logged_in(self, response):
-        """The signature first; the heuristics only when there is none."""
+        """Is this response one the application gives a logged-in user?"""
+        return self.judge(response)[0]
+
+    def judge(self, response):
+        """``(logged_in, reason)`` — the verdict and why, for the log.
+
+        Evidence in order of how much it proves. The order matters: a
+        password field used to be treated as proof of a login page, which is
+        wrong on every account, profile and settings page in existence — the
+        very pages people give as the verification URL.
+        """
         body = response.text or ""
+        final_url = str(getattr(response, "url", "") or "")
+
+        # 1. An explicit signature settles it. Nothing else is consulted.
         if self.config.logged_in_signature:
-            return self.config.logged_in_signature in body
+            if self.config.logged_in_signature in body:
+                return True, "the session signature was present"
+            return False, (f"the session signature "
+                           f"{self.config.logged_in_signature!r} was not in "
+                           f"the response")
+
+        # 2. The server refusing outright.
         if response.status_code in (401, 403):
-            return False
+            return False, f"the server answered HTTP {response.status_code}"
+
+        # 3. A redirect towards a login page, seen before it is followed.
         location = response.headers.get("Location", "")
-        if 300 <= response.status_code < 400 and \
-                re.search(r"log ?in|sign ?in|auth", location, re.I):
-            return False
-        return not any(sign.search(body) for sign in LOGGED_OUT_SIGNS)
+        if 300 <= response.status_code < 400 and location:
+            if PUBLIC_BY_NATURE.search(location) or \
+                    re.search(r"log ?in|sign ?in|auth|sso", location, re.I):
+                return False, (f"the response redirected to {location}, "
+                               f"which is a login page")
+
+        # 4. Redirects already followed, and we ended up at a login page.
+        #    This is the case the old code could not see at all: once
+        #    requests has followed the redirect, the status is 200 and the
+        #    only remaining clue is the URL we actually landed on.
+        if final_url:
+            if self.config.login_url and \
+                    final_url.split("?")[0].rstrip("/") == \
+                    self.config.login_url.split("?")[0].rstrip("/"):
+                return False, "the request ended up back on the login page"
+            if PUBLIC_BY_NATURE.search(final_url) and \
+                    not PUBLIC_BY_NATURE.search(self.config.check_url or ""):
+                return False, (f"the request ended up at {final_url}, which "
+                               f"is a sign-in or registration page")
+
+        # 5. The application saying so in words.
+        prose = LOGGED_OUT_PROSE.search(body)
+        if prose:
+            return False, (f"the response said "
+                           f"{prose.group(0).strip()!r}")
+
+        # 6. A login-shaped form: a password field beside a username field.
+        #    A change-password form has no username field and does not match.
+        if LOGIN_FORM_SHAPE.search(body):
+            return False, "the response contains a login form"
+
+        # 7. Positive signs, for the log rather than the verdict.
+        for sign in LOGGED_IN_SIGNS:
+            if sign.search(body):
+                return True, "the response carries a signed-in marker"
+        return True, "nothing in the response indicates a logged-out session"
 
     def send(self, request, allow_redirects=False, timeout=None):
         """Send a Request, re-authenticating if the session has lapsed.

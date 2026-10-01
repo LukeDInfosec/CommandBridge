@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import threading
 import time
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
@@ -38,6 +39,10 @@ from command_bridge.modules.scanner.crawl import Crawler, Scope
 from command_bridge.modules.scanner.model import (
     Request, ScanFinding, insertion_points)
 from command_bridge.modules.scanner.session import AuthConfig, Authenticator
+
+#: The name the discovered-parameter list is written under. One place, so
+#: the engine, the interface and the report cannot disagree about it.
+PARAMETER_FILENAME = "Active_Scan_Discovered_Parameters.txt"
 from command_bridge.modules.scanner.checks.access import (
     AccessControlCheck, anonymous_identity)
 from command_bridge.modules.scanner.checks.files import (
@@ -153,6 +158,15 @@ class ScanResult:
     relogins: int = 0
     skipped_destructive: list = field(default_factory=list)
     authenticated: bool = False
+    #: The full authentication story — method, every step, and the reason it
+    #: ended the way it did. The report and the interface both read this
+    #: rather than inferring a state from which fields were filled in.
+    auth_outcome: object = None
+    #: Every parameterised request the crawl found, as
+    #: ``{url: [parameter names]}``. Written out at the end of the scan for
+    #: the tester to work through by hand.
+    discovered_parameters: dict = field(default_factory=dict)
+    parameter_file: str = ""
     profile: str = ""
     notes: list = field(default_factory=list)
 
@@ -165,15 +179,26 @@ class ScanEngine:
     """One scan of one target."""
 
     def __init__(self, target, auth=None, second_auth=None, profile=None,
-                 scope=None, on_log=None, on_progress=None, on_finding=None):
+                 scope=None, on_log=None, on_progress=None, on_finding=None,
+                 on_auth=None):
         self.target = target if target.startswith(("http://", "https://")) \
             else "https://" + target
         self.profile = profile or Profile.standard()
         self.auth_config = auth or AuthConfig("none")
         self.second_auth_config = second_auth
         self.on_log = on_log or (lambda line: None)
-        self.on_progress = on_progress or (lambda phase, done, total: None)
+        self.on_progress = on_progress or (lambda *a, **k: None)
+        #: Live progress state, shared across the worker threads. The
+        #: interface reads what is ACTUALLY running rather than a number
+        #: with no context: which URL, which parameter, which check.
+        self._progress_lock = threading.Lock()
+        self._done = 0
+        self._total = 1
         self.on_finding = on_finding or (lambda finding: None)
+        #: Called once with the AuthOutcome as soon as the login attempt
+        #: resolves, so the interface can show the real state before the
+        #: crawl rather than only at the end of the scan.
+        self.on_auth = on_auth or (lambda outcome: None)
         self._stop = threading.Event()
         #: Pause/stop for this run. The engine's own stop flag stays as it
         #: was so nothing that reads it has to change; the gate is what
@@ -229,6 +254,12 @@ class ScanEngine:
             self.on_log("[scan] WARNING: not authenticated — see the report")
         self.result.authenticated = auth.logged_in and \
             self.auth_config.strategy != "none"
+        self.result.auth_outcome = getattr(auth, "outcome", None)
+        self.auth = auth
+        try:
+            self.on_auth(self.result.auth_outcome)
+        except Exception:                               # noqa: BLE001
+            pass
 
         second = None
         if self.second_auth_config:
@@ -271,11 +302,15 @@ class ScanEngine:
                 include_path=self.profile.test_path_segments))
         points = points[:self.profile.max_points]
         self.result.points_tested = len(points)
+        self.result.discovered_parameters = self._collect_parameters(
+            requests, points)
         self.on_log(f"[scan] {len(points)} insertion point(s) across "
                     f"{len(requests)} request(s)")
 
         checks = self._checks()
         total = max(1, len(points))
+        with self._progress_lock:
+            self._done, self._total = 0, total
         done = 0
         if points:
             with ThreadPoolExecutor(max_workers=self.profile.threads) as pool:
@@ -283,6 +318,8 @@ class ScanEngine:
                                        checks): point for point in points}
                 for future in as_completed(futures):
                     done += 1
+                    with self._progress_lock:
+                        self._done = done
                     self.on_progress("Testing parameters", done, total)
                     try:
                         for finding in future.result() or []:
@@ -389,6 +426,107 @@ class ScanEngine:
         ]
         return [check for key, check in available if key in wanted]
 
+    def _collect_parameters(self, requests, points):
+        """What the crawl actually found that takes input.
+
+        Built from the requests and insertion points the scan really used, so
+        the file cannot contain a URL the scanner never saw. Values are kept
+        — an example value is most of what makes a parameter worth testing by
+        hand — and identical entries collapse.
+        """
+        found = {}
+        for request in requests:
+            names = [name for name, _ in request.query]
+            if request.data:
+                names += [f"body:{name}" for name, _ in request.data]
+            if not names:
+                continue
+            entry = found.setdefault(request.url, {
+                "method": request.method, "names": [], "source": "crawl"})
+            for name in names:
+                if name not in entry["names"]:
+                    entry["names"].append(name)
+        for point in points:
+            url = point.request.url
+            entry = found.setdefault(url, {
+                "method": point.request.method, "names": [],
+                "source": "tested"})
+            entry["source"] = "tested"
+            tag = point.name if point.kind == "query" \
+                else f"{point.kind}:{point.name}"
+            if tag not in entry["names"]:
+                entry["names"].append(tag)
+        return found
+
+    def write_parameter_file(self, directory, filename=PARAMETER_FILENAME):
+        """Write the discovered parameters where the tester can use them.
+
+        Returns the path, or "" when there was nothing to write or the
+        directory could not be used. A scan that finds nothing should not
+        leave an empty file implying it did.
+        """
+        rows = self.result.discovered_parameters or {}
+        if not rows or not directory:
+            return ""
+        lines = [
+            "# Parameters discovered by the Active Scan",
+            f"# Target:  {self.result.target}",
+            f"# Scanned: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"# {len(rows)} parameterised URL(s). Everything here was "
+            f"actually reached by the crawl.",
+            "",
+        ]
+        tested = sorted(u for u, r in rows.items() if r["source"] == "tested")
+        seen_only = sorted(u for u, r in rows.items()
+                           if r["source"] != "tested")
+        if tested:
+            lines += ["# --- tested by the scanner ---", ""]
+            lines += [f"{rows[url]['method']} {url}"
+                      f"    [{', '.join(rows[url]['names'])}]"
+                      for url in tested]
+        if seen_only:
+            lines += ["", "# --- found but not tested (over the point "
+                          "limit, or out of profile) ---", ""]
+            lines += [f"{rows[url]['method']} {url}"
+                      f"    [{', '.join(rows[url]['names'])}]"
+                      for url in seen_only]
+        try:
+            path = Path(directory) / filename
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except Exception as exc:                        # noqa: BLE001
+            self.on_log(f"[scan] could not write the parameter list: {exc}")
+            return ""
+        self.result.parameter_file = str(path)
+        self.on_log(f"[scan] discovered parameters written to {path}")
+        return str(path)
+
+    def _announce_check(self, point, check):
+        """Tell the interface exactly what is being tested right now."""
+        with self._progress_lock:
+            done, total = self._done, self._total
+        # `done` counts what has FINISHED. The thing being announced is the
+        # one running now, so the tester sees "27 of 268" while the 27th is
+        # being tested rather than while it is already over.
+        current = min(done + 1, total)
+        try:
+            self.on_progress(
+                "Testing parameters", current, total,
+                detail={
+                    "url": point.request.url,
+                    "method": point.request.method,
+                    "parameter": point.name,
+                    "location": point.kind,
+                    "point": point.label(),
+                    "check": check.name,
+                    "check_key": check.key,
+                })
+        except TypeError:
+            # An older callback that does not take a detail. Keep the scan
+            # running rather than failing over a progress line.
+            self.on_progress("Testing parameters", current, total)
+        except Exception:                               # noqa: BLE001
+            pass
+
     def _test_point(self, context, point, checks):
         if self.stopped():
             return []
@@ -406,6 +544,10 @@ class ScanEngine:
                 break
             if not check.applies(point, self.profile):
                 continue
+            # Announce the check as it STARTS. Reporting it after the point
+            # finishes would show the tester what the scanner has already
+            # stopped doing.
+            self._announce_check(point, check)
             try:
                 found = check.run(context, point, baseline) or []
             except Exception as exc:                    # noqa: BLE001

@@ -63,8 +63,19 @@ def as_markdown(result):
     lines.append(f"- **Duration:** {int(result.duration // 60)}m "
                  f"{int(result.duration % 60)}s")
     lines.append(f"- **Profile:** {result.profile}")
-    lines.append(f"- **Authenticated:** "
-                 f"{'yes' if result.authenticated else 'no'}")
+    # The authentication line decides whether anything below it means
+    # much, so it carries the method and the verdict's reason rather than a
+    # bare yes/no.
+    outcome = getattr(result, "auth_outcome", None)
+    if outcome is not None and getattr(outcome, "finished", False):
+        lines.append(f"- **Authenticated:** {outcome.summary()} "
+                     f"({outcome.method}) — {outcome.reason}")
+    else:
+        lines.append(f"- **Authenticated:** "
+                     f"{'yes' if result.authenticated else 'no'}")
+    if getattr(result, "parameter_file", ""):
+        lines.append(f"- **Discovered parameters:** "
+                     f"{result.parameter_file}")
     lines.append(f"- **Coverage:** {result.pages_crawled} page(s) crawled, "
                  f"{result.requests_seen} distinct request(s), "
                  f"{result.points_tested} insertion point(s) tested")
