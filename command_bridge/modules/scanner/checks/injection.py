@@ -98,6 +98,7 @@ class TemplateInjectionCheck:
                              f"is not a reflection.",
                 evidence=[
                     Evidence(label=f"{payload} evaluated to {CANARY_RESULT}",
+                             payload=payload, decisive=True,
                              request=request.describe(),
                              response=response_summary(response, 300)),
                     Evidence(label="A second expression, to rule out a "
@@ -188,6 +189,7 @@ class CommandInjectionCheck:
                                     "output." if shell_error else ""),
                     evidence=[Evidence(
                         label=f"Injected with '{separator}'",
+                        payload=payload, decisive=True,
                         request=request.describe(),
                         response=response_summary(response, 400),
                         note=f"`{COMMAND_ECHO}` printed {CANARY_RESULT}")])
@@ -222,10 +224,13 @@ class CommandInjectionCheck:
                             Evidence(label=f"{result['short_delay']}s "
                                            f"requested → "
                                            f"{result['short_time']}s",
+                                     payload=result.get("short_payload", ""),
                                      request=result["short_request"].describe()),
                             Evidence(label=f"{result['long_delay']}s "
                                            f"requested → "
                                            f"{result['long_time']}s",
+                                     payload=result.get("long_payload", ""),
+                                     decisive=True,
                                      request=result["long_request"].describe(),
                                      note=f"Normal responses never exceeded "
                                           f"{result['baseline_ceiling']}s.")])

@@ -101,11 +101,15 @@ class SqlInjectionCheck:
                 evidence.append(Evidence(
                     label="Condition true — page returned as normal",
                     request=result["true_request"].describe(),
-                    response=response_summary(result["true_response"], 400)))
+                    response=response_summary(result["true_response"], 400),
+                    payload=result["true_payload"],
+                    # The true case is what a reader replays first.
+                    decisive=True))
                 evidence.append(Evidence(
                     label="Condition false — page changed",
                     request=result["false_request"].describe(),
                     response=response_summary(result["false_response"], 400),
+                    payload=result["false_payload"],
                     note=f"similarity between the two responses: "
                          f"{result['pair_similarity']}"))
 
@@ -120,21 +124,25 @@ class SqlInjectionCheck:
             evidence.append(Evidence(
                 label=f"Delay {timing['short_delay']}s → "
                       f"{timing['short_time']}s",
+                payload=timing.get("short_payload", ""),
                 request=timing["short_request"].describe()))
             evidence.append(Evidence(
                 label=f"Delay {timing['long_delay']}s → {timing['long_time']}s",
+                payload=timing.get("long_payload", ""),
+                decisive=True,
                 request=timing["long_request"].describe(),
                 note=f"This endpoint never took longer than "
                      f"{timing['baseline_ceiling']}s when left alone."))
 
         if error:
-            engine, excerpt, request, response = error
+            engine, excerpt, request, response, probe = error
             notes.append(f"The {engine} parser reported a syntax error when "
                          f"the value was modified.")
             evidence.append(Evidence(
                 label=f"{engine} error",
                 request=request.describe(),
                 response=response_summary(response, 300),
+                payload=probe,
                 note=excerpt))
             if confidence == "tentative":
                 confidence = "firm"
@@ -161,7 +169,7 @@ class SqlInjectionCheck:
                 continue
             engine, excerpt = oracles.database_error(response.text)
             if engine:
-                return engine, excerpt, request, response
+                return engine, excerpt, request, response, probe
         return None
 
     def _timing(self, ctx, point, baseline):

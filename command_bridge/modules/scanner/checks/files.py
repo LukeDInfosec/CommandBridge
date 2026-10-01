@@ -89,6 +89,7 @@ class TraversalCheck:
                         f"root was read and returned."),
                     evidence=[Evidence(
                         label=f"Payload: {payload}",
+                        payload=payload, decisive=True,
                         request=request.describe(),
                         response=response_summary(response, 500),
                         note="\n".join(body.splitlines()[:6])[:400])])]
@@ -114,6 +115,7 @@ class TraversalCheck:
                         "on this platform."),
                     evidence=[Evidence(
                         label=f"Payload: {payload}",
+                        payload=payload, decisive=True,
                         request=request.describe(),
                         response=response_summary(response, 400))])]
         return []
@@ -171,6 +173,7 @@ class OpenRedirectCheck:
                     "request."),
                 evidence=[Evidence(
                     label=f"Payload: {payload}",
+                    payload=payload, decisive=True,
                     request=request.describe(),
                     response=response_summary(response, 200),
                     note=proof)])]

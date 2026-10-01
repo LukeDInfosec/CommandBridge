@@ -168,6 +168,7 @@ class XssCheck:
                              request=point.build(canary, "replace").describe(),
                              note=context["excerpt"]),
                     Evidence(label="Payload for that context",
+                             payload=payload, decisive=True,
                              request=request.describe(),
                              response=response_summary(response, 400))])
         return None
@@ -281,6 +282,10 @@ class StoredXssCheck:
                         "link being clicked."),
                     evidence=[
                         Evidence(label="Submitted here",
+                                 # The canary is the payload here: it is what
+                                 # was stored, and replaying the issue means
+                                 # submitting it again.
+                                 payload=canary, decisive=True,
                                  request=origin.describe()),
                         Evidence(label="Rendered here",
                                  request=request.describe(),
