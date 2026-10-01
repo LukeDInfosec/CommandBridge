@@ -1047,7 +1047,12 @@ def main():
 
         class FakeEvidence:
             label = "injected payload: ;id"
-            request = "GET /ping?host=127.0.0.1%3Bid HTTP/1.1\nHost: target"
+            request = "GET http://target/ping?host=127.0.0.1%3Bid"
+            # The wire form, captured by the check at the moment it sent the
+            # request. burp_request() returns this and nothing else: the
+            # human-readable summary above is not a request Burp accepts.
+            raw_request = ("GET /ping?host=127.0.0.1%3Bid HTTP/1.1\r\n"
+                           "Host: target\r\nCookie: sid=abc123\r\n\r\n")
             response = "HTTP/1.1 200 OK\n\nuid=33(www-data) gid=33(www-data)"
             note = ("The response to ';id' contains uid=33(www-data), which "
                     "the baseline response does not.")
@@ -1085,7 +1090,7 @@ def main():
         check("a PoC exists", bool(poc))
         check("it names the parameter", "host" in poc)
         check("it shows the payload", "127.0.0.1;id" in poc)
-        check("it shows the request", "GET /ping?host=" in poc)
+        check("it shows the request", "GET http://target/ping?host=" in poc)
         check("it shows the response", "uid=33(www-data)" in poc)
         check("it explains the observation", "baseline response does not" in poc)
         check("and it pastes into Burp",

@@ -808,6 +808,111 @@ def main():
         check("it still returns a result", "result" in outcome)
         del sent_before
 
+        # ─────────────────────────────────────────────────────────────────
+        print("\n\033[1mCommand injection is proved by output, not by "
+              "waiting\033[0m")
+
+        cmdi = [f for f in result.findings
+                if f.issue == "command_injection"]
+        check("the planted command injection is found", bool(cmdi))
+        if cmdi:
+            finding = cmdi[0]
+            labels = [e.label for e in finding.evidence]
+            text = finding.detail_extra + " ".join(
+                (e.label or "") + (e.note or "") for e in finding.evidence)
+
+            check("execution is established before anything else",
+                  "Shell execution proved" in labels[0])
+            check("real commands were run, not just arithmetic",
+                  any("`id`" in label for label in labels))
+            check("including whoami",
+                  any("`whoami`" in label for label in labels))
+            check("and uname",
+                  any("`uname -a`" in label for label in labels))
+            check("and /etc/passwd",
+                  any("cat /etc/passwd" in label for label in labels))
+            check("the output of id is in the evidence",
+                  "uid=0(root)" in text)
+            check("the passwd file is identified by its first line",
+                  "root:x:0:0:" in text)
+            check("the finding does not rest on a delay",
+                  "took" not in finding.detail_extra
+                  or "TIME-BASED" not in finding.detail_extra)
+            check("it says the commands were read-only",
+                  "read-only" in finding.detail_extra)
+
+            proof, validation = cb_evidence.assess_scan(finding)
+            check("it is CONFIRMED", validation.state, cb_evidence.CONFIRMED)
+            check("the PoC leads with a request that returns output",
+                  "id" in proof.burp_request()
+                  or "passwd" in proof.burp_request())
+            check("and the payload shown matches that request",
+                  proof.payload in urllib.parse.unquote_plus(
+                      proof.burp_request()))
+
+        print("\n\033[1mEvery finding can be pasted into Burp\033[0m")
+        # Asserted against the findings the engine really produced. A fixture
+        # here would only prove that the fixture was written to match.
+        missing = []
+        for finding in result.findings:
+            proof, _ = cb_evidence.assess_scan(finding)
+            raw = proof.burp_request()
+            if not raw:
+                missing.append(finding.issue)
+                continue
+            first = raw.splitlines()[0] if raw.splitlines() else ""
+            if not first.endswith(" HTTP/1.1"):
+                missing.append(f"{finding.issue}: no request line")
+            elif not re.search(r"(?mi)^Host: \S+", raw):
+                missing.append(f"{finding.issue}: no Host header")
+            elif "\r\n\r\n" not in raw:
+                missing.append(f"{finding.issue}: headers not terminated")
+            elif not re.search(r"(?mi)^Cookie: \S+", raw) \
+                    and finding.point != "no session":
+                # Everything else was found as a logged-in user, so the
+                # session cookie has to be in the block or the tester pastes
+                # it and gets the login page. Forced browsing is the one
+                # exception and is excluded deliberately: its whole point is
+                # that the request carried no cookie, so a block with one in
+                # it would not reproduce the finding.
+                missing.append(f"{finding.issue}: no session cookie")
+        check("all of them carry a raw HTTP request", missing, [])
+
+        print("\n\033[1mThe second account's role decides the finding\033[0m")
+        for role, expect in (("same", "HORIZONTAL"), ("lower", "VERTICAL")):
+            second.role = role
+            access_profile = Profile.standard()
+            access_profile.use_browser = False
+            access_profile.rate = 80
+            access_profile.checks = ("access",)
+            role_engine = ScanEngine(base, auth=config, second_auth=second,
+                                     profile=access_profile,
+                                     scope=build_scope(base))
+            role_result = role_engine.run()
+            paths = {urllib.parse.urlparse(f.where).path
+                     for f in role_result.findings}
+            cross = [f for f in role_result.findings
+                     if expect in f.detail_extra]
+            check(f"role '{role}' reports {expect.lower()} failures",
+                  bool(cross))
+            check(f"role '{role}' finds the planted /account bug",
+                  "/account" in paths)
+            check(f"role '{role}' finds the planted /admin bug",
+                  "/admin" in paths)
+            # The false-positive half, which is the half that matters: these
+            # are pages both accounts are meant to see, and a check that
+            # reports them reports the whole application.
+            for safe in ("/dashboard", "/tools", "/profile", "/item_safe"):
+                check(f"role '{role}' does not report {safe}",
+                      safe not in paths)
+            if role == "lower":
+                admin = [f for f in role_result.findings
+                         if urllib.parse.urlparse(f.where).path == "/admin"
+                         and "VERTICAL" in f.detail_extra]
+                check("an admin path is raised as CRITICAL",
+                      bool(admin) and admin[0].severity, "CRITICAL")
+        second.role = "same"
+
     finally:
         server.shutdown()
 

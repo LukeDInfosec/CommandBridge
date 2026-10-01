@@ -193,7 +193,11 @@ def main():
         issue="command_injection", where="https://t.example/ping",
         point="host", confidence="confirmed",
         evidence=[SEv(label="injected payload: 127.0.0.1;id",
-                      request="GET /ping?host=127.0.0.1%3Bid HTTP/1.1",
+                      payload="127.0.0.1;id",
+                      request="GET https://t.example/ping?host=127.0.0.1%3Bid",
+                      raw_request=("GET /ping?host=127.0.0.1%3Bid HTTP/1.1\r\n"
+                                   "Host: t.example\r\n"
+                                   "Cookie: sid=abc123\r\n\r\n"),
                       response="HTTP/1.1 200 OK\n\nuid=33(www-data)",
                       note="';id' returned uid=33(www-data); the baseline "
                            "did not.")])
@@ -220,6 +224,90 @@ def main():
         check(f"the Scan detail pane shows '{section}'", section in detail)
     check("the caching is per finding, not shared",
           window._as_shared(proved) is shared)
+
+    # ── Copy Burp Request ────────────────────────────────────────────────
+    print("\n\033[1mCopy Burp Request\033[0m")
+    for tab, attr in (("Scan", "as_burp_btn"), ("Coffee Break",
+                                                "cb_burp_btn")):
+        check(f"the {tab} findings pane has the button",
+              hasattr(window, attr))
+    check("it starts disabled, with nothing selected",
+          window.as_burp_btn.isEnabled(), False)
+
+    window._as_findings = [proved]
+    window._as_shared_cache = {}
+    window._as_add_row(proved)
+    window.as_table.selectRow(0)
+    check("selecting a finding enables it", window.as_burp_btn.isEnabled())
+    check("and it is labelled for the job",
+          window.as_burp_btn.text(), "Copy Burp Request")
+    window._as_copy_burp()
+    copied = QApplication.clipboard().text()
+    check("the clipboard holds a request line",
+          copied.splitlines()[0].endswith(" HTTP/1.1"))
+    check("with a Host header", "Host: t.example" in copied)
+    check("and the session cookie", "Cookie: sid=abc123" in copied)
+    check("the header block is terminated", copied.endswith("\r\n\r\n"))
+    check("it is not the human-readable summary",
+          copied.startswith("GET http://"), False)
+    check("the button confirms the copy",
+          "Copied" in window.as_burp_btn.text())
+
+    # A finding with no captured request must not offer an empty clipboard.
+    window._as_findings = [unproved_for_burp := ScanFinding(
+        issue="xss_reflected", where="https://t.example/s", point="q",
+        confidence="firm", evidence=[])]
+    window._as_shared_cache = {}
+    window.as_table.setRowCount(0)
+    window._as_add_row(unproved_for_burp)
+    window.as_table.selectRow(0)
+    check("a finding with no captured request disables the button",
+          window.as_burp_btn.isEnabled(), False)
+    check("and the button says why",
+          "No request captured" in window.as_burp_btn.text())
+    window.as_table.setRowCount(0)
+    window._as_findings = []
+    window._as_shared_cache = {}
+
+    # ── the second account's role ────────────────────────────────────────
+    print("\n\033[1mThe second account's role is declared, not guessed\033[0m")
+    check("the Scan tab asks what the second account is",
+          hasattr(window, "as_second_role"))
+    roles = [window.as_second_role.itemData(i)
+             for i in range(window.as_second_role.count())]
+    check("all three relationships are offered",
+          sorted(roles), ["higher", "lower", "same"])
+    check("it defaults to a peer account", window.as_second_role.currentData(),
+          "same")
+    check("the role control is disabled until a second account is wanted",
+          window.as_second_role.isEnabled(), False)
+    check("there is an explanation under it", hasattr(window, "as_role_help"))
+    check("which wraps rather than clipping",
+          window.as_role_help.wordWrap(), True)
+    window.as_second_user.setChecked(True)
+    check("ticking the box enables the role control",
+          window.as_second_role.isEnabled())
+    for index, role in enumerate(roles):
+        window.as_second_role.setCurrentIndex(index)
+        text = window.as_role_help.text()
+        check(f"the '{role}' option explains itself", len(text) > 200)
+        check(f"the '{role}' option names the test it runs",
+              "IDOR" in text or "escalation" in text)
+    window.as_second_role.setCurrentIndex(roles.index("lower"))
+    lower_help = window.as_role_help.text()
+    check("the lower-privilege option says which box the admin goes in",
+          "admin above" in lower_help.lower())
+    check("and which box the restricted account goes in",
+          "here" in lower_help.lower())
+    window.as_second_user.setChecked(False)
+
+    # ── time-based command injection ─────────────────────────────────────
+    print("\n\033[1mTime-based command injection is opt-in\033[0m")
+    check("the Scan tab offers the switch", hasattr(window, "as_timing_only"))
+    check("and it is off by default",
+          window.as_timing_only.isChecked(), False)
+    check("the tooltip says why",
+          "slow" in window.as_timing_only.toolTip().lower())
 
     # A scanner result with nothing behind it must not read as proven, even
     # though the scanner itself called it firm.
