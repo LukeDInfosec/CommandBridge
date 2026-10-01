@@ -1,7 +1,7 @@
 ================================================================================
  COMMAND BRIDGE v4 — PROJECT REFERENCE & CHANGELOG
  (Reference doc for Claude / future sessions. Keep this updated after changes.)
- Last updated: 2026-09-24
+ Last updated: 2026-10-01
 ================================================================================
 
 HOW TO USE THIS FILE
@@ -18,6 +18,141 @@ HOW TO USE THIS FILE
 ================================================================================
  CHANGELOG (most recent first)
 ================================================================================
+
+## 2026-10-01 — PROVE IT, THEN HAND IT OVER (6.7.0)
+
+Three things a tester asked for, all of them about the same thing: a finding
+you can put in front of a client without doing the work again yourself.
+
+COMMAND INJECTION IS PROVED BY OUTPUT, NOT BY WAITING
+
+  The old check led with arithmetic and fell back to a timed sleep, and the
+  sleep was doing most of the work. On an application that is slow — or slow
+  in proportion to how much a request asks it to do, which is most real
+  applications — a scaled delay happens without any injection, and a finding
+  that says "this took 9s instead of 4s" is not something that goes in a
+  report. It is a job for the person reading the report.
+
+  checks/injection.py now works in two phases:
+
+    1. ESTABLISH EXECUTION. A random token through `echo`, platform-neutral
+       and cheap. Confirmed only when the token appears, the payload does
+       NOT appear (reflection is not execution), the token is not sitting
+       beside the word that printed it, and the token was not already in the
+       baseline.
+    2. MAKE IT TALK. Only once a separator is known to work does the check
+       spend requests on `id`, `whoami`, `uname -a`, `pwd`,
+       `cat /etc/passwd` — and on Windows `whoami`, `ver`, `dir C:\`,
+       `type win.ini`. Each is its own evidence step with its own request and
+       response, so the report shows the command and the output side by side.
+       That is the screenshot.
+
+  oracles.command_output() holds the signature table — `uid=0(root) gid=…`,
+  `root:x:0:0:`, `Microsoft Windows [Version …]`, `[fonts]` and the rest. A
+  match is discarded if it is also in the BASELINE body (an application whose
+  own documentation shows /etc/passwd must not be reported for quoting
+  itself) or inside the payload (we are reading our own input back).
+  WEAK_SIGNATURES — `whoami`, `pwd` — corroborate and never confirm on their
+  own: a bare word and an absolute path match ordinary page text far too
+  easily.
+
+  TIMING IS DEMOTED, NOT REMOVED. When it fires, the check immediately tries
+  to turn it into real output through the same separator; success upgrades
+  the finding to a confirmed one with the command output attached. Failure
+  means:
+    * confidence "tentative", not "confirmed", so the evidence layer renders
+      it POTENTIAL / manual validation required rather than a confirmed
+      CRITICAL; and
+    * it is not reported at all unless Profile.report_timing_only is on,
+      which is a new checkbox in Scope and aggression, OFF by default.
+  oracles.Timing also sends a ZERO-SECOND control now. If asking for a
+  0s sleep also takes several seconds, the delay was never ours. That one
+  extra request removes the commonest false positive on a laggy target.
+
+  Blind injection is still reported, and the detail says plainly that the
+  command runs but the page does not show it, rather than implying there is
+  output to screenshot.
+
+COPY BURP REQUEST
+
+  Evidence.request was always a human summary — "GET http://host/path?id=1"
+  — which is not a request Burp accepts. burp_request() used to fall back to
+  it, which meant the button pasted something that looked right and came back
+  400.
+
+  * model.raw_http(prepared) renders the PreparedRequest `requests` ACTUALLY
+    SENT as raw HTTP/1.1: origin-form request line, Host, every header with
+    the session's cookies already merged, recomputed Content-Length, blank
+    line, body. Reconstruction (raw_http_from_request) is the fallback for
+    the few steps that never got a response, and reads cookies and defaults
+    off the live session so the block is still complete.
+  * model.step(label, request, response, auth=…) builds every evidence step
+    and captures the wire form AT THE MOMENT IT IS SENT. All five check
+    modules now go through it, so no finding can be recorded without its
+    request — the button works for every check rather than for whichever
+    ones remembered.
+  * Evidence.raw_request carries it; burp_request() returns that and NOTHING
+    ELSE. No raw request means no button, and the button says
+    "No request captured for this finding" rather than copying an empty
+    clipboard.
+  * "Copy Burp Request" sits under the detail pane on BOTH findings screens.
+    Confirms in the button text for two seconds; no dialog, because a tester
+    presses this thirty times in an afternoon.
+  * The PoC for command injection now LEADS with a request that returns
+    output (`id`, `cat /etc/passwd`) rather than the token echo, and
+    evidence_from_scan takes the payload from the LEAD step so the payload
+    printed above a request is the one inside it.
+
+THE SECOND ACCOUNT HAS A DECLARED ROLE
+
+  "Account B saw account A's page" is a data leak between peers and a
+  privilege escalation between levels. Same observation, different finding,
+  and the scanner cannot tell which. So the operator declares it:
+
+    Same level     → horizontal (IDOR). Needs an object identifier AND the
+                     first account's data in the second's response.
+    Lower          → vertical (privilege escalation). Crawls as the admin,
+                     replays as the restricted account. Privileged paths
+                     (/admin, /manage, /users/…/roles, /billing) CRITICAL;
+                     the rest HIGH.
+    Higher         → the same test with the direction reversed, for when the
+                     first account is fixed for another reason.
+
+  A wrapped explanation sits under the dropdown and changes with it, saying
+  which login goes in which box and what the scanner will do with it. In a
+  tooltip this was being missed, and entering the two accounts the wrong way
+  round silently inverts every finding the check produces.
+
+  FALSE POSITIVES WERE THE WHOLE PROBLEM HERE. Most of an application is
+  pages both accounts are meant to see; they come back 99% identical and the
+  naive vertical test reports the entire site. The gate is now: a privileged-
+  looking path, OR the privileged account's identifier genuinely leaking into
+  the other's response. "Genuinely" does real work:
+    * attribute values, <script> and <style> are stripped first
+      (visible_text), because <input name="nick" value="alice"> is a form
+      default, not alice's data;
+    * a marker that came from OUR OWN request is reflection, not a leak;
+    * a page containing the reader's own name too is a shared listing
+      ("All users: alice, bob"), not a leak;
+    * _owner_marker no longer falls back to the first email on the page — on
+      a page showing somebody else's record that returned THEIR address as
+      proof the record was ours, which inverts the one thing it exists to
+      establish.
+  Against the test application all three roles now report exactly the two
+  planted access-control bugs and nothing else; /dashboard, /tools, /profile
+  and /item_safe are all correctly silent.
+
+  The vertical modes also run the horizontal test, since a second account
+  proves whatever it proves whatever level it is. The IDOR test always runs
+  in the crawl's direction: those URLs name the first account's records, so
+  asking whether the first account can read its own is not a question.
+
+TESTS — 218 scanner / 236 GUI / 288 Coffee Break / 13 chain, all passing.
+  The command-injection and Burp assertions run against the REAL engine
+  output, not a fixture. Two existing tests failed on this change because
+  their hand-written fixtures had no raw_request; that is the tightening
+  working, and the fixtures were corrected rather than the behaviour.
+
 
 ## 2026-10-01 — THE SCAN SAYS WHAT IT IS DOING (6.6.0)
 
