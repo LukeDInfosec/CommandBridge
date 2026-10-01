@@ -14,7 +14,7 @@ import re
 import urllib.parse
 
 from command_bridge.modules.scanner.model import Evidence, ScanFinding, \
-    response_summary
+    response_summary, step
 
 TRAVERSAL_PAYLOADS = (
     "../../../../etc/passwd",
@@ -87,11 +87,10 @@ class TraversalCheck:
                         f"The parameter is used to build a file path. The "
                         f"response contains {what}, so a file outside the web "
                         f"root was read and returned."),
-                    evidence=[Evidence(
-                        label=f"Payload: {payload}",
-                        payload=payload, decisive=True,
-                        request=request.describe(),
-                        response=response_summary(response, 500),
+                    evidence=[step(
+                        f"Payload: {payload}", request, response,
+                        auth=ctx.auth, payload=payload, decisive=True,
+                        body_limit=500,
                         note="\n".join(body.splitlines()[:6])[:400])])]
 
         for payload in LFI_PAYLOADS:
@@ -113,11 +112,10 @@ class TraversalCheck:
                         "reads. A PHP stream wrapper returned the source of "
                         "another file, which is one step from code execution "
                         "on this platform."),
-                    evidence=[Evidence(
-                        label=f"Payload: {payload}",
-                        payload=payload, decisive=True,
-                        request=request.describe(),
-                        response=response_summary(response, 400))])]
+                    evidence=[step(
+                        f"Payload: {payload}", request, response,
+                        auth=ctx.auth, payload=payload, decisive=True,
+                        body_limit=400)])]
         return []
 
 
@@ -171,10 +169,8 @@ class OpenRedirectCheck:
                     "without being checked against an allow-list. The "
                     "response sent the browser to a host chosen by the "
                     "request."),
-                evidence=[Evidence(
-                    label=f"Payload: {payload}",
-                    payload=payload, decisive=True,
-                    request=request.describe(),
-                    response=response_summary(response, 200),
-                    note=proof)])]
+                evidence=[step(
+                    f"Payload: {payload}", request, response,
+                    auth=ctx.auth, payload=payload, decisive=True,
+                    body_limit=200, note=proof)])]
         return []

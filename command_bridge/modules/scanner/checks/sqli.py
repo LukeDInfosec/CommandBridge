@@ -27,7 +27,7 @@ false.
 from __future__ import annotations
 
 from command_bridge.modules.scanner.model import Evidence, ScanFinding, \
-    response_summary
+    response_summary, step
 from command_bridge.modules.scanner import oracles
 
 #: (true, false) pairs. Ordered so the most commonly effective quoting is
@@ -98,18 +98,16 @@ class SqlInjectionCheck:
                          "this parameter: the true form returned the original "
                          "page and the false form did not.")
             for result in boolean[:2]:
-                evidence.append(Evidence(
-                    label="Condition true — page returned as normal",
-                    request=result["true_request"].describe(),
-                    response=response_summary(result["true_response"], 400),
-                    payload=result["true_payload"],
+                evidence.append(step(
+                    "Condition true — page returned as normal",
+                    result["true_request"], result["true_response"],
+                    auth=ctx.auth, payload=result["true_payload"],
                     # The true case is what a reader replays first.
                     decisive=True))
-                evidence.append(Evidence(
-                    label="Condition false — page changed",
-                    request=result["false_request"].describe(),
-                    response=response_summary(result["false_response"], 400),
-                    payload=result["false_payload"],
+                evidence.append(step(
+                    "Condition false — page changed",
+                    result["false_request"], result["false_response"],
+                    auth=ctx.auth, payload=result["false_payload"],
                     note=f"similarity between the two responses: "
                          f"{result['pair_similarity']}"))
 
@@ -121,16 +119,15 @@ class SqlInjectionCheck:
                 f"{timing['short_time']}s and {timing['long_delay']}s produced "
                 f"{timing['long_time']}s, against a normal response time of "
                 f"{timing['baseline_median']}s.")
-            evidence.append(Evidence(
-                label=f"Delay {timing['short_delay']}s → "
-                      f"{timing['short_time']}s",
-                payload=timing.get("short_payload", ""),
-                request=timing["short_request"].describe()))
-            evidence.append(Evidence(
-                label=f"Delay {timing['long_delay']}s → {timing['long_time']}s",
-                payload=timing.get("long_payload", ""),
+            evidence.append(step(
+                f"Delay {timing['short_delay']}s → {timing['short_time']}s",
+                timing["short_request"], auth=ctx.auth,
+                payload=timing.get("short_payload", "")))
+            evidence.append(step(
+                f"Delay {timing['long_delay']}s → {timing['long_time']}s",
+                timing["long_request"], timing.get("response"),
+                auth=ctx.auth, payload=timing.get("long_payload", ""),
                 decisive=True,
-                request=timing["long_request"].describe(),
                 note=f"This endpoint never took longer than "
                      f"{timing['baseline_ceiling']}s when left alone."))
 
@@ -138,12 +135,9 @@ class SqlInjectionCheck:
             engine, excerpt, request, response, probe = error
             notes.append(f"The {engine} parser reported a syntax error when "
                          f"the value was modified.")
-            evidence.append(Evidence(
-                label=f"{engine} error",
-                request=request.describe(),
-                response=response_summary(response, 300),
-                payload=probe,
-                note=excerpt))
+            evidence.append(step(
+                f"{engine} error", request, response, auth=ctx.auth,
+                payload=probe, note=excerpt, body_limit=300))
             if confidence == "tentative":
                 confidence = "firm"
 

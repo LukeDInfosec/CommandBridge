@@ -32,7 +32,7 @@ import re
 import urllib.parse
 
 from command_bridge.modules.scanner.model import Evidence, ScanFinding, \
-    response_summary
+    response_summary, step
 from command_bridge.modules.scanner import oracles
 
 CANARY = "cbx9r4t"
@@ -164,13 +164,12 @@ class XssCheck:
                     f"{context['kind']} context, and the characters needed to "
                     f"break out of it are not encoded. " + how),
                 evidence=[
-                    Evidence(label="Where the input lands",
-                             request=point.build(canary, "replace").describe(),
-                             note=context["excerpt"]),
-                    Evidence(label="Payload for that context",
-                             payload=payload, decisive=True,
-                             request=request.describe(),
-                             response=response_summary(response, 400))])
+                    step("Where the input lands",
+                         point.build(canary, "replace"), auth=ctx.auth,
+                         note=context["excerpt"]),
+                    step("Payload for that context", request, response,
+                         auth=ctx.auth, payload=payload, decisive=True,
+                         body_limit=400)])
         return None
 
     def _executes(self, ctx, request, response, body):
@@ -281,15 +280,13 @@ class StoredXssCheck:
                         "runs for every user who views the page, without any "
                         "link being clicked."),
                     evidence=[
-                        Evidence(label="Submitted here",
-                                 # The canary is the payload here: it is what
-                                 # was stored, and replaying the issue means
-                                 # submitting it again.
-                                 payload=canary, decisive=True,
-                                 request=origin.describe()),
-                        Evidence(label="Rendered here",
-                                 request=request.describe(),
-                                 response=response_summary(response, 400),
-                                 note=contexts[0]["excerpt"])]))
+                        # The canary is the payload here: it is what was
+                        # stored, and replaying the issue means submitting it
+                        # again.
+                        step("Submitted here", origin, auth=ctx.auth,
+                             payload=canary, decisive=True),
+                        step("Rendered here", request, response,
+                             auth=ctx.auth, body_limit=400,
+                             note=contexts[0]["excerpt"])]))
                 break
         return findings
