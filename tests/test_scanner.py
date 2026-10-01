@@ -29,6 +29,7 @@ from command_bridge.modules.scanner import (                # noqa: E402
     AuthConfig, Authenticator, Profile, Request, ScanEngine, ScanFinding,
     build_scope, insertion_points)
 from command_bridge.modules.scanner import oracles, report   # noqa: E402
+from command_bridge.modules import cb_evidence                # noqa: E402
 from command_bridge.modules.scanner.crawl import Scope, _plausible  # noqa: E402
 from command_bridge.modules.scanner.model import json_points, json_set  # noqa: E402
 from tests.vulnerable_app import start                      # noqa: E402
@@ -498,6 +499,65 @@ def main():
         # that is where the run is held; these prove it holds, that a paused
         # scan can still be stopped without being resumed first, and that a
         # real run stops promptly when told to.
+
+        # ─────────────────────────────────────────────────────────────────
+        #  Every real finding must be replayable
+        # ─────────────────────────────────────────────────────────────────
+        #
+        # These run against the findings the engine ACTUALLY produced above,
+        # not a hand-written fixture. That distinction is the whole point:
+        # the evidence layer was first tested with a fake ScanFinding whose
+        # label happened to match the regex that recovered the payload, so
+        # the tests passed while every genuine confirmed finding came out as
+        # "POTENTIAL — Payload: NOT CAPTURED" with no PoC. A fixture tests
+        # the assumption; this tests the data.
+        print("\n\033[1mReal findings carry a replayable PoC\033[0m")
+        confirmed_real = [f for f in result.findings
+                          if f.confidence == "confirmed"]
+        check("the scan confirmed several findings to check",
+              len(confirmed_real) >= 5)
+
+        missing_poc, not_confirmed, no_payload = [], [], []
+        for finding in confirmed_real:
+            proof, validation = cb_evidence.assess_scan(finding)
+            # Access control is proved by replaying one request as two
+            # identities, so it has a reproduction but no payload.
+            if not proof.payload and finding.issue != "access_control":
+                no_payload.append(finding.issue)
+            if not proof.poc():
+                missing_poc.append(finding.issue)
+            if validation.state != cb_evidence.CONFIRMED:
+                not_confirmed.append((finding.issue, validation.state))
+        check("every confirmed finding names the payload it sent",
+              no_payload, [])
+        check("every confirmed finding renders a PoC", missing_poc, [])
+        check("and reaches CONFIRMED, not POTENTIAL", not_confirmed, [])
+
+        by_issue = {f.issue: f for f in result.findings}
+        sqli_proof, sqli_validation = cb_evidence.assess_scan(by_issue["sqli"])
+        check("the SQL injection PoC names the parameter",
+              "id" in sqli_proof.parameter)
+        check("it shows a condition that was injected",
+              "AND" in sqli_proof.payload.upper())
+        check("it carries a request that can be pasted into Burp",
+              sqli_proof.burp_request().startswith("GET "))
+        check("the request actually contains the payload",
+              "AND" in urllib.parse.unquote_plus(sqli_proof.request).upper())
+        check("it shows the response that came back",
+              "HTTP 200" in sqli_proof.response)
+        check("the lead evidence is the TRUE case, not the control",
+              "true" in sqli_proof.request.lower()
+              or "1 AND 1=1" in urllib.parse.unquote_plus(sqli_proof.request)
+              or "5=5" in urllib.parse.unquote_plus(sqli_proof.request))
+        check("both halves of the pair are kept for the reader",
+              "Condition false" in sqli_proof.comparison)
+        check("and the explanation says what was observed",
+              "evaluated a condition" in sqli_proof.observed)
+
+        poc = sqli_proof.poc()
+        for part in ("Endpoint:", "Parameter:", "Test input:", "Request:",
+                     "Response:", "Observation:"):
+            check(f"the PoC has a '{part.rstrip(':')}' section", part in poc)
 
         print("\n\033[1mPause and stop\033[0m")
         paused_profile = Profile.standard()
