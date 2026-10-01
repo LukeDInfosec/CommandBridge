@@ -272,6 +272,15 @@ class Evidence:
     request: str = ""
     response: str = ""
     note: str = ""
+    #: The exact input that was sent, when this step sent one. Recorded as a
+    #: field rather than left to be read back out of the label or the URL: a
+    #: proof of concept has to name the payload, and recovering it by parsing
+    #: a human-written label is guesswork that silently fails.
+    payload: str = ""
+    #: True for the step that demonstrates the issue. A boolean SQL injection
+    #: proves itself with a pair of requests, and the one worth putting at the
+    #: top of a PoC is the one that came back *true*, not the control.
+    decisive: bool = False
 
     def render(self):
         parts = [f"── {self.label} " + "─" * max(0, 60 - len(self.label))]

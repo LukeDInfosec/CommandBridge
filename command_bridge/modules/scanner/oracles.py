@@ -212,6 +212,10 @@ class Differential:
                      and pair_similarity < self.threshold)
         return {
             "confirmed": confirmed,
+            # The payloads themselves, carried forward so the report can name
+            # them. A PoC that says "a condition was injected" without saying
+            # what was sent cannot be replayed by the person reading it.
+            "true_payload": true_payload, "false_payload": false_payload,
             "true_request": true_request, "true_response": true_response,
             "false_request": false_request, "false_response": false_response,
             "pair_similarity": round(pair_similarity, 3),
@@ -287,6 +291,10 @@ class Timing:
 
         return {
             "confirmed": True,
+            # Named so a report can print what was sent, not just how long
+            # it took.
+            "short_payload": template.format(d=short),
+            "long_payload": template.format(d=long),
             "short_request": short_request, "short_time": round(short_time, 2),
             "long_request": long_request, "long_time": round(long_time, 2),
             "short_delay": short, "long_delay": long,
