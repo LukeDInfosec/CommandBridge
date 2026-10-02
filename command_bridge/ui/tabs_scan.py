@@ -701,6 +701,7 @@ class ActiveScanTabMixin:
         "checking":    ("Checking authentication…", "#3a2f10", "#f6b73c"),
         "ok":          ("Authentication Successful", "#102a16", "#3fb950"),
         "unverified":  ("Authentication Unverified", "#3a2f10", "#f6b73c"),
+        "lost":        ("Session Lost During Scan", "#2e1115", "#ff3b5c"),
         "failed":      ("Authentication Failed", "#2e1115", "#ff3b5c"),
     }
 
@@ -924,8 +925,24 @@ class ActiveScanTabMixin:
             title.setFont(unsettled)
         where = QTableWidgetItem(finding.where)
         where.setToolTip(finding.where)
-        confidence = QTableWidgetItem(getattr(shared, "confidence",
-                                              finding.confidence))
+        # Severity and confidence are two separate columns and neither is
+        # allowed to colour the other (§18). The severity cell's tooltip
+        # carries the phrase that spells the relationship out.
+        graded = getattr(shared, "confidence", "") or finding.confidence
+        cell.setToolTip(
+            f"{cb_evidence.severity_label(severity, graded)} — "
+            f"{severity} impact if real, evidence graded {graded}.")
+        confidence = QTableWidgetItem(graded)
+        confidence.setForeground(QtGui.QColor(
+            cb_evidence.CONFIDENCE_COLOURS.get(graded, "#8b9bb4")))
+        verdict = getattr(shared, "verdict", None)
+        confidence.setToolTip(
+            (f"Detected by {verdict.detection_method}.\n"
+             if getattr(verdict, "detection_method", "") else "")
+            + (getattr(verdict, "rationale", "") or "")
+            + (f"\n\nTo confirm: {verdict.verification}"
+               if getattr(verdict, "verification", "")
+               and graded != "confirmed" else ""))
         confidence.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
         index = self._as_findings.index(finding)
