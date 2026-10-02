@@ -122,6 +122,17 @@ class CBFinding:
     scanner_severity: str = ""
     #: One evidence object per additional sighting, parallel to ``instances``.
     instance_proof: list = field(default_factory=list)
+    #: The active scanner's graded verdict, when this came from the Active
+    #: Scan: the signals it rested on, the reasoning, what could still
+    #: explain it away and how to settle it. Kept whole so the detail pane
+    #: can show the raw detection separately from the interpretation.
+    verdict: object = None          # scanner.grading.Verdict
+    #: Raw numbers behind the detection — response times, lengths, statuses.
+    measurements: dict = field(default_factory=dict)
+    #: Who the scanner was when it saw this (§15).
+    auth_context: dict = field(default_factory=dict)
+    #: The HTTP method of the request that produced it.
+    method: str = ""
 
     def __post_init__(self):
         if self.proof is None:
@@ -374,8 +385,20 @@ def finding_from_scan(scan_finding, stage="active-scan"):
         stage=stage, proof=proof,
         severity=getattr(scan_finding, "severity", "") or "",
     )
-    finding.revalidate(detector_confirmed=str(
-        getattr(scan_finding, "confidence", "")).lower() == "confirmed")
+    # The grading module already decided how strong this evidence is, and
+    # assess_scan is the single place that reconciles that grade with the
+    # evidence chain. Going through it means the detail pane, the written
+    # report and the JSON cannot disagree about one finding.
+    _, validation = cb_evidence.assess_scan(scan_finding)
+    finding.validation = validation
+    finding.state = validation.state
+    finding.confidence = validation.confidence
+    finding.verdict = getattr(scan_finding, "verdict", None)
+    finding.measurements = dict(getattr(scan_finding, "measurements", {})
+                                or {})
+    finding.auth_context = dict(getattr(scan_finding, "auth_context", {})
+                                or {})
+    finding.method = getattr(scan_finding, "method", "") or ""
     return finding
 #: Headers that say more about the server than the operator meant to.
 LEAKY_HEADERS = ("server", "x-powered-by", "x-aspnet-version",

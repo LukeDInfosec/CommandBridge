@@ -745,6 +745,42 @@ STATE_COLOURS = {
 }
 
 
+#: Confidence gets its own palette, deliberately unlike the severity one. A
+#: confirmed low and a potential critical must not be able to look alike.
+CONFIDENCE_COLOURS = {
+    CONFIRMED_C: "#3fb950",
+    HIGH: "#58a6ff",
+    MEDIUM: "#58a6ff",
+    "likely": "#58a6ff",
+    POTENTIAL_C: "#d29922",
+    "inconclusive": "#8b9bb4",
+    INFORMATIONAL: "#8b9bb4",
+}
+
+#: Human names for the scanner's evidence grades, so this module can label a
+#: raw signal without importing the scanner (which is a heavier dependency
+#: than a lookup table deserves). Falls back to the grade itself.
+try:                                    # pragma: no cover - import guard
+    from command_bridge.modules.scanner.grading import GRADE_NAMES
+except Exception:                       # pragma: no cover
+    GRADE_NAMES = {}
+
+
+def severity_label(severity, confidence):
+    """"Potentially Critical" rather than a bare CRITICAL or a quiet demotion.
+
+    A critical issue that has not been proved is still potentially critical.
+    Saying so keeps both facts in one phrase instead of letting the severity
+    imply a certainty the evidence does not support.
+    """
+    severity = (severity or "INFO").upper()
+    if confidence in (CONFIRMED_C, INFORMATIONAL):
+        return severity
+    if confidence == "inconclusive":
+        return f"{severity} if real"
+    return f"Potentially {severity.capitalize()}"
+
+
 def _esc(text):
     """HTML-escape, the way both tabs need it."""
     return (str(text or "").replace("&", "&amp;").replace("<", "&lt;")
@@ -776,11 +812,40 @@ def detail_html(finding):
     if state:
         html.append(f"<div style='color:{STATE_COLOURS.get(state, '#8b9bb4')};"
                     f"font-weight:700'>[{_esc(state)}]</div>")
+    # §18 — severity answers "how bad if real", confidence answers "how well
+    # do we know it". They are printed as two separate statements, and the
+    # combined label spells out the relationship instead of hiding it.
+    confidence = getattr(finding, "confidence", "") or ""
     html.append(
         f"<div style='color:{colour};font-weight:600'>{_esc(severity)}"
-        f" &nbsp;·&nbsp; <span style='color:palette(mid);font-weight:400'>"
-        f"{_esc(stage)} · {_esc(getattr(finding, 'confidence', ''))} "
-        f"confidence</span></div>")
+        f" <span style='color:palette(mid);font-weight:400'>"
+        f"(impact if real)</span>"
+        f" &nbsp;·&nbsp; <span style='color:"
+        f"{CONFIDENCE_COLOURS.get(confidence, '#8b9bb4')};font-weight:600'>"
+        f"{_esc(confidence)}</span>"
+        f" <span style='color:palette(mid);font-weight:400'>"
+        f"(evidence) · {_esc(stage)}</span></div>")
+    if confidence and confidence not in (CONFIRMED_C, INFORMATIONAL):
+        html.append(f"<div style='color:palette(mid)'>Reads as: "
+                    f"<b>{_esc(severity_label(severity, confidence))}</b>"
+                    f"</div>")
+
+    verdict = getattr(finding, "verdict", None)
+    auth = getattr(finding, "auth_context", {}) or {}
+    if auth:
+        # §15 — the same bug on a public page and behind an admin login are
+        # two different reports, so every finding says which it was.
+        html.append(
+            f"<p><b>Authentication context:</b> "
+            f"{_esc(auth.get('label', 'unknown'))}"
+            + (f" as <code>{_esc(auth.get('identity'))}</code>"
+               if auth.get("identity") else "")
+            + (f", via {_esc(auth.get('method'))}"
+               if auth.get("method") and auth.get("method") != "none" else "")
+            + "</p>")
+    if getattr(verdict, "detection_method", ""):
+        html.append(f"<p><b>Detected by:</b> "
+                    f"{_esc(verdict.detection_method)}</p>")
     html.append(f"<p><b>Where:</b> "
                 f"<code>{_esc(getattr(finding, 'where', ''))}</code></p>")
     if proof.parameter:
@@ -802,7 +867,31 @@ def detail_html(finding):
                 "<p style='color:#d29922'><b>⚠ Classification / evidence "
                 "mismatch.</b> "
                 + "<br>".join(_esc(c) for c in validation.conflicts) + "</p>")
-        html.append("<p><b>Why this was detected</b><br>"
+        # §17 — raw detection on its own first: exactly what was measured
+        # or matched, with nothing wrapped around it. The interpretation
+        # comes after, clearly labelled as interpretation.
+        signals = list(getattr(verdict, "signals", None)
+                       or getattr(finding, "signals", []) or [])
+        measurements = getattr(finding, "measurements", {}) or {}
+        if signals or measurements:
+            rows = []
+            for signal in signals:
+                numbers = ""
+                if signal.measurements:
+                    numbers = " <code>" + _esc(", ".join(
+                        f"{k}={signal.measurements[k]}"
+                        for k in sorted(signal.measurements))) + "</code>"
+                rows.append(
+                    f"<li><b>{_esc(GRADE_NAMES.get(signal.grade, signal.grade))}"
+                    f"</b>"
+                    + (" (reproduced)" if signal.reproduced else "")
+                    + f": {_esc(signal.detail)}{numbers}</li>")
+            for key in sorted(measurements):
+                rows.append(f"<li><b>{_esc(key)}</b>: "
+                            f"{_esc(str(measurements[key]))}</li>")
+            html.append("<p><b>Raw detection</b> — what was actually "
+                        "observed</p><ul>" + "".join(rows) + "</ul>")
+        html.append("<p><b>Interpreted finding</b><br>"
                     + _esc(validation.rationale
                            or "Detection rationale unavailable.") + "</p>")
         checklist = evidence_checklist(getattr(finding, "key", ""), proof)
@@ -823,12 +912,19 @@ def detail_html(finding):
                 "<pre style='white-space:pre-wrap;border-left:3px solid "
                 f"#3d7eff;padding-left:8px'>{_esc(burp)}</pre>")
         if validation.false_positive_indicators:
-            html.append("<p><b>Potential false-positive indicators</b></p><ul>"
+            html.append("<p><b>What could explain this without the "
+                        "vulnerability</b></p><ul>"
                         + "".join(f"<li>{_esc(i)}</li>"
                                   for i in
                                   validation.false_positive_indicators)
                         + "</ul>")
-        if validation.action:
+        if confidence not in (CONFIRMED_C, INFORMATIONAL):
+            html.append(
+                f"<p style='border-left:3px solid #d29922;padding-left:8px'>"
+                f"<b>Not proved.</b> "
+                f"{_esc(getattr(verdict, 'verification', '') or validation.action or 'Manual validation required.')}"
+                f"</p>")
+        elif validation.action:
             html.append(f"<p><b>Next step:</b> {_esc(validation.action)}</p>")
 
     sources = [s for s in (getattr(finding, "sources", []) or [stage]) if s]
@@ -952,13 +1048,61 @@ def payload_from_label(label):
     return match.group(1).strip() if match else ""
 
 
+#: The scanner's graded confidence → what this module may say about it.
+#: A graded verdict is the scanner's own account of how strong its evidence
+#: was, so it governs in both directions: it can confirm a finding, and it
+#: can hold one down. Nothing here can lift a finding above the grade its
+#: evidence earned.
+_GRADED = {
+    "confirmed": (CONFIRMED, CONFIRMED_C,
+                  "Reproduced by the tool on decisive evidence. Re-check "
+                  "before writing up."),
+    "likely": (VALIDATED, HIGH,
+               "Corroborating evidence captured, nothing decisive. Confirm "
+               "manually before reporting."),
+    "potential": (POTENTIAL, POTENTIAL_C, "MANUAL VALIDATION REQUIRED"),
+    "inconclusive": (INCONCLUSIVE, POTENTIAL_C, "MANUAL VALIDATION REQUIRED"),
+}
+
+
 def assess_scan(scan_finding):
-    """``(evidence, validation)`` for one active-scan result."""
+    """``(evidence, validation)`` for one active-scan result.
+
+    The active checks no longer declare their own confidence: each attaches
+    graded signals and the grading module derives a verdict from them. This
+    reads that verdict rather than second-guessing it, and carries its
+    reasoning — why, what could still explain it away, and how to check —
+    into the validation so the report can show all three.
+    """
     proof = evidence_from_scan(scan_finding)
+    graded = str(getattr(scan_finding, "confidence", "") or "").lower()
+    verdict = getattr(scan_finding, "verdict", None)
+
     validation = assess(
         getattr(scan_finding, "issue", ""), proof,
-        detector_confirmed=str(
-            getattr(scan_finding, "confidence", "")).lower() == "confirmed")
+        detector_confirmed=graded == "confirmed")
+
+    if graded in _GRADED and validation.classification_consistent:
+        state, confidence, action = _GRADED[graded]
+        if graded == "confirmed" and not validation.evidence_sufficient:
+            # The grade says the behaviour was proved, but the evidence
+            # chain is missing a piece the write-up needs. Keep the lower of
+            # the two: say what is there, not what it would have been.
+            pass
+        else:
+            validation.state = state
+            validation.confidence = confidence
+            validation.action = action
+
+    if verdict is not None:
+        if getattr(verdict, "rationale", ""):
+            validation.rationale = verdict.rationale
+        for limitation in getattr(verdict, "limitations", ()) or ():
+            if limitation not in validation.false_positive_indicators:
+                validation.false_positive_indicators.append(limitation)
+        if getattr(verdict, "verification", "") and \
+                validation.state != CONFIRMED:
+            validation.action = verdict.verification
     return proof, validation
 
 
