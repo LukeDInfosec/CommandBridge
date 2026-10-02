@@ -38,7 +38,7 @@ import secrets
 
 from command_bridge.modules.scanner.model import Evidence, ScanFinding, \
     response_summary, step
-from command_bridge.modules.scanner import oracles
+from command_bridge.modules.scanner import oracles, grading
 
 #: 7 * 191 = 1337, which does not appear on a normal page the way 49 does.
 CANARY_RESULT = "1337"
@@ -116,11 +116,12 @@ class TemplateInjectionCheck:
             second = ctx.auth.send(confirm)
             if second is None or "1146" not in (second.text or ""):
                 continue
-            return [ScanFinding(
+            finding = ScanFinding(
                 issue=self.issue,
                 where=point.request.url,
                 point=point.label(),
-                confidence="confirmed",
+                method=point.request.method,
+                auth_context=grading.auth_context(ctx),
                 detail_extra=f"The template engine evaluated an expression "
                              f"supplied in this parameter. The syntax that "
                              f"worked points to {engine}. Two different "
@@ -132,7 +133,19 @@ class TemplateInjectionCheck:
                          decisive=True, body_limit=300),
                     step("A second expression, to rule out a coincidence",
                          confirm, second, auth=ctx.auth, body_limit=300,
-                         note="6*191 = 1146")])]
+                         note="6*191 = 1146")])
+            finding.add(grading.Signal(
+                grading.EXECUTION,
+                f"The server computed {payload} and returned "
+                f"{CANARY_RESULT}, then computed a second, different "
+                f"expression correctly. The expression was evaluated, not "
+                f"echoed — a reflected template string would have come back "
+                f"unchanged.",
+                {"payload": payload, "expected": CANARY_RESULT,
+                 "observed": CANARY_RESULT, "engine_hint": engine,
+                 "second_expression": "6*191", "second_expected": "1146"}))
+            finding.settle()
+            return [finding]
         return []
 
 
@@ -153,11 +166,12 @@ class CodeInjectionCheck:
                     continue
                 body = response.text or ""
                 if CANARY_RESULT in body and payload not in body:
-                    return [ScanFinding(
+                    finding = ScanFinding(
                         issue=self.issue,
                         where=point.request.url,
                         point=point.label(),
-                        confidence="confirmed",
+                        method=point.request.method,
+                        auth_context=grading.auth_context(ctx),
                         detail_extra=f"An expression supplied in this "
                                      f"parameter was evaluated by the "
                                      f"application. The syntax suggests "
@@ -165,7 +179,17 @@ class CodeInjectionCheck:
                         evidence=[step(
                             f"{payload} evaluated to {CANARY_RESULT}",
                             request, response, auth=ctx.auth, payload=payload,
-                            decisive=True, body_limit=300)])]
+                            decisive=True, body_limit=300)])
+                    finding.add(grading.Signal(
+                        grading.EXECUTION,
+                        f"The application computed {payload} and returned "
+                        f"{CANARY_RESULT}. The payload itself is not in the "
+                        f"response, so it was evaluated rather than "
+                        f"reflected.",
+                        {"payload": payload, "expected": CANARY_RESULT,
+                         "observed": CANARY_RESULT, "language_hint": language}))
+                    finding.settle()
+                    return [finding]
         return []
 
 
@@ -318,13 +342,31 @@ class CommandInjectionCheck:
         if oracles.COMMAND_ERRORS.search(first_response.text or ""):
             detail += " The response also contains shell error output."
 
-        return ScanFinding(
+        finding = ScanFinding(
             issue=self.issue,
             where=point.request.url,
             point=point.label(),
-            confidence="confirmed",
+            method=point.request.method,
+            auth_context=grading.auth_context(ctx),
             detail_extra=detail,
             evidence=evidence)
+        # The random token is the proof. It is generated per test, so it
+        # cannot already be in the application's own content, and it only
+        # appears in the response if a shell printed it.
+        finding.add(grading.Signal(
+            grading.EXECUTION,
+            f"A marker generated for this test ({expected}) was produced by "
+            f"server-side command execution and returned in the response. "
+            f"The payload itself is not reflected, so the shell ran it."
+            + (f" Follow-up commands then returned "
+               + ", ".join(f"{name} → {extract}"
+                           for name, _, extract in observations[:3])
+               if observations else
+               " Follow-up commands returned no output, so this is blind."),
+            {"marker": expected, "separator": separator,
+             "commands": [name for name, _, _ in observations]}))
+        finding.settle()
+        return finding
 
     # ── the last resort ──────────────────────────────────────────────────
     def _timed(self, ctx, point, baseline):
@@ -380,14 +422,21 @@ class CommandInjectionCheck:
                              payload, f"echo {canary}", canary, baseline_body)
 
     def _timing_finding(self, point, result):
-        return ScanFinding(
+        finding = ScanFinding(
             issue=self.issue,
             where=point.request.url,
             point=point.label(),
-            # Not 'confirmed'. A delay is consistent with command injection
-            # and with half a dozen other things, and calling it confirmed is
-            # how a scanner ends up being ignored.
-            confidence="tentative",
+            method=point.request.method,
+            auth_context=grading.auth_context(ctx),
+            measurements={
+                "baseline_median_s": result["baseline_median"],
+                "baseline_ceiling_s": result["baseline_ceiling"],
+                "short_delay_s": result["short_delay"],
+                "short_time_s": result["short_time"],
+                "long_delay_s": result["long_delay"],
+                "long_time_s": result["long_time"],
+                "control_time_s": result.get("control_time"),
+            },
             detail_extra=(
                 f"TIME-BASED EVIDENCE ONLY — MANUAL VALIDATION REQUIRED. "
                 f"Asking for {result['short_delay']}s took "
@@ -417,3 +466,13 @@ class CommandInjectionCheck:
                           f"{result['baseline_ceiling']}s; a zero-second "
                           f"sleep took {result.get('control_time', '?')}s. "
                           f"This is circumstantial, not proof.")])
+        finding.add(grading.Signal(
+            grading.TIMING,
+            f"Asking for {result['short_delay']}s took "
+            f"{result['short_time']}s and asking for {result['long_delay']}s "
+            f"took {result['long_time']}s, against a baseline of "
+            f"{result['baseline_median']}s. An attempt to turn this into "
+            f"command output through the same separator returned nothing.",
+            dict(finding.measurements)))
+        finding.settle()
+        return finding

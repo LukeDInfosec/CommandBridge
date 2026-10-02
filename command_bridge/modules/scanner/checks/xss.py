@@ -33,7 +33,7 @@ import urllib.parse
 
 from command_bridge.modules.scanner.model import Evidence, ScanFinding, \
     response_summary, step
-from command_bridge.modules.scanner import oracles
+from command_bridge.modules.scanner import oracles, grading
 
 CANARY = "cbx9r4t"
 #: The characters that decide whether a reflection can become execution.
@@ -153,12 +153,12 @@ class XssCheck:
             if executed is False:
                 continue
 
-            confidence = "confirmed" if executed else "firm"
-            return ScanFinding(
+            finding = ScanFinding(
                 issue=self._issue_for(point),
                 where=point.request.url,
                 point=point.label(),
-                confidence=confidence,
+                method=point.request.method,
+                auth_context=grading.auth_context(ctx),
                 detail_extra=(
                     f"Input to this parameter is reflected into the page in a "
                     f"{context['kind']} context, and the characters needed to "
@@ -170,6 +170,27 @@ class XssCheck:
                     step("Payload for that context", request, response,
                          auth=ctx.auth, payload=payload, decisive=True,
                          body_limit=400)])
+            # Reflection, executable context and execution are three
+            # different things and the report has to say which one it has.
+            # "The payload appeared in the HTML" is not cross-site scripting;
+            # it is the first of three steps towards it.
+            finding.add(grading.Signal(
+                grading.REFLECTION,
+                f"Input to '{point.name}' is returned in the response.",
+                {"context": context["kind"]}))
+            finding.add(grading.Signal(
+                grading.EXECUTABLE_CONTEXT,
+                f"The reflection lands in a {context['kind']} context and the "
+                f"characters needed to break out of it are not encoded.",
+                {"context": context["kind"], "payload": payload}))
+            if executed:
+                finding.add(grading.Signal(
+                    grading.EXECUTION,
+                    "The payload executed in a real browser: the scanner "
+                    "loaded the URL and the script ran.",
+                    {"payload": payload, "browser": True}))
+            finding.settle()
+            return finding
         return None
 
     def _executes(self, ctx, request, response, body):
@@ -268,11 +289,12 @@ class StoredXssCheck:
                     continue
                 if not re.search(re.escape(canary) + r"[^&]*[<\"']", body):
                     continue
-                findings.append(ScanFinding(
+                finding = ScanFinding(
                     issue=self.issue,
                     where=request.url,
                     point=label,
-                    confidence="firm",
+                    method=request.method,
+                    auth_context=grading.auth_context(ctx),
                     detail_extra=(
                         "Input submitted to one page is stored and rendered "
                         "on another, in a context where the characters needed "
@@ -287,6 +309,18 @@ class StoredXssCheck:
                              payload=canary, decisive=True),
                         step("Rendered here", request, response,
                              auth=ctx.auth, body_limit=400,
-                             note=contexts[0]["excerpt"])]))
+                             note=contexts[0]["excerpt"])])
+                finding.add(grading.Signal(
+                    grading.REFLECTION,
+                    f"A canary submitted to '{label}' on another page is "
+                    f"returned in the response for {request.url}.",
+                    {"canary": canary, "planted_at": origin.url}))
+                finding.add(grading.Signal(
+                    grading.EXECUTABLE_CONTEXT,
+                    f"The stored value lands in a "
+                    f"{contexts[0]['kind']} context and the characters "
+                    f"needed to break out of it are not encoded.",
+                    {"context": contexts[0]["kind"]}))
+                findings.append(finding.settle())
                 break
         return findings

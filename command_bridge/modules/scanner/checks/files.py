@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 import urllib.parse
 
+from command_bridge.modules.scanner import grading
 from command_bridge.modules.scanner.model import Evidence, ScanFinding, \
     response_summary, step
 
@@ -78,11 +79,12 @@ class TraversalCheck:
             for pattern, what in PROOF:
                 if not pattern.search(body):
                     continue
-                return [ScanFinding(
+                finding = ScanFinding(
                     issue=self.issue,
                     where=point.request.url,
                     point=point.label(),
-                    confidence="confirmed",
+                    method=request.method,
+                    auth_context=grading.auth_context(ctx),
                     detail_extra=(
                         f"The parameter is used to build a file path. The "
                         f"response contains {what}, so a file outside the web "
@@ -91,7 +93,13 @@ class TraversalCheck:
                         f"Payload: {payload}", request, response,
                         auth=ctx.auth, payload=payload, decisive=True,
                         body_limit=500,
-                        note="\n".join(body.splitlines()[:6])[:400])])]
+                        note="\n".join(body.splitlines()[:6])[:400])])
+                finding.add(grading.Signal(
+                    grading.DATA,
+                    f"The response contains {what}, which the web root does "
+                    f"not hold, so a file outside it was read and returned.",
+                    {"payload": payload, "matched": what}))
+                return [finding.settle()]
 
         for payload in LFI_PAYLOADS:
             request = point.build(payload, mode="replace")
@@ -102,11 +110,12 @@ class TraversalCheck:
             # A base64 PHP source file starts with the encoding of "<?php".
             if body.startswith(("PD9waHA", "PHNjcmlwdA")) or \
                     re.search(r"\bPATH=/", body):
-                return [ScanFinding(
+                finding = ScanFinding(
                     issue="file_inclusion",
                     where=point.request.url,
                     point=point.label(),
-                    confidence="confirmed",
+                    method=request.method,
+                    auth_context=grading.auth_context(ctx),
                     detail_extra=(
                         "The parameter selects a file that the application "
                         "reads. A PHP stream wrapper returned the source of "
@@ -115,7 +124,13 @@ class TraversalCheck:
                     evidence=[step(
                         f"Payload: {payload}", request, response,
                         auth=ctx.auth, payload=payload, decisive=True,
-                        body_limit=400)])]
+                        body_limit=400)])
+                finding.add(grading.Signal(
+                    grading.DATA,
+                    "A PHP stream wrapper returned the encoded contents of "
+                    "another file on the server.",
+                    {"payload": payload, "prefix": body[:24]}))
+                return [finding.settle()]
         return []
 
 
@@ -159,11 +174,12 @@ class OpenRedirectCheck:
                 if REDIRECT_CANARY not in host:
                     continue
                 proof = f"Location: {location}"
-            return [ScanFinding(
+            finding = ScanFinding(
                 issue=self.issue,
                 where=point.request.url,
                 point=point.label(),
-                confidence="confirmed",
+                method=request.method,
+                auth_context=grading.auth_context(ctx),
                 detail_extra=(
                     "The destination is taken from the request and used "
                     "without being checked against an allow-list. The "
@@ -172,5 +188,11 @@ class OpenRedirectCheck:
                 evidence=[step(
                     f"Payload: {payload}", request, response,
                     auth=ctx.auth, payload=payload, decisive=True,
-                    body_limit=200, note=proof)])]
+                    body_limit=200, note=proof)])
+            finding.add(grading.Signal(
+                grading.OBSERVATION,
+                f"The response directs the browser to a host taken from the "
+                f"request ({proof}).",
+                {"payload": payload, "proof": proof}))
+            return [finding.settle()]
         return []

@@ -46,11 +46,35 @@ import urllib.parse
 from command_bridge.modules.scanner.model import Evidence, ScanFinding, \
     response_summary, step
 from command_bridge.modules.scanner import oracles
+from command_bridge.modules.scanner import grading
 
 #: Pages that are meant to be reachable without logging in.
 PUBLIC = re.compile(
     r"/(login|signin|register|signup|logout|about|contact|terms|privacy|"
     r"robots\.txt|favicon|health|status|static|assets|public)(/|$|\?)", re.I)
+
+#: Files the browser fetches to render the page. jQuery is *meant* to be
+#: readable without a session; so are the stylesheets, the fonts and the logo.
+#: Reporting them as broken access control is noise of the worst kind,
+#: because there are hundreds of them and they crowd out the one finding that
+#: matters. A static asset is never an access-control finding, whatever the
+#: comparison says.
+STATIC_ASSET = re.compile(
+    r"\.(?:js|mjs|cjs|jsx|ts|css|scss|less|map|png|jpe?g|gif|svg|webp|avif|"
+    r"ico|bmp|tiff?|woff2?|ttf|otf|eot|mp4|webm|ogg|mp3|wav|flac|avi|mov|"
+    r"pdf|zip|gz|tgz|bz2|xz|7z|rar|txt|xml|json|csv|wasm|manifest|"
+    r"appcache)(?:$|\?|#)", re.I)
+
+#: Directories that hold them, for applications that serve assets without an
+#: extension (a bundler hash route, a CDN-style path).
+ASSET_PATH = re.compile(
+    r"/(?:scripts?|js|javascript|css|styles?|fonts?|images?|img|media|"
+    r"content|dist|build|bundles?|_next/static|__webpack|vendor|lib|libs|"
+    r"node_modules|wp-includes|wp-content/(?:themes|plugins))/", re.I)
+
+
+def is_static_asset(url):
+    return bool(STATIC_ASSET.search(url or "") or ASSET_PATH.search(url or ""))
 
 _ATTRIBUTES = re.compile(r"""=\s*(?:"[^"]*"|'[^']*')""")
 _SCRIPTS = re.compile(r"<(script|style)\b.*?</\1>", re.I | re.S)
@@ -130,14 +154,32 @@ class AccessControlCheck:
         check does not run rather than answering it wrongly.
         """
         config = getattr(ctx.auth, "config", None)
-        return bool(config and config.strategy != "none"
-                    and getattr(ctx.auth, "logged_in", False))
+        if not (config and config.strategy != "none"):
+            return False
+        if not getattr(ctx.auth, "logged_in", False):
+            return False
+        # `logged_in` on its own is not enough. A session that was established
+        # and has since died leaves the flag set in some code paths, and this
+        # check is the one that pays for it: with both halves of the
+        # comparison anonymous, every page matches every page and the whole
+        # crawl is reported as broken access control. So the outcome has to
+        # agree, and the outcome only says "ok" when a verification URL
+        # actually confirmed it.
+        outcome = getattr(ctx.auth, "outcome", None)
+        if outcome is not None and outcome.state not in ("ok", "unverified"):
+            return False
+        return True
 
     # ── the pass over every request ──────────────────────────────────────
     def run(self, ctx, request):
         if request.method not in ("GET", "POST"):
             return []
         if PUBLIC.search(request.url):
+            return []
+        if is_static_asset(request.url):
+            # jQuery, the stylesheet and the logo are served to everybody on
+            # purpose. They are not access-control findings, and there are
+            # enough of them to bury the one that is.
             return []
         if not self.authenticated(ctx):
             # Without a logged-in session there is nothing to compare against.
@@ -212,11 +254,15 @@ class AccessControlCheck:
                ).LOGGED_OUT_SIGNS):
             return None
 
-        return ScanFinding(
+        repeated, again = self._repeats(
+            self.unauthenticated, request, authorised, 0.9)
+
+        finding = ScanFinding(
             issue="access_control",
             where=request.url,
             point="no session",
-            confidence="confirmed",
+            method=request.method,
+            auth_context=grading.auth_context(ctx),
             detail_extra=(
                 f"This page was requested with no session cookie at all and "
                 f"returned the same content as it does for a logged-in user "
@@ -228,6 +274,26 @@ class AccessControlCheck:
                 step("With no session", request, anonymous,
                      auth=self.unauthenticated, decisive=True, body_limit=350,
                      note="No cookies, no Authorization header.")])
+        finding.add(grading.Signal(
+            grading.DIFFERENTIAL,
+            f"With no session cookie the page returned the same content as "
+            f"it does for a logged-in user ({int(likeness * 100)}% "
+            f"identical)" + (f", and a second serial request repeated it "
+                             f"({int(again * 100)}%)." if repeated
+                             else ", but a second serial request did not "
+                                  "repeat it."),
+            {"similarity": round(likeness, 4),
+             "repeat_similarity": round(again, 4),
+             "authorised_status": authorised.status_code,
+             "anonymous_status": anonymous.status_code},
+            reproduced=repeated))
+        finding.add(grading.Signal(
+            grading.OBSERVATION,
+            "The response to the unauthenticated request was not a redirect "
+            "to a login page, a 401, a 403, or a login form rendered with "
+            "HTTP 200.",
+            {"status": anonymous.status_code}))
+        return finding.settle()
 
     # ── replay as somebody else ──────────────────────────────────────────
     def _cross_identity(self, ctx, request, authorised):
@@ -312,11 +378,13 @@ class AccessControlCheck:
             return None
 
         likeness = oracles.similarity(authorised.text, other.text)
-        return ScanFinding(
+        repeated, again = self._repeats(challenger, request, authorised, 0.95)
+        finding = ScanFinding(
             issue="access_control",
             where=request.url,
             point=", ".join(identifiers),
-            confidence="confirmed",
+            method=request.method,
+            auth_context=grading.auth_context(ctx),
             severity="HIGH",
             detail_extra=(
                 f"HORIZONTAL ACCESS CONTROL FAILURE (IDOR). The request "
@@ -330,6 +398,23 @@ class AccessControlCheck:
                 f"can read any other user's data by changing the identifier."),
             evidence=self._pair(request, authorised, other,
                                 privileged, challenger, likeness))
+        finding.add(grading.Signal(
+            grading.DIFFERENTIAL,
+            f"Replayed as {challenger.config.name}, the request returned the "
+            f"same record ({int(likeness * 100)}% identical)"
+            + (f" and a second serial replay returned it again "
+               f"({int(again * 100)}%)." if repeated
+               else ", but a second serial replay did not return it again."),
+            {"similarity": round(likeness, 4),
+             "repeat_similarity": round(again, 4),
+             "identifiers": list(identifiers)},
+            reproduced=repeated))
+        finding.add(grading.Signal(
+            grading.OBSERVATION,
+            f"The challenger's response contains '{marker}', which belongs "
+            f"to {privileged.config.name}.",
+            {"owner_marker": marker}))
+        return finding.settle()
 
     def _vertical(self, ctx, request, authorised, privileged, challenger):
         """The privilege-escalation case: does the lower account get in?"""
@@ -372,11 +457,13 @@ class AccessControlCheck:
                  if privileged_path else "a page reached as the privileged "
                                          "account")
         marker = marker if leaked else ""
-        return ScanFinding(
+        repeated, again = self._repeats(challenger, request, authorised, 0.90)
+        finding = ScanFinding(
             issue="access_control",
             where=request.url,
             point=", ".join(identifiers) or "whole request",
-            confidence="confirmed",
+            method=request.method,
+            auth_context=grading.auth_context(ctx),
             severity=severity,
             detail_extra=(
                 f"VERTICAL ACCESS CONTROL FAILURE (PRIVILEGE ESCALATION). "
@@ -393,6 +480,27 @@ class AccessControlCheck:
                   "account is enough to reach it."),
             evidence=self._pair(request, authorised, other,
                                 privileged, challenger, likeness))
+        finding.add(grading.Signal(
+            grading.DIFFERENTIAL,
+            f"The request succeeded as {privileged.config.name} and, "
+            f"replayed as {challenger.config.name}, returned the same "
+            f"content ({int(likeness * 100)}% identical)"
+            + (f"; a second serial replay returned it again "
+               f"({int(again * 100)}%)." if repeated
+               else ", but a second serial replay did not return it again."),
+            {"similarity": round(likeness, 4),
+             "repeat_similarity": round(again, 4),
+             "privileged_path": privileged_path},
+            reproduced=repeated))
+        finding.add(grading.Signal(
+            grading.OBSERVATION,
+            (f"The lower-privileged account's response contains '{marker}', "
+             f"which belongs to {privileged.config.name}." if marker
+             else "The URL is an administrative or otherwise privileged "
+                  "path, so it is not a page both accounts are meant to "
+                  "share."),
+            {"owner_marker": marker, "privileged_path": privileged_path}))
+        return finding.settle()
 
     # ── shared judging ───────────────────────────────────────────────────
     @staticmethod
@@ -437,6 +545,23 @@ class AccessControlCheck:
             if own and len(own) >= 3 and own in body:
                 return False
         return True
+
+    @staticmethod
+    def _repeats(sender, request, authorised, threshold):
+        """Ask the same question a second time, on its own.
+
+        A differential seen once can be a cache, a race, or a server that
+        truncated under the load of a concurrent scan. One serial replay is
+        what separates a behavioural difference from a coincidence, and the
+        grading module will not confirm a differential that did not repeat.
+        """
+        again = sender.send(request, allow_redirects=False)
+        if again is None or again.status_code >= 400:
+            return False, 0.0
+        if again.status_code in (301, 302, 303, 307, 308):
+            return False, 0.0
+        likeness = oracles.similarity(authorised.text, again.text)
+        return likeness >= threshold, likeness
 
     @staticmethod
     def _got_the_same_page(authorised, other, threshold):
