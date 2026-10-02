@@ -1,7 +1,7 @@
 ================================================================================
  COMMAND BRIDGE v4 — PROJECT REFERENCE & CHANGELOG
  (Reference doc for Claude / future sessions. Keep this updated after changes.)
- Last updated: 2026-10-01
+ Last updated: 2026-10-02
 ================================================================================
 
 HOW TO USE THIS FILE
@@ -18,6 +18,211 @@ HOW TO USE THIS FILE
 ================================================================================
  CHANGELOG (most recent first)
 ================================================================================
+
+## 2026-10-02 — EVIDENCE DECIDES, NOT THE DETECTOR (6.8.0)
+
+Reported from a live engagement: SQL injection raised as "[CONFIRMED]
+CRITICAL" on `header 'X-Original-URL'` on the strength of a stopwatch alone —
+a 3.43s baseline, a 5s payload that took 4.59s, a 10s payload that took 8.58s.
+On an application that is slow, loaded or behind a proxy that is not evidence
+of anything. The fix is not wording: no check is allowed to declare its own
+confidence any more.
+
+1. A NEW MODULE GRADES EVIDENCE — modules/scanner/grading.py
+
+   Evidence has grades, ordered by how hard each is to explain away: an
+   out-of-band callback, command execution, backend-derived data, an
+   engine-specific error signature, a reproduced behavioural differential, an
+   executable context, a plain observation, a response-time anomaly, a
+   reflection, and "the application accepted the input" (which proves
+   nothing). POLICY maps each issue class to which grades are decisive for it,
+   which merely support, and which can NEVER confirm it however many are seen.
+
+   grade(issue, signals) -> Verdict. The rules, in order: a decisive signal
+   confirms — except a differential, which must have been REPRODUCED, because
+   one pair of responses that differ is what a page with a timestamp in it
+   looks like; evidence drawn only from the class's "never" list is capped at
+   Potential, since three stopwatch readings are one stopwatch reading; two
+   independent supporting signals make it Likely; one makes it Potential;
+   nothing usable is Inconclusive.
+
+   Four levels: confirmed / likely / potential / inconclusive. Every Verdict
+   carries its rationale, its limitations (what could explain the observation
+   without the vulnerability) and the verification step that would settle it.
+
+   For sqli, timing and reflection are both on the "never" list. The field
+   scenario above now reports POTENTIAL with the raw measurements preserved.
+
+2. EVERY ACTIVE CHECK WAS REFACTORED, NOT JUST SQL INJECTION
+
+   ScanFinding gained .signals, .verdict, .measurements, .auth_context and
+   .method, plus .add(signal) and .settle(); .confidence is derived by
+   settle() and is never assigned by a check. The hard-coded
+   confidence="confirmed" is gone from every check in the scanner.
+
+   - sqli.py: new METADATA_PROBES — eight read-only expressions (MSSQL
+     CONVERT(int,@@version)/DB_NAME(), MySQL EXTRACTVALUE, PostgreSQL
+     CAST(version() AS int)/current_database(), Oracle UTL_INADDR, SQLite
+     load_extension) each with an extraction regex, tried ONLY once another
+     channel has already fired, so a clean endpoint is never sent them.
+     Database-derived data and engine errors now outrank the stopwatch, and a
+     timing observation contributes measurements and nothing else. Nothing is
+     dumped: one version string or database name is the whole of it.
+   - injection.py: SSTI, code injection and command injection confirm on
+     EXECUTION — a real command's output carrying the random marker — and a
+     sleep that worked attaches a TIMING signal only.
+   - xss.py: reflected and stored both attach REFLECTION plus
+     EXECUTABLE_CONTEXT, and EXECUTION only when the browser actually ran the
+     payload. Without a browser, XSS does not reach confirmed.
+   - files.py: traversal and file inclusion confirm on DATA (file contents),
+     open redirect on OBSERVATION (where the browser was actually sent).
+   - access.py: both halves now re-ask the question serially before reporting
+     (_repeats), so a differential caused by a cache, a race or a server
+     truncating under a concurrent scan is not confirmed.
+
+   Declared but NOT IMPLEMENTED, and now said so in the module and in the
+   report header: SSRF, XXE and unsafe deserialization have policies so an
+   imported finding is graded by the same rules, but the Active Scan has no
+   detector for them and will never raise one.
+
+3. SEVERITY AND CONFIDENCE ARE TWO STATEMENTS (§18)
+
+   Severity says how bad it is if real; confidence says how well it is
+   evidenced. Neither scales the other. grading.severity_label() and
+   cb_evidence.severity_label() print the relationship instead of hiding it:
+   "Potentially Critical", or "CRITICAL if real" when inconclusive. The
+   findings table keeps them in separate columns with separate palettes, so a
+   confirmed low and a potential critical cannot look alike at a glance.
+
+4. RAW DETECTION IS KEPT APART FROM THE INTERPRETED FINDING (§17)
+
+   cb_evidence.detail_html(), report.as_markdown(), report.as_html() and
+   report.as_json() all show the graded signals and their raw measurements in
+   their own labelled section FIRST, then the interpretation, then what could
+   explain it without the vulnerability, then — for anything short of
+   confirmed — how to confirm it. The JSON carries raw_detection.signals and
+   raw_detection.measurements so a consumer can re-judge the evidence itself.
+
+5. ONE PLACE RECONCILES THE GRADE WITH THE EVIDENCE CHAIN
+
+   cb_evidence.assess_scan() now reads the scanner's graded verdict instead
+   of asking "did the detector say confirmed". The grade governs in both
+   directions — it can confirm and it can hold a finding down — and it can
+   never lift one above what its evidence chain supports. Its rationale,
+   limitations and verification advice are carried into the Validation, so
+   the Findings pane, the Markdown report, the HTML report and the JSON
+   cannot disagree about a single finding. coffee_break.finding_from_scan()
+   goes through the same function.
+
+6. AUTHENTICATION CONTEXT ON EVERY FINDING (§15)
+
+   grading.auth_context() records whether the scan was authenticated, by
+   which method, as which identity, which verification URL proved it, and
+   whether the session was ever verified or was lost mid-scan. Printed on
+   every finding in all three formats: SQL injection on a public search box
+   and the same injection behind an administrator login are not the same
+   report.
+
+Verified: SlowClean (3-4s jittery baseline, no bugs) -> no findings;
+ErrorSqli -> CONFIRMED via backend-derived data and an engine error signature,
+returning 'Microsoft SQL Server 2019 (RTM) - 15.0.2000.5'; BlindSqli ->
+CONFIRMED via a reproduced behavioural differential; TimingMimic (latency
+scales with a number in the input, no SQL anywhere) -> no findings at all: the
+stability gate rejected it before grading, and had it been raised the ceiling
+for timing-only evidence is POTENTIAL. All four suites pass
+(test_scanner 284, test_coffee_break 288, test_coffee_chain 13,
+test_gui_smoke 242).
+
+
+## 2026-10-02 — THE LIGHT AND THE REPORT TELL THE SAME STORY (6.7.1)
+
+Reported from a live engagement: the indicator showed a green "Authentication
+Successful" while the finished report said (UNAUTHENTICATED), the login
+genuinely failed against an ASP.NET portal with correct credentials, and the
+findings list filled with HIGH "broken access control" on jQuery. Three bugs,
+reproduced against a portal built to match the log that was sent in.
+
+1. THE LOGIN FAILED BECAUSE THE SUBMIT BUTTON WAS NEVER SENT
+
+   _read_login_form() read `<input>` elements only, and inside those it
+   skipped type="submit". ASP.NET MVC controllers routinely branch on the
+   submit control — `Command=Login` — to tell a login POST from any other
+   POST to the same URL. Without it the controller never treats the request
+   as a login, re-renders the page, and the scanner reports refused
+   credentials against credentials that are fine. The log said so exactly:
+
+       [AUTH] Login response: HTTP 200 at https://example.com/
+       [auth] AUTHENTICATION FAILED — the login request returned the login
+              page again
+
+   FIXED. The parser now reads what a browser would send: `<button>`
+   (the modern spelling of the same thing), `<select>` and `<textarea>`
+   defaults, ticked checkboxes, and the FIRST submit control's name and
+   value — first only, because a browser sends the button that was clicked
+   and a form with "Log in" and "Forgot password" must not send both.
+
+2. A GUESS WAS OVERRULING THE EVIDENCE
+
+   _login_form() decided the login had failed from the shape of the login
+   response and returned False — BEFORE check_session() had ever requested
+   the verification URL. On a portal whose home page carries a login widget
+   beside its content, or which renders the dashboard at the same path, a
+   completely successful login was reported as refused.
+
+   FIXED. The login response is now a signal, not a verdict. What it looked
+   like is recorded; the verification URL decides. The heuristic only has the
+   final word when there is no verification URL to consult — the one case
+   where a guess beats nothing. When the two disagree, both are reported:
+   a refused login now reads "the application replied 'Invalid username',
+   and the session signature 'Sign out' was not in the response" rather than
+   only the second half.
+
+3. WHY THE LIGHT AND THE REPORT DISAGREED, AND WHY jQUERY WAS "HIGH"
+
+   One line in send():
+
+       self.logged_in = retried is not None and self.looks_logged_in(retried)
+
+   `logged_in` is what AccessControlCheck reads to decide whether there is a
+   real session to compare an anonymous one against. Setting it from whether
+   one arbitrary response looked logged-in meant an entirely unauthenticated
+   scan could flip it true — and then the check compared an anonymous session
+   against an anonymous session, found every page 100% identical, and
+   reported the whole crawl as broken access control. Including jQuery.
+
+   The same line reset _consecutive_lapses, which re-armed the three-strikes
+   test, which is why the log showed "session lapsed — logging back in
+   (attempt 7)" long after the scanner had announced it was giving up.
+
+   FIXED
+     * `logged_in` is set only by check_session() — the verification URL —
+       and never by a single response's appearance.
+     * _gave_up is now a hard stop. A login refused at the start is never
+       retried at all (_relogins goes from 7 to 0 on the reproduction).
+     * ScanResult.authenticated is DERIVED from the outcome rather than
+       tracked separately, so the report line and the indicator are the same
+       fact read twice and cannot drift.
+     * Authenticator.on_state_change publishes every change, so the indicator
+       follows the session for the whole run. A session that dies forty
+       minutes in now shows "Session Lost During Scan" while it is happening
+       instead of being inferred afterwards from an empty report. That is a
+       new state, distinct from "failed": a login that never worked is a
+       configuration problem, a session that died is a timeout or a
+       concurrent-login policy, and the findings up to that point are real.
+     * AccessControlCheck additionally refuses to run unless the outcome
+       itself says ok/unverified, and skips static assets outright —
+       .js/.css/fonts/images and the directories that hold them. jQuery is
+       meant to be readable without a session.
+
+TESTS — 251 scanner / 236 GUI / 288 Coffee Break / 13 chain. The new section
+  runs a real ASP.NET-shaped portal: anti-forgery token, login form on the
+  home page, POST to the same URL, 200 either way, and a controller that
+  branches on the button. It asserts the login succeeds, that a genuinely
+  refused one still fails with the application's own words, that the
+  indicator and the report agree in both cases, that a mid-scan session loss
+  is reported as a loss, and that nothing static is ever an access-control
+  finding.
+
 
 ## 2026-10-01 — PROVE IT, THEN HAND IT OVER (6.7.0)
 
