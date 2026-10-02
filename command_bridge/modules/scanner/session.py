@@ -117,6 +117,7 @@ class AuthOutcome:
         self.reason = ""
         self.lines = []
         self.finished = False
+        self.was_lost = False
 
     def step(self, line):
         """Record one step. Returns the line, so callers can log it too."""
@@ -128,12 +129,31 @@ class AuthOutcome:
         self.verified = bool(ok and verified)
         self.reason = reason
         self.finished = True
+        self.was_lost = False
+        return self
+
+    def lost(self, reason):
+        """The session worked and has stopped working.
+
+        A distinct state rather than a flip back to failed, because the two
+        mean different things to whoever is reading the report: a login that
+        never worked is a configuration problem, and a session that died
+        forty minutes in is a timeout or a concurrent-login policy, and the
+        findings up to that point are still real.
+        """
+        self.ok = False
+        self.verified = False
+        self.was_lost = True
+        self.reason = reason
+        self.finished = True
         return self
 
     @property
     def state(self):
         if not self.finished:
             return "checking"
+        if getattr(self, "was_lost", False):
+            return "lost"
         if not self.ok:
             return "failed"
         return "ok" if self.verified else "unverified"
@@ -142,6 +162,7 @@ class AuthOutcome:
         return {"checking": "Checking authentication…",
                 "ok": "Authentication Successful",
                 "unverified": "Authentication Unverified",
+                "lost": "Session Lost During Scan",
                 "failed": "Authentication Failed"}[self.state]
 
     def as_dict(self):
@@ -218,6 +239,15 @@ class Authenticator:
         self.sent = 0
         self._consecutive_lapses = 0
         self._gave_up = False
+        self._login_doubt = ""
+        self.outcome = AuthOutcome(method=METHOD_NAMES.get(config.strategy,
+                                                           config.strategy))
+        #: Called with the outcome whenever the authentication state changes.
+        #: The interface uses it to keep its indicator honest *during* a run
+        #: rather than only at the start — a session that dies in the middle
+        #: of a two-hour scan is something the operator needs to see while it
+        #: is happening, not inferred afterwards from an empty report.
+        self.on_state_change = None
         try:
             import urllib3
             urllib3.disable_warnings()
@@ -300,8 +330,28 @@ class Authenticator:
         step(("Verification: " if ok else "Verification indicates an "
               "unauthenticated session: ") + reason)
         self.logged_in = ok
+        if not ok and self._login_doubt:
+            # The verification failed and the login response already told us
+            # why. "the signature was not in the response" is true and
+            # useless; "the application replied 'Invalid username or
+            # password'" is the thing to act on.
+            reason = f"{self._login_doubt}, and {reason}"
+        elif ok and self._login_doubt:
+            # Worth recording: the login response looked like a failure and
+            # the verification URL disagreed. Whoever reads this later should
+            # know the verdict came from the check, not from the POST.
+            reason = (f"{reason} (the login response itself looked "
+                      f"unsuccessful — {self._login_doubt} — but the "
+                      f"verification URL confirms the session)")
         self.outcome.finish(ok, reason,
                             verified=bool(self.config.check_url))
+        if not ok:
+            # Nothing is gained by re-logging in during the scan with
+            # credentials that have just been refused. Without this the run
+            # log fills with "session lapsed — logging back in (attempt 7)"
+            # long after the scanner has announced it is continuing
+            # unauthenticated.
+            self._gave_up = True
         self._announce()
         return self.logged_in
 
@@ -316,6 +366,38 @@ class Authenticator:
                    "checking": "authentication still in progress"}
         self.report(f"[auth] {self.config.name}: "
                     f"{verdict[self.outcome.state]}")
+        self._publish()
+
+    def _publish(self):
+        """Tell whoever is watching what the state is now.
+
+        The interface's indicator and the report's "authenticated" line must
+        never be able to disagree, and the only way to guarantee that is for
+        both to read the same object and for every change to it to be
+        published. A green light beside a report that says UNAUTHENTICATED is
+        worse than either one being wrong on its own, because it means
+        neither can be trusted.
+        """
+        if self.on_state_change:
+            try:
+                self.on_state_change(self.outcome)
+            except Exception:                           # noqa: BLE001
+                pass
+
+    def session_lost(self, reason):
+        """The session was established and has since stopped working.
+
+        Only meaningful if it ever worked. A login that was refused at the
+        start stays "failed", with the reason it was refused — relabelling it
+        "session lost" would replace the one piece of information the
+        operator needs ("the credentials were rejected") with a vaguer one.
+        """
+        if self.outcome.state in ("lost", "failed"):
+            return
+        self.outcome.lost(reason)
+        self.logged_in = False
+        self.report(f"[auth] {self.config.name}: SESSION LOST — {reason}")
+        self._publish()
 
     def _apply_static(self):
         for name, value in (self.config.cookies or {}).items():
@@ -373,24 +455,50 @@ class Authenticator:
         step(f"Login response: HTTP {response.status_code} "
              f"at {str(response.url)}")
 
-        # A 200 from the login endpoint is not success. Applications re-serve
-        # the login page with an error message on the same status code, and
-        # treating that as a win is how a scan runs entirely logged out while
-        # claiming otherwise.
+        # What the login response looks like is a *signal*, not the verdict.
+        #
+        # This is the ordering that was wrong before, and it is worth being
+        # explicit about because it is the whole design. A 200 from the login
+        # endpoint proves nothing — applications re-serve the login page with
+        # an error on the same status code. So the previous version refused
+        # the login whenever the response came back at the same URL carrying
+        # something login-shaped, and returned False immediately.
+        #
+        # The problem is that it returned False *before the verification URL
+        # was ever requested*. A guess was overruling the only piece of real
+        # evidence available, and on an application whose home page carries a
+        # login widget beside its content — or which simply renders the
+        # dashboard at the same path — a completely successful login was
+        # reported as refused credentials.
+        #
+        # So: record what was seen, and let check_session() decide. The
+        # heuristic only has the final word when there is no verification URL
+        # to consult, which is the one case where a guess is better than
+        # nothing.
+        self._login_doubt = ""
+        rejected = LOGGED_OUT_PROSE.search(response.text or "")
         landed_back = (str(response.url).split("?")[0].rstrip("/") ==
                        self.config.login_url.split("?")[0].rstrip("/"))
-        rejected = LOGGED_OUT_PROSE.search(response.text or "")
         if rejected:
-            self.outcome.finish(
-                False, f"the credentials were rejected — the application "
-                       f"replied {rejected.group(0).strip()!r}")
-            return False
-        if landed_back and LOGIN_FORM_SHAPE.search(response.text or ""):
-            self.outcome.finish(
-                False, "the login request returned the login page again, "
-                       "which usually means the credentials were refused or "
-                       "a required field was missing")
-            return False
+            self._login_doubt = (f"the application replied "
+                                 f"{rejected.group(0).strip()!r}")
+        elif landed_back and LOGIN_FORM_SHAPE.search(response.text or ""):
+            self._login_doubt = ("the login request returned a page carrying "
+                                 "a login form again")
+        if self._login_doubt:
+            step(f"The login response looks unsuccessful: {self._login_doubt}"
+                 + (". The verification URL decides."
+                    if self.config.check_url else
+                    ". There is no verification URL, so this is the only "
+                    "evidence available."))
+            if not self.config.check_url:
+                self.outcome.finish(
+                    False,
+                    f"{self._login_doubt}, and with no verification URL set "
+                    f"there is nothing that can confirm otherwise. Set a "
+                    f"session check URL and a string that only appears when "
+                    f"logged in, and the scan will be able to tell.")
+                return False
         return True
 
     def _login_browser(self):
@@ -572,6 +680,17 @@ class Authenticator:
         response = self._send_once(request, allow_redirects, timeout)
         if self.config.strategy == "none" or response is None:
             return response
+        # Once we have given up, stay given up.
+        #
+        # This guard was missing and the effect was visible in the log as
+        # "session lapsed — logging back in (attempt 4) … (attempt 7)" after
+        # the scanner had already announced it was continuing unauthenticated.
+        # The cause is three lines below: any response that happens to look
+        # logged in resets the lapse counter, so the "three strikes" test kept
+        # being re-armed and the scan spent itself on login requests it had
+        # already decided were pointless.
+        if self._gave_up:
+            return response
         if self.looks_logged_in(response):
             self._consecutive_lapses = 0
             return response
@@ -589,12 +708,14 @@ class Authenticator:
             # Something is wrong that logging in again will not fix. Say so
             # once and let the engine's report carry it, rather than spending
             # the scan on login requests.
-            if not self._gave_up:
-                self._gave_up = True
-                self.report("[auth] the session will not stay established — "
-                            "continuing unauthenticated, and the report will "
-                            "say so")
-                self.logged_in = False
+            self._gave_up = True
+            self.session_lost(
+                "the session would not stay established after three "
+                "re-logins. Everything from this point on was requested as "
+                "an anonymous user.")
+            self.report("[auth] the session will not stay established — "
+                        "continuing unauthenticated, and the report will "
+                        "say so")
             return response
         # One re-login, then one retry. If it is still logged out the session
         # is genuinely broken and the engine needs to hear about it.
@@ -617,7 +738,26 @@ class Authenticator:
                 self.logged_in = False
                 return response
         retried = self._send_once(request, allow_redirects, timeout)
-        self.logged_in = retried is not None and self.looks_logged_in(retried)
+        # `logged_in` is read by the access-control check to decide whether
+        # there is a real session to compare an anonymous one against, so it
+        # must mean "the verification URL says we are logged in" and nothing
+        # weaker. It used to be set from whether one arbitrary response looked
+        # logged-in, and that is how an entirely unauthenticated scan came to
+        # report broken access control on every page it had crawled —
+        # including jQuery. Both halves of that comparison were anonymous, so
+        # of course they matched, and the check believed it was comparing a
+        # privileged session against an anonymous one.
+        ok, reason = self.check_session()
+        self.logged_in = ok
+        if not ok:
+            self._consecutive_lapses += 1
+        else:
+            self._consecutive_lapses = 0
+            if self.outcome.state in ("failed", "lost"):
+                self.outcome.finish(True, f"re-established mid-scan: {reason}",
+                                    verified=bool(self.config.check_url))
+                self.report(f"[auth] {self.config.name}: session re-established")
+                self._publish()
         return retried if retried is not None else response
 
     def _send_once(self, request, allow_redirects, timeout):
@@ -651,7 +791,30 @@ class Authenticator:
 
 
 def _read_login_form(html, base_url):
-    """Hidden fields, field names and the action URL of the login form."""
+    """Every field the browser would send, the field names, and the action.
+
+    "Every field the browser would send" is the part that was wrong, and it
+    cost a real engagement. The first version read ``<input>`` elements only,
+    and inside those it skipped anything of type ``submit``. That drops three
+    things an application may well require:
+
+      * **the submit control's own name and value.** A great many server-side
+        frameworks branch on it — ASP.NET MVC in particular, where a
+        controller reads ``Command=Login`` to tell a login POST from any
+        other POST to the same URL. Without it the controller does not treat
+        the request as a login at all, re-renders the page, and the scanner
+        reports "the credentials were refused" against perfectly good
+        credentials;
+      * **``<button name=… value=…>``**, which is the modern spelling of
+        exactly that and was not being looked at at all;
+      * **``<select>`` and ``<textarea>``**, which carry their own defaults
+        and are occasionally mandatory (a tenant or region picker beside the
+        login box).
+
+    Only the *first* submit control is sent, because a browser sends the one
+    that was clicked and never more than one — a form with "Log in" and
+    "Forgot password" buttons must not have both.
+    """
     hidden, username_field, password_field, action = {}, "", "", ""
     try:
         from bs4 import BeautifulSoup
@@ -665,17 +828,54 @@ def _read_login_form(html, base_url):
             return hidden, ("", ""), ""
         if form.get("action"):
             action = urllib.parse.urljoin(base_url, form["action"])
-        for field in form.find_all("input"):
-            kind = (field.get("type") or "text").lower()
+
+        submit_sent = False
+        for field in form.find_all(["input", "button", "select", "textarea"]):
+            tag = field.name.lower()
             name = field.get("name")
+
+            if tag == "button":
+                kind = (field.get("type") or "submit").lower()
+                if kind == "submit" and name and not submit_sent:
+                    hidden[name] = field.get("value", "")
+                    submit_sent = True
+                continue
+
+            if tag == "select":
+                if not name:
+                    continue
+                chosen = field.find("option", selected=True) or \
+                    field.find("option")
+                if chosen is not None:
+                    hidden[name] = chosen.get("value",
+                                              chosen.get_text(strip=True))
+                continue
+
+            if tag == "textarea":
+                if name:
+                    hidden[name] = field.get_text()
+                continue
+
+            kind = (field.get("type") or "text").lower()
+            if kind in ("submit", "image"):
+                # The clicked button. A browser sends exactly one.
+                if name and not submit_sent:
+                    hidden[name] = field.get("value", "")
+                    submit_sent = True
+                continue
             if not name:
                 continue
             if kind == "hidden":
                 hidden[name] = field.get("value", "")
             elif kind == "password" and not password_field:
                 password_field = name
-            elif kind in ("text", "email") and not username_field:
-                username_field = name
+            elif kind in ("checkbox", "radio"):
+                # Only a ticked box is submitted. "Remember me" left alone.
+                if field.has_attr("checked"):
+                    hidden[name] = field.get("value", "on")
+            elif kind in ("text", "email", "tel", "number", ""):
+                if not username_field:
+                    username_field = name
     except Exception:                                   # noqa: BLE001
         pass
     return hidden, (username_field, password_field), action

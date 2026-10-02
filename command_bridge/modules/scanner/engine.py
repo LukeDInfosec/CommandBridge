@@ -257,10 +257,18 @@ class ScanEngine:
                 "below was found as an unauthenticated user, which is a "
                 "fraction of the application.")
             self.on_log("[scan] WARNING: not authenticated — see the report")
-        self.result.authenticated = auth.logged_in and \
-            self.auth_config.strategy != "none"
         self.result.auth_outcome = getattr(auth, "outcome", None)
         self.auth = auth
+        # One source of truth. `authenticated` is derived from the outcome
+        # rather than tracked separately, so the report line and the
+        # interface's indicator cannot disagree — they are the same fact read
+        # twice. They did disagree, and a green light above a report that
+        # says UNAUTHENTICATED destroys trust in both.
+        self.result.authenticated = self.authenticated_now()
+        # The indicator follows the session for the whole run, not just the
+        # first second of it. A session that dies forty minutes in is
+        # something the operator needs to see while it is happening.
+        auth.on_state_change = self._auth_changed
         try:
             self.on_auth(self.result.auth_outcome)
         except Exception:                               # noqa: BLE001
@@ -417,6 +425,27 @@ class ScanEngine:
         return ordered
 
     # ── pieces ───────────────────────────────────────────────────────────
+    def authenticated_now(self):
+        """Whether the scan currently has a session it has actually proved.
+
+        Read from the outcome, which is the same object the interface shows,
+        so the two can never drift. "unverified" counts as authenticated —
+        the session exists and the scan is using it — but the outcome keeps
+        the distinction so the report can say it was never confirmed.
+        """
+        if self.auth_config.strategy == "none":
+            return False
+        outcome = getattr(getattr(self, "auth", None), "outcome", None)
+        return bool(outcome and outcome.state in ("ok", "unverified"))
+
+    def _auth_changed(self, outcome):
+        self.result.auth_outcome = outcome
+        self.result.authenticated = self.authenticated_now()
+        try:
+            self.on_auth(outcome)
+        except Exception:                               # noqa: BLE001
+            pass
+
     def _identity(self, config):
         auth = Authenticator(config, report=self.on_log)
         auth.pace = self.pacer.wait
