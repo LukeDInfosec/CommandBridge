@@ -21,10 +21,24 @@ import json
 import time
 
 from command_bridge.modules import cb_evidence, cb_issues
+from command_bridge.modules.scanner import grading
 
 SEVERITY_ORDER = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")
+
+#: Classes the Active Scan does not test for. A report that lists only what
+#: was found invites the reader to assume the rest was checked and came back
+#: clean, so this is printed in both the Markdown and the HTML header.
+NOT_TESTED = (
+    "server-side request forgery (SSRF)",
+    "XML external entity injection (XXE)",
+    "unsafe deserialization",
+)
 SEVERITY_COLOUR = {"CRITICAL": "#c1121f", "HIGH": "#e35d2b",
                    "MEDIUM": "#c78b12", "LOW": "#2f6fdb", "INFO": "#5c6b7f"}
+#: Deliberately not the severity palette. A confirmed low and a potential
+#: critical must not be able to look like each other at a glance.
+CONFIDENCE_COLOUR = {"confirmed": "#1f7a4d", "likely": "#5c7fb8",
+                     "potential": "#6b7280", "inconclusive": "#8a8f98"}
 
 
 def severity_of(finding):
@@ -41,6 +55,19 @@ def sorted_findings(result):
                   key=lambda f: (SEVERITY_ORDER.index(severity_of(f))
                                  if severity_of(f) in SEVERITY_ORDER else 9,
                                  title_of(f), f.where))
+
+
+CONFIDENCE_ORDER = ("confirmed", "likely", "potential", "inconclusive")
+
+
+def confidence_tally(result):
+    """How many findings are proved, and how many are only suspected."""
+    tally = {}
+    for finding in result.findings:
+        _, validation = cb_evidence.assess_scan(finding)
+        key = validation.confidence
+        tally[key] = tally.get(key, 0) + 1
+    return tally
 
 
 def counts(result):
@@ -82,12 +109,24 @@ def as_markdown(result):
     if tally:
         lines.append("- **Findings:** " + ", ".join(
             f"{tally[s]} {s.lower()}" for s in SEVERITY_ORDER if tally.get(s)))
+        # Severity counts say how bad things would be; this says how much of
+        # it is actually proved. Both belong in the header (§18).
+        graded = confidence_tally(result)
+        if graded:
+            lines.append("- **Evidence:** " + ", ".join(
+                f"{graded[c]} {c}" for c in CONFIDENCE_ORDER
+                if graded.get(c)))
     else:
-        lines.append("- **Findings:** none confirmed")
+        lines.append("- **Findings:** none")
     lines.append("")
 
     for note in result.notes:
         lines.append(f"> {note}")
+    lines.append("> Not tested by this scan: " + ", ".join(NOT_TESTED)
+                 + ". These require an out-of-band collaborator the scanner "
+                   "does not run, and no check for them exists. Their "
+                   "absence from this report is not evidence of their "
+                   "absence from the application.")
     if result.skipped_destructive:
         lines.append(f"> {len(result.skipped_destructive)} link(s) were not "
                      f"followed because they appeared to log out or delete "
@@ -99,25 +138,85 @@ def as_markdown(result):
         # The same evidence chain and verdict the Findings screens show, so
         # the written report and the screen cannot disagree.
         proof, validation = cb_evidence.assess_scan(finding)
-        lines.append(f"## [{validation.state}] [{severity_of(finding)}] "
+        verdict = getattr(finding, "verdict", None)
+        severity = severity_of(finding)
+        confidence = validation.confidence
+        label = grading.severity_label(severity, confidence)
+        auth = getattr(finding, "auth_context", {}) or {}
+
+        # §18 — severity and confidence are two different statements and are
+        # never multiplied together. The heading carries both, spelled out.
+        lines.append(f"## [{confidence.upper()}] [{label}] "
                      f"{title_of(finding)}")
         lines.append("")
-        lines.append(f"- **Where:** {finding.where}")
-        lines.append(f"- **Parameter:** {finding.point}")
+
+        # §16 — the same fields, in the same order, on every finding.
+        lines.append(f"- **Issue:** {title_of(finding)}")
+        lines.append(f"- **Severity:** {severity} "
+                     f"(impact if the issue is real)")
+        lines.append(f"- **Confidence:** {confidence} "
+                     f"(how well it is evidenced)")
         lines.append(f"- **Status:** {validation.state}")
-        lines.append(f"- **Confidence:** {validation.confidence} "
-                     f"(scanner said: {finding.confidence})")
+        lines.append(f"- **URL:** {finding.where}")
+        lines.append(f"- **Method:** {getattr(finding, 'method', '') or '—'}")
+        lines.append(f"- **Insertion point:** {finding.point}")
+        lines.append(f"- **Detection method:** "
+                     f"{getattr(verdict, 'detection_method', '') or '—'}")
+        # §15 — who the scanner was when it found this.
+        lines.append(f"- **Authentication context:** "
+                     f"{auth.get('label', 'unknown')}"
+                     + (f" as {auth['identity']}" if auth.get("identity")
+                        else "")
+                     + (f" via {auth['method']}" if auth.get("method")
+                        and auth.get("method") != "none" else ""))
         if issue.get("cwe"):
             lines.append(f"- **Classification:** {issue['cwe']}")
         lines.append("")
-        if issue.get("detail"):
-            lines.append(issue["detail"])
+
+        # §17 — raw detection first and on its own: exactly what was
+        # measured or matched, with no interpretation wrapped around it.
+        lines.append("### Raw detection")
+        lines.append("")
+        signals = list(getattr(verdict, "signals", None)
+                       or getattr(finding, "signals", []) or [])
+        if signals:
+            for signal in signals:
+                name = grading.GRADE_NAMES.get(signal.grade, signal.grade)
+                lines.append(f"- **{name}**"
+                             + (" (reproduced)" if signal.reproduced else "")
+                             + f": {signal.detail}")
+                for key in sorted(signal.measurements):
+                    lines.append(f"    - {key}: "
+                                 f"{signal.measurements[key]}")
+        else:
+            lines.append("- No graded signals were recorded for this "
+                         "finding.")
+        if getattr(finding, "measurements", None):
             lines.append("")
-        lines.append("### Why this was detected")
+            lines.append("```")
+            for key in sorted(finding.measurements):
+                lines.append(f"{key}: {finding.measurements[key]}")
+            lines.append("```")
+        lines.append("")
+        if finding.evidence:
+            lines.append("```http")
+            lines.append(finding.evidence_text())
+            lines.append("```")
+            lines.append("")
+
+        # Then, separately, what the scanner believes it means.
+        lines.append("### Interpreted finding")
         lines.append("")
         lines.append(validation.rationale
                      or "Detection rationale unavailable.")
         lines.append("")
+        if issue.get("detail"):
+            lines.append(issue["detail"])
+            lines.append("")
+        if finding.detail_extra:
+            lines.append(finding.detail_extra)
+            lines.append("")
+
         lines.append("### Observed evidence")
         lines.append("")
         lines.append("```")
@@ -131,20 +230,21 @@ def as_markdown(result):
         lines.append("```")
         lines.append("")
         if validation.false_positive_indicators:
-            lines.append("### Potential false-positive indicators")
+            lines.append("### What could explain this without the "
+                         "vulnerability")
             lines.append("")
             lines += [f"- {item}"
                       for item in validation.false_positive_indicators]
             lines.append("")
+        if confidence != "confirmed":
+            lines.append("### How to confirm it")
+            lines.append("")
+            lines.append(getattr(verdict, "verification", "")
+                         or validation.action
+                         or "Manual validation required.")
+            lines.append("")
         for conflict in validation.conflicts:
             lines.append(f"> ⚠ {conflict}")
-            lines.append("")
-        if finding.evidence:
-            lines.append("### Raw detection")
-            lines.append("")
-            lines.append("```http")
-            lines.append(finding.evidence_text())
-            lines.append("```")
             lines.append("")
         if issue.get("remediation"):
             lines.append(f"**Fix.** {issue['remediation']}")
@@ -177,11 +277,35 @@ def as_json(result):
     }
     for finding in sorted_findings(result):
         issue = cb_issues.ISSUES.get(finding.issue, {})
+        proof, validation = cb_evidence.assess_scan(finding)
+        verdict = getattr(finding, "verdict", None)
         payload["findings"].append({
             "issue": finding.issue,
             "title": title_of(finding),
+            # Severity and confidence stay two separate fields (§18) and the
+            # printable label that combines them is given, never substituted
+            # for either.
             "severity": severity_of(finding),
-            "confidence": finding.confidence,
+            "confidence": validation.confidence,
+            "severity_label": grading.severity_label(
+                severity_of(finding), validation.confidence),
+            "status": validation.state,
+            "method": getattr(finding, "method", ""),
+            "detection_method": getattr(verdict, "detection_method", ""),
+            "rationale": validation.rationale,
+            "limitations": validation.false_positive_indicators,
+            "verification": getattr(verdict, "verification", "")
+                            or validation.action,
+            # §17 — the raw signals and their measurements, kept apart from
+            # the prose above so a consumer can re-judge them itself.
+            "raw_detection": {
+                "signals": [sig.as_dict()
+                            for sig in (getattr(verdict, "signals", None)
+                                        or getattr(finding, "signals", [])
+                                        or [])],
+                "measurements": getattr(finding, "measurements", {}) or {},
+            },
+            "auth_context": getattr(finding, "auth_context", {}) or {},
             "url": finding.where,
             "parameter": finding.point,
             "cwe": issue.get("cwe", ""),
@@ -213,6 +337,10 @@ body { margin:0; padding:0 16px 80px; background:var(--bg); color:var(--fg);
 .wrap { max-width:960px; margin:0 auto; }
 h1 { font-size:26px; margin:32px 0 4px; }
 h2 { font-size:19px; margin:34px 0 10px; }
+h4 { font-size:13px; margin:18px 0 6px; text-transform:uppercase;
+     letter-spacing:.05em; color:var(--dim); }
+.finding ul { margin:6px 0; padding-left:20px; }
+.finding li { margin:3px 0; }
 .sub { color:var(--dim); margin:0 0 24px; }
 .facts { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
          gap:10px; margin:20px 0 6px; }
@@ -274,6 +402,12 @@ def as_html(result):
 
     for note in result.notes:
         out.append(f"<div class='note'>{html.escape(note)}</div>")
+    out.append("<div class='note'><b>Not tested by this scan:</b> "
+               + ", ".join(NOT_TESTED)
+               + ". No check for these exists in the Active Scan — they need "
+                 "an out-of-band collaborator it does not run. Their absence "
+                 "from this report is not evidence of their absence from the "
+                 "application.</div>")
     if result.skipped_destructive:
         out.append(f"<div class='note'>{len(result.skipped_destructive)} "
                    f"link(s) were not followed because they appeared to log "
@@ -296,32 +430,86 @@ def as_html(result):
     for finding in findings:
         issue = cb_issues.ISSUES.get(finding.issue, {})
         severity = severity_of(finding)
+        proof, validation = cb_evidence.assess_scan(finding)
+        verdict = getattr(finding, "verdict", None)
+        confidence = validation.confidence
+        auth = getattr(finding, "auth_context", {}) or {}
         out.append("<div class='finding'>")
+        # Two pills, not one: how bad it would be, and how well it is known.
         out.append(f"<h3><span class='pill' style='background:"
                    f"{SEVERITY_COLOUR.get(severity, '#5c6b7f')}'>{severity}"
-                   f"</span>{html.escape(title_of(finding))}</h3>")
+                   f"</span><span class='pill' style='background:"
+                   f"{CONFIDENCE_COLOUR.get(confidence, '#5c6b7f')}'>"
+                   f"{confidence}</span>"
+                   f"{html.escape(title_of(finding))}</h3>")
         out.append(f"<div class='meta'><code>{html.escape(finding.where)}"
-                   f"</code><br>{html.escape(finding.point)} · "
-                   f"{finding.confidence}"
+                   f"</code><br>"
+                   f"{html.escape(getattr(finding, 'method', '') or '')} "
+                   f"{html.escape(finding.point)} · "
+                   f"{html.escape(grading.severity_label(severity, confidence))}"
+                   + (f" · detected by "
+                      f"{html.escape(verdict.detection_method)}"
+                      if getattr(verdict, "detection_method", "") else "")
+                   + f" · {html.escape(auth.get('label', 'auth unknown'))}"
+                   + (f" as {html.escape(auth['identity'])}"
+                      if auth.get("identity") else "")
                    + (f" · {issue['cwe']}" if issue.get("cwe") else "")
                    + "</div>")
-        if issue.get("detail"):
-            out.append(f"<p>{html.escape(issue['detail'])}</p>")
-        if finding.detail_extra:
-            out.append(f"<p><b>How it was confirmed.</b> "
-                       f"{html.escape(finding.detail_extra)}</p>")
+
+        # §17 — raw detection, then interpretation, never mixed.
+        signals = list(getattr(verdict, "signals", None)
+                       or getattr(finding, "signals", []) or [])
+        if signals or getattr(finding, "measurements", None):
+            out.append("<h4>Raw detection</h4><ul>")
+            for signal in signals:
+                name = grading.GRADE_NAMES.get(signal.grade, signal.grade)
+                extra = ""
+                if signal.measurements:
+                    extra = " <code>" + html.escape(", ".join(
+                        f"{k}={signal.measurements[k]}"
+                        for k in sorted(signal.measurements))) + "</code>"
+                out.append(f"<li><b>{html.escape(name)}</b>"
+                           + (" (reproduced)" if signal.reproduced else "")
+                           + f": {html.escape(signal.detail)}{extra}</li>")
+            for key in sorted(getattr(finding, "measurements", {}) or {}):
+                out.append(f"<li><b>{html.escape(key)}</b>: "
+                           f"{html.escape(str(finding.measurements[key]))}"
+                           f"</li>")
+            out.append("</ul>")
         if finding.evidence:
             out.append(f"<pre><code>"
                        f"{html.escape(finding.evidence_text())}</code></pre>")
+
+        out.append("<h4>Interpreted finding</h4>")
+        if validation.rationale:
+            out.append(f"<p>{html.escape(validation.rationale)}</p>")
+        if issue.get("detail"):
+            out.append(f"<p>{html.escape(issue['detail'])}</p>")
+        if finding.detail_extra:
+            out.append(f"<p>{html.escape(finding.detail_extra)}</p>")
+        if validation.false_positive_indicators:
+            out.append("<h4>What could explain this without the "
+                       "vulnerability</h4><ul>")
+            for item in validation.false_positive_indicators:
+                out.append(f"<li>{html.escape(item)}</li>")
+            out.append("</ul>")
+        if confidence != "confirmed":
+            advice = (getattr(verdict, "verification", "")
+                      or validation.action
+                      or "Manual validation required.")
+            out.append(f"<div class='note'><b>Not proved.</b> "
+                       f"{html.escape(advice)}</div>")
         if issue.get("remediation"):
             out.append(f"<div class='fix'><b>Fix.</b> "
                        f"{html.escape(issue['remediation'])}</div>")
         out.append("</div>")
 
     out.append("<p class='sub' style='margin-top:40px;font-size:12px'>"
-               "Generated by Command Bridge. Every finding above was "
-               "confirmed by the evidence shown with it; checks that could "
-               "not be proved were discarded rather than reported.</p>")
+               "Generated by Command Bridge. Each finding above carries the "
+               "evidence it was graded on. Findings marked anything other "
+               "than <b>confirmed</b> are not proved: the raw detection "
+               "shows what was actually observed, and the confirmation "
+               "advice says what would settle it.</p>")
     out.append("</div></body></html>")
     return "\n".join(out)
 

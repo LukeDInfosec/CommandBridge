@@ -438,10 +438,44 @@ class ScanFinding:
     where: str
     point: str = ""                 # which parameter
     evidence: list = field(default_factory=list)   # [Evidence]
-    confidence: str = "confirmed"   # confirmed | firm | tentative
+    #: Derived from the graded signals below — never set by a check directly.
+    #: One of grading.CONFIRMED / LIKELY / POTENTIAL / INCONCLUSIVE.
+    confidence: str = "potential"
     severity: str = ""              # only to override the library
     detail_extra: str = ""
     found_at: float = field(default_factory=time.time)
+
+    #: What kind of evidence was obtained. A check appends grading.Signal
+    #: objects; grading.grade() turns them into the confidence above. This is
+    #: the whole point of the redesign: a check reports what it saw, and
+    #: something that knows the policy for the vulnerability class decides
+    #: what that is worth.
+    signals: list = field(default_factory=list)
+    #: The verdict object, so the report can print the reasoning rather than
+    #: only the conclusion.
+    verdict: object = None
+    #: The raw numbers behind the detection — response times, lengths, status
+    #: codes. Held apart from the prose so the report can show exactly what
+    #: was measured next to what the scanner made of it.
+    measurements: dict = field(default_factory=dict)
+    #: How the scan was authenticated when this was found. The same bug
+    #: reachable anonymously and reachable only as an administrator are two
+    #: different findings.
+    auth_context: dict = field(default_factory=dict)
+    #: HTTP method and endpoint, for the structured report header.
+    method: str = ""
+
+    def add(self, signal):
+        if signal is not None:
+            self.signals.append(signal)
+        return self
+
+    def settle(self):
+        """Work out the confidence from the evidence. Call once, at the end."""
+        from command_bridge.modules.scanner import grading
+        self.verdict = grading.grade(self.issue, self.signals)
+        self.confidence = self.verdict.confidence
+        return self
 
     def evidence_text(self):
         return "\n\n".join(item.render() for item in self.evidence)
