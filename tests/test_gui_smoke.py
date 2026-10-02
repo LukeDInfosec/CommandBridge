@@ -218,12 +218,41 @@ def main():
     check("the PoC is not titled twice",
           poc.lower().count("proof of concept"), 0)
     detail = cb_evidence.detail_html(shared)
-    for section in ("Why this was detected", "Observed evidence",
+    # §17 — the detail pane keeps what was observed and what it is taken to
+    # mean in two separately labelled sections.
+    for section in ("Interpreted finding", "Observed evidence",
                     "Proof of concept", "Replay in Burp",
                     "Recommended remediation"):
         check(f"the Scan detail pane shows '{section}'", section in detail)
     check("the caching is per finding, not shared",
           window._as_shared(proved) is shared)
+
+    # A finding whose only evidence is a stopwatch reading must look
+    # different in the pane from one that was proved, not merely read
+    # differently if you get to the bottom.
+    from command_bridge.modules.scanner import grading
+    from command_bridge.modules.scanner.model import ScanFinding
+    from command_bridge.modules.coffee_break import finding_from_scan
+    slow = ScanFinding(issue="sqli", where="https://app/x",
+                       point="header 'X-Original-URL'", method="GET",
+                       auth_context=grading.auth_context(None))
+    slow.measurements.update({"baseline_median_s": 3.43, "long_time_s": 8.58})
+    slow.add(grading.Signal(grading.TIMING, "the response took longer",
+                            dict(slow.measurements)))
+    slow.settle()
+    slow_detail = cb_evidence.detail_html(finding_from_scan(slow))
+    check("a timing-only finding is not called confirmed in the pane",
+          "confirmed" not in slow_detail.lower())
+    check("its raw detection is shown separately",
+          "Raw detection" in slow_detail)
+    check("with the numbers that were actually measured",
+          "baseline_median_s" in slow_detail and "3.43" in slow_detail)
+    check("it is marked as not proved", "Not proved" in slow_detail)
+    check("and the pane says what else could explain it",
+          "What could explain this without the vulnerability" in slow_detail)
+    check("raw detection comes before the interpretation",
+          slow_detail.index("Raw detection")
+          < slow_detail.index("Interpreted finding"))
 
     # ── Copy Burp Request ────────────────────────────────────────────────
     print("\n\033[1mCopy Burp Request\033[0m")

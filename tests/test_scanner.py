@@ -21,6 +21,7 @@ import re
 import sys
 import time
 import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -659,11 +660,21 @@ def main():
         check("the request actually contains the payload",
               "AND" in urllib.parse.unquote_plus(sqli_proof.request).upper())
         check("it shows the response that came back",
-              "HTTP 200" in sqli_proof.response)
-        check("the lead evidence is the TRUE case, not the control",
-              "true" in sqli_proof.request.lower()
-              or "1 AND 1=1" in urllib.parse.unquote_plus(sqli_proof.request)
-              or "5=5" in urllib.parse.unquote_plus(sqli_proof.request))
+              sqli_proof.response.startswith("HTTP "))
+        # The lead evidence is whichever channel was decisive, not a fixed
+        # one. Grading ranks backend-derived data above a behavioural
+        # differential, so on an endpoint where both fired the metadata
+        # request leads — and what must never lead is the control or the
+        # FALSE half of a pair, which prove nothing on their own.
+        lead = urllib.parse.unquote_plus(sqli_proof.request)
+        check("the lead evidence is a decisive channel, not a control",
+              ("1=1" in lead or "5=5" in lead or "true" in lead.lower()
+               or "version" in lead.lower() or "@@" in lead
+               or "convert" in lead.lower() or "extractvalue" in lead.lower()
+               or "current_database" in lead.lower()))
+        check("and the finding was graded on more than a stopwatch",
+              [s.grade for s in by_issue["sqli"].signals
+               if s.grade in ("data", "differential", "error")] != [])
         check("both halves of the pair are kept for the reader",
               "Condition false" in sqli_proof.comparison)
         check("and the explanation says what was observed",
@@ -916,8 +927,390 @@ def main():
     finally:
         server.shutdown()
 
+    test_aspnet_login()
+
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  The ASP.NET login failure, and the three bugs behind it
+# ─────────────────────────────────────────────────────────────────────────────
+
+ASPNET_FORM = """<html><head><title>Portal</title></head><body>
+<h1>Services</h1>{message}
+<form method="post" action="/">
+  <input type="hidden" name="__RequestVerificationToken" value="{token}">
+  <input type="text" name="UserName" value="">
+  <input type="password" name="Password">
+  <select name="Region"><option value="uk" selected>UK</option></select>
+  <input type="checkbox" name="RememberMe" value="true">
+  <button type="submit" name="Command" value="Login">Sign in</button>
+  <button type="submit" name="Command" value="Reset">Forgot password</button>
+</form>
+<script src="/Scripts/jquery-3.6.0.min.js"></script>
+<a href="/Booking?BookingRefId=7">Booking</a></body></html>"""
+
+
+class _AspNet(BaseHTTPRequestHandler):
+    """A portal whose controller branches on the submit button's name.
+
+    Entirely ordinary ASP.NET MVC, and the exact shape that defeated the
+    scanner: the login form sits on the home page, the POST goes to the same
+    URL, the response is HTTP 200 at that URL either way, and the controller
+    only treats the request as a login when ``Command=Login`` is present —
+    which a parser that reads ``<input>`` elements and skips submit types
+    never sends.
+    """
+
+    protocol_version = "HTTP/1.1"
+    users = {"2T0120978": "Correct-Horse-1"}
+    sessions = {}
+    tokens = set()
+    die_after = 0
+    hits = 0
+
+    def log_message(self, *args):
+        pass
+
+    def _cookies(self):
+        out = {}
+        for part in (self.headers.get("Cookie", "") or "").split(";"):
+            if "=" in part:
+                key, _, value = part.partition("=")
+                out[key.strip()] = value.strip()
+        return out
+
+    def _user(self):
+        type(self).hits += 1
+        if type(self).die_after and type(self).hits > type(self).die_after:
+            return None
+        return type(self).sessions.get(self._cookies().get("AppCookie", ""))
+
+    def _reply(self, code, body, extra=None):
+        raw = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        for key, value in (extra or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _home(self, message=""):
+        import secrets
+        token = secrets.token_hex(8)
+        type(self).tokens.add(token)
+        return ASPNET_FORM.format(token=token, message=message)
+
+    def do_GET(self):
+        path = urllib.parse.urlsplit(self.path).path
+        if path == "/":
+            if self._user():
+                return self._reply(200, "<html><body><h1>Dashboard</h1>"
+                                        "<a href='/LogOff'>Sign out</a>"
+                                        "</body></html>")
+            return self._reply(200, self._home())
+        if path.startswith("/Scripts/"):
+            return self._reply(200, "/*! jQuery v3.6.0 */(function(){}());")
+        if path in ("/Account/Manage", "/Booking"):
+            if not self._user():
+                return self._reply(302, "", {"Location": "/"})
+            return self._reply(200, f"<html><body><h1>{path}</h1>"
+                                    f"<a href='/LogOff'>Sign out</a></body></html>")
+        return self._reply(404, "<html><body>not found</body></html>")
+
+    def do_POST(self):
+        import secrets
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        data = dict(urllib.parse.parse_qsl(
+            self.rfile.read(length).decode(), keep_blank_values=True))
+        if data.get("Command") != "Login":
+            return self._reply(200, self._home())
+        if data.get("__RequestVerificationToken") not in type(self).tokens:
+            return self._reply(200, self._home(
+                "<p>The anti-forgery token was invalid.</p>"))
+        if type(self).users.get(data.get("UserName", "")) != data.get("Password"):
+            return self._reply(200, self._home(
+                "<p>Invalid username or password.</p>"))
+        sid = secrets.token_hex(12)
+        type(self).sessions[sid] = data["UserName"]
+        return self._reply(200, "<html><body><h1>Dashboard</h1>"
+                                "<a href='/LogOff'>Sign out</a></body></html>",
+                           {"Set-Cookie": f"AppCookie={sid}; Path=/"})
+
+
+def _serve_aspnet():
+    _AspNet.sessions = {}
+    _AspNet.tokens = set()
+    _AspNet.hits = 0
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _AspNet)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_address[1]}"
+
+
+def _aspnet_config(base, password="Correct-Horse-1"):
+    return AuthConfig("form", login_url=base + "/", username="2T0120978",
+                      password=password, check_url=base + "/Account/Manage",
+                      logged_in_signature="Sign out", name="2T0120978")
+
+
+def test_aspnet_login():
+    from command_bridge.modules.scanner.session import _read_login_form
+    from command_bridge.modules.scanner.checks.access import is_static_asset
+
+    print("\n\033[1mThe login form is read the way a browser reads it\033[0m")
+    hidden, (user_field, pass_field), action = _read_login_form(
+        ASPNET_FORM.format(token="abc", message=""), "https://t.example/")
+    check("the username field is found", user_field, "UserName")
+    check("and the password field", pass_field, "Password")
+    check("the anti-forgery token is carried",
+          hidden.get("__RequestVerificationToken"), "abc")
+    check("the submit button's name and value are sent — a controller that "
+          "branches on it sees a login",
+          hidden.get("Command"), "Login")
+    check("only the first submit control is sent, as a browser would",
+          list(hidden.values()).count("Reset"), 0)
+    check("a select contributes its chosen option", hidden.get("Region"), "uk")
+    check("an unticked checkbox is left out", "RememberMe" in hidden, False)
+
+    print("\n\033[1mA correct login is recognised\033[0m")
+    server, base = _serve_aspnet()
+    try:
+        auth = Authenticator(_aspnet_config(base))
+        ok = auth.login()
+        check("login() succeeds against an ASP.NET form", ok)
+        check("the state is confirmed, not guessed", auth.outcome.state, "ok")
+        check("and it says the verification URL proved it",
+              "signature" in auth.outcome.reason)
+    finally:
+        server.shutdown()
+
+    print("\n\033[1mThe verification URL decides, not the login response"
+          "\033[0m")
+    server, base = _serve_aspnet()
+    try:
+        # The login response is HTTP 200 at the login URL carrying a login
+        # form — the exact shape the old heuristic vetoed on.
+        config = _aspnet_config(base, password="wrong")
+        auth = Authenticator(config)
+        auth.login()
+        check("a genuinely refused login is reported as failed",
+              auth.outcome.state, "failed")
+        check("and the reason quotes what the application actually said",
+              "Invalid username" in auth.outcome.reason)
+        check("not merely that a signature was absent",
+              auth.outcome.reason.startswith("the session signature"), False)
+    finally:
+        server.shutdown()
+
+    print("\n\033[1mThe light and the report cannot disagree\033[0m")
+    for label, password, expect_auth in (
+            ("correct credentials", "Correct-Horse-1", True),
+            ("refused credentials", "wrong", False)):
+        server, base = _serve_aspnet()
+        try:
+            profile = Profile.standard()
+            profile.use_browser = False
+            profile.rate = 200
+            profile.checks = ("access",)
+            states = []
+            engine = ScanEngine(base, auth=_aspnet_config(base, password),
+                                profile=profile, scope=build_scope(base),
+                                on_auth=lambda o: states.append(o.state))
+            result = engine.run()
+            outcome = result.auth_outcome
+            shown = outcome.state in ("ok", "unverified")
+            check(f"{label}: the indicator and the report agree",
+                  shown, bool(result.authenticated))
+            check(f"{label}: and both say {'yes' if expect_auth else 'no'}",
+                  bool(result.authenticated), expect_auth)
+            if not expect_auth:
+                check("a refused login is not retried all scan",
+                      engine.auth._relogins, 0)
+                check("and no access control is claimed without a session",
+                      [f for f in result.findings
+                       if f.issue == "access_control"], [])
+        finally:
+            server.shutdown()
+
+    print("\n\033[1mA session that dies mid-scan is reported as that"
+          "\033[0m")
+    server, base = _serve_aspnet()
+    _AspNet.die_after = 3
+    try:
+        profile = Profile.standard()
+        profile.use_browser = False
+        profile.rate = 200
+        profile.checks = ("access",)
+        states = []
+        engine = ScanEngine(base, auth=_aspnet_config(base), profile=profile,
+                            scope=build_scope(base),
+                            on_auth=lambda o: states.append(o.state))
+        result = engine.run()
+        check("the indicator tracked it live rather than only at the start",
+              states, ["ok", "lost"])
+        check("the final state says the session was lost",
+              result.auth_outcome.state, "lost")
+        check("the report agrees it ended unauthenticated",
+              bool(result.authenticated), False)
+        check("re-logins are bounded rather than repeating all scan",
+              engine.auth._relogins <= 3)
+        check("and nothing is reported as broken access control",
+              [f for f in result.findings if f.issue == "access_control"], [])
+    finally:
+        _AspNet.die_after = 0
+        server.shutdown()
+
+    print("\n\033[1mStatic assets are never access-control findings\033[0m")
+    for url in ("https://t/Scripts/jquery-3.6.0.min.js", "https://t/app.css",
+                "https://t/_next/static/chunk/1", "https://t/logo.png",
+                "https://t/fonts/x.woff2", "https://t/bundles/core.js"):
+        check(f"{url.split('/')[-1]} is an asset", is_static_asset(url))
+    for url in ("https://t/Booking?BookingRefId=7", "https://t/Account/Manage",
+                "https://t/api/v1/orders"):
+        check(f"{url.split('/')[-1][:24]} is not", is_static_asset(url), False)
+
+
+    print("\n\033[1mEvidence grading decides confidence, not the check\033[0m")
+    from command_bridge.modules.scanner import grading
+
+    def graded(issue, *signals):
+        return grading.grade(issue, list(signals))
+
+    timing_only = graded(
+        "sqli", grading.Signal(grading.TIMING, "the response was slower",
+                               {"baseline_median_s": 3.43,
+                                "long_time_s": 8.58}))
+    check("timing alone never confirms SQL injection",
+          timing_only.confidence, grading.POTENTIAL)
+    check("and it says what else could explain it",
+          any("slow" in limit or "proxy" in limit or "load" in limit
+              for limit in timing_only.limitations))
+    check("and it says how to settle it", bool(timing_only.verification))
+    check("a database-derived value confirms it",
+          graded("sqli", grading.Signal(
+              grading.DATA, "the database returned its version")).confidence,
+          grading.CONFIRMED)
+    check("an engine error plus a differential is confirmed too",
+          graded("sqli",
+                 grading.Signal(grading.ERROR, "syntax error"),
+                 grading.Signal(grading.DIFFERENTIAL, "true/false",
+                                reproduced=True)).confidence,
+          grading.CONFIRMED)
+    check("a differential seen once is not",
+          graded("access_control",
+                 grading.Signal(grading.DIFFERENTIAL, "same page",
+                                reproduced=False)).confidence,
+          grading.POTENTIAL)
+    check("but a reproduced one is",
+          graded("access_control",
+                 grading.Signal(grading.DIFFERENTIAL, "same page",
+                                reproduced=True)).confidence,
+          grading.CONFIRMED)
+    check("a reflection on its own cannot confirm XSS",
+          graded("xss_reflected",
+                 grading.Signal(grading.REFLECTION, "echoed")).confidence,
+          grading.POTENTIAL)
+    # Reflection is on the class's "never" list, so it does not count as a
+    # supporting indicator either — an unencoded executable context is the
+    # only thing here that says anything, and one indicator is Potential.
+    # Nothing short of the payload running in a browser confirms XSS.
+    check("an unencoded executable context on its own is still Potential",
+          graded("xss_reflected",
+                 grading.Signal(grading.REFLECTION, "echoed"),
+                 grading.Signal(grading.EXECUTABLE_CONTEXT,
+                                "unencoded")).confidence,
+          grading.POTENTIAL)
+    check("only a browser execution confirms it",
+          graded("xss_reflected",
+                 grading.Signal(grading.EXECUTION, "it ran")).confidence,
+          grading.CONFIRMED)
+    check("a command that returned output confirms command injection",
+          graded("command_injection",
+                 grading.Signal(grading.EXECUTION,
+                                "whoami returned root")).confidence,
+          grading.CONFIRMED)
+    check("a slow sleep does not",
+          graded("command_injection",
+                 grading.Signal(grading.TIMING, "it slept")).confidence,
+          grading.POTENTIAL)
+    check("no signals at all is inconclusive, not potential",
+          graded("sqli").confidence, grading.INCONCLUSIVE)
+
+    print("\n\033[1mSeverity and confidence stay separate\033[0m")
+    check("an unproved critical reads as potentially critical",
+          grading.severity_label("CRITICAL", grading.POTENTIAL),
+          "Potentially Critical")
+    check("a proved one keeps its severity",
+          grading.severity_label("CRITICAL", grading.CONFIRMED), "CRITICAL")
+    check("and the report module agrees with the scanner",
+          cb_evidence.severity_label("CRITICAL", "potential"),
+          "Potentially Critical")
+
+    print("\n\033[1mA graded finding carries its reasoning to the report"
+          "\033[0m")
+    slow = ScanFinding(issue="sqli", where="https://app/x",
+                       point="header 'X-Original-URL'", method="GET",
+                       auth_context={"authenticated": True,
+                                     "label": "Authenticated",
+                                     "identity": "alice", "method": "form"})
+    slow.measurements.update({"baseline_median_s": 3.43,
+                              "short_time_s": 4.59, "long_time_s": 8.58})
+    slow.add(grading.Signal(grading.TIMING,
+                            "asking for 5s took 4.59s and 10s took 8.58s",
+                            dict(slow.measurements)))
+    slow.settle()
+    check("the scanner does not call it confirmed", slow.confidence,
+          grading.POTENTIAL)
+    _, slow_validation = cb_evidence.assess_scan(slow)
+    check("and the evidence chain does not either",
+          slow_validation.confidence, "potential")
+    check("the verdict's limitations become false-positive indicators",
+          bool(slow_validation.false_positive_indicators))
+    check("and the next step is the verification advice",
+          slow_validation.action, slow.verdict.verification)
+
+    class _Result:
+        target = "https://app"
+        profile = "standard"
+        started = finished = 0.0
+        duration = 1.0
+        authenticated = True
+        pages_crawled = requests_seen = points_tested = 1
+        http_sent = relogins = 0
+        skipped_destructive = []
+        notes = []
+        parameter_file = ""
+        findings = [slow]
+
+    markdown = report.as_markdown(_Result())
+    check("the written report leads with the confidence, not the severity",
+          "[POTENTIAL]" in markdown)
+    check("it labels the severity as conditional",
+          "Potentially Critical" in markdown)
+    check("raw detection is its own section", "### Raw detection" in markdown)
+    check("kept apart from the interpretation",
+          markdown.index("### Raw detection")
+          < markdown.index("### Interpreted finding"))
+    check("the raw numbers survive into it",
+          "baseline_median_s" in markdown and "3.43" in markdown)
+    check("it records who the scanner was",
+          "Authentication context:" in markdown and "alice" in markdown)
+    check("and it says how to confirm it",
+          "### How to confirm it" in markdown)
+    check("and it admits what it never tested",
+          "SSRF" in markdown and "deserialization" in markdown)
+    json_report = report.as_json(_Result())
+    check("the JSON keeps severity and confidence as separate fields",
+          '"severity": "CRITICAL"' in json_report
+          and '"confidence": "potential"' in json_report)
+    check("and carries the raw signals for a consumer to re-judge",
+          '"raw_detection"' in json_report and '"timing"' in json_report)
+    html_report = report.as_html(_Result())
+    check("the HTML report shows both pills",
+          "potential" in html_report and "CRITICAL" in html_report)
+    check("and marks it as not proved", "Not proved" in html_report)
 
 
 if __name__ == "__main__":
