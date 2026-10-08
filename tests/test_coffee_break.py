@@ -1362,6 +1362,58 @@ def main():
     finally:
         server.shutdown()
 
+    print("\n\033[1mThe URL handed to a human has to visibly work\033[0m")
+    from command_bridge.modules.scanner.checks import xss as xss_check
+
+    reproduction = cb_evidence.Evidence(
+        url="http://127.0.0.1:8000/search?q=test",
+        parameter="query parameter 'q'", location="query",
+        payload='<img src=x onerror="window.__cb_xss_fired=1">',
+        proof_payload='<img src=x onerror=alert(document.domain)>')
+    url = reproduction.attack_url()
+    check("the reproduction URL carries a visible payload",
+          "alert(document.domain)" in url)
+    check("not the scanner's silent marker",
+          "__cb_xss_fired" not in url)
+    check("and it is readable rather than fully percent-encoded",
+          "%3Cimg" not in url and "<img" in url)
+
+    traversal = cb_evidence.Evidence(
+        url="http://t/download?file=brochure.txt",
+        parameter="query parameter 'file'", location="query",
+        payload="../../../../etc/passwd")
+    check("a traversal URL keeps its slashes",
+          traversal.attack_url().endswith("file=../../../../etc/passwd"))
+
+    for label in ("body parameter 'author'", "header 'X-Original-URL'",
+                  "cookie 'sid'"):
+        blocked = cb_evidence.Evidence(url="http://t/guestbook",
+                                       parameter=label, payload="x")
+        check(f"no fake GET URL for a {label.split()[0]} parameter",
+              blocked.attack_url(), "")
+
+    check("every payload context has a visible equivalent",
+          all("MARK" not in xss_check.visible(payload)
+              for payloads in xss_check.BY_CONTEXT.values()
+              for payload in payloads))
+    check("the payload set covers more than the three it shipped with",
+          sum(len(v) for v in xss_check.BY_CONTEXT.values()) > 40)
+    check("including a URL context, for href and src sinks",
+          "url" in xss_check.BY_CONTEXT)
+    check("and the DOM sinks a reflection never reaches the body through",
+          "innerHTML" in xss_check.DOM_SINKS
+          and "location.hash" in xss_check.DOM_SOURCES)
+
+    print("\n\033[1mA signature match is re-requested before it is "
+          "reported\033[0m")
+    probe = Engine("http://127.0.0.1:1")          # nothing is listening
+    alive, _ = probe._cb_endpoint_alive("http://127.0.0.1:1/nope")
+    check("an unreachable endpoint is not called dead", alive, None)
+    check("a URL with no path is not checked at all",
+          probe._cb_endpoint_alive("http://127.0.0.1:1/")[0], None)
+    check("and neither is something that is not a URL",
+          probe._cb_endpoint_alive("somewhere on the target")[0], None)
+
     print("\n\033[1msqlmap's verdict, not sqlmap's narration\033[0m")
     from command_bridge.modules import sqlmap_verdict
 

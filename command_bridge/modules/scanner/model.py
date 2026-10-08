@@ -406,6 +406,14 @@ class Evidence:
     #: proof of concept has to name the payload, and recovering it by parsing
     #: a human-written label is guesswork that silently fails.
     payload: str = ""
+    #: The payload to put in front of a HUMAN, when that differs from the one
+    #: actually sent. The XSS checks prove execution with a silent marker —
+    #: `window.__cb_xss_fired=1` — because an alert() would block the
+    #: headless browser and because a marker can be read back reliably. That
+    #: is the right payload to send and the wrong one to hand somebody: the
+    #: reproduction URL fired correctly, showed nothing at all, and read as
+    #: a false positive. This holds the visible equivalent.
+    proof_payload: str = ""
     #: True for the step that demonstrates the issue. A boolean SQL injection
     #: proves itself with a pair of requests, and the one worth putting at the
     #: top of a PoC is the one that came back *true*, not the control.
@@ -482,7 +490,7 @@ class ScanFinding:
 
 
 def step(label, request, response=None, *, auth=None, payload="",
-         decisive=False, note="", body_limit=400):
+         proof_payload="", decisive=False, note="", body_limit=400):
     """One evidence step, with its wire form captured at the same moment.
 
     Every check builds its evidence through this so that no finding can be
@@ -493,6 +501,7 @@ def step(label, request, response=None, *, auth=None, payload="",
     return Evidence(
         label=label,
         payload=payload,
+        proof_payload=proof_payload,
         decisive=decisive,
         note=note,
         request=request.describe() if request is not None else "",

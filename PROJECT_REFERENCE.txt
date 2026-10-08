@@ -19,6 +19,74 @@ HOW TO USE THIS FILE
  CHANGELOG (most recent first)
 ================================================================================
 
+## 2026-10-08 - THE URL IN THE REPORT HAS TO ACTUALLY WORK (6.8.3)
+
+Three field reports, all variants of the same failure: the report said
+something that was true and handed over something that was not usable.
+
+1. THE REPRODUCTION URL FIRED AND SHOWED NOTHING
+
+   The XSS checks prove execution with a silent marker,
+   window.__cb_xss_fired=1, because an alert() blocks a headless browser
+   and a marker can be read back reliably. 6.8.2 then printed that same
+   payload as "Vulnerable URL - paste this into a browser". It executes
+   perfectly and displays nothing, so from the outside it is
+   indistinguishable from a false positive - and that is exactly how it
+   was reported back.
+
+   Evidence.proof_payload (both the scanner's and cb_evidence's) now
+   carries the visible equivalent, and attack_url() prefers it. The
+   scanner still sends the marker; the human gets alert(document.domain).
+
+2. A GET URL FOR A POST PARAMETER
+
+   Stored XSS on a form field produced "/guestbook?author=cbx9r4tab03",
+   which is not how it was sent and does nothing when visited. attack_url
+   now reads the insertion point from the parameter label as well as the
+   location field, and refuses to build a URL for a body, cookie, header,
+   JSON or multipart parameter.
+
+3. THE XSS PAYLOAD SET - 3 vectors to 54, across 9 contexts
+
+   Was three payloads for html and a handful per context. Now html,
+   attribute-double, attribute-single, attribute-bare, script, raw-text,
+   comment, url and style, including the no-interaction tags and the
+   SVG/animation handlers from PortSwigger's cheat sheet, javascript: URI
+   vectors for href/src sinks, template-literal and comment breakouts for
+   script context, and case/tab variants for naive blocklists. DOM_SOURCES
+   and DOM_SINKS are declared for the DOM-based case a reflection check
+   cannot see. Every payload has a visible() equivalent.
+
+4. NIKTO REPORTED A LOGIN PANEL THAT 404s
+
+   "+ /wordpress/wp-admin/wp-login.php: WordPress login found." went into
+   the report on a target that returns 404 for that path. The first thing
+   anybody does with an exposed-panel finding is click it, so a finding
+   whose URL leads to a 404 page is worse than no finding at all.
+
+   _cb_endpoint_alive() re-requests any path a signature names before the
+   finding is recorded, and drops it if the path is not there - including
+   soft 404s, where the page answers 200 and says it is not found. 401 and
+   403 count as alive: a protected admin panel is still an admin panel. An
+   unreachable target returns None rather than False, because a network
+   blip is not evidence of absence, and what gets dropped is printed to
+   the console rather than binned silently.
+
+5. NAVIGABLE ENDPOINTS ARE HIGHLIGHTED TOO
+
+   Findings with no payload but a specific path - an exposed panel, a .git
+   directory, a backup file - get the same prominent block, in amber:
+   "Go to this URL - re-requested during the scan and still there". The
+   URL is the finding in those cases.
+
+All four suites pass: test_scanner 284, test_coffee_break 323,
+test_coffee_chain 13, test_gui_smoke 248 - 868 assertions.
+
+Sources for the payload set: PortSwigger's XSS cheat sheet
+(https://portswigger.net/web-security/cross-site-scripting/cheat-sheet)
+for the no-interaction tags and the animation/SVG event handlers.
+
+
 ## 2026-10-08 - THE REPORT ANSWERS THE QUESTION (6.8.2)
 
 Field feedback from a Coffee Break and an Active Scan run against the new

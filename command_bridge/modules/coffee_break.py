@@ -1835,6 +1835,23 @@ class CoffeeBreakMixin:
             if not key:
                 key, issue = _header_issue_from_nikto(body)
             override_title = _panel_title(key, body)
+
+            # Nikto matches signatures; it does not re-check that the thing
+            # it matched is still there. It reported a WordPress login
+            # panel at /wordpress/wp-admin/wp-login.php on a target that
+            # returns 404 for it, and the finding went into the report with
+            # a URL that leads to a 404 page — which is worse than no
+            # finding, because the first thing anybody does is click it.
+            #
+            # So any finding that names a path gets that path re-requested
+            # before it is reported. One HEAD or GET per finding, against a
+            # target already being scanned.
+            located = self._cb_where_for(key, body)
+            alive, note = self._cb_endpoint_alive(located)
+            if alive is False:
+                self._cb_log_dropped(located, note, body)
+                continue
+            reachable_note = (f"\n\nVerified: {note}" if note else "")
             if key == "robots_disclosure" and \
                     not self._cb_robots_worth_reporting():
                 continue
@@ -1842,13 +1859,13 @@ class CoffeeBreakMixin:
                 if issue["severity"] != "INFO":
                     produced += 1
                 self._cb_record(self._cb_issue(
-                    key, self._cb_where_for(key, body), body[:500],
+                    key, located, body[:500],
                     stage["key"], confidence="tentative",
                     **({"title": override_title} if override_title else {}),
                     detail=issue["detail"] + f"\n\nNikto reported: {body}\n\n"
                            "Nikto matches signatures and does not confirm "
                            "what it finds; verify before this goes in a "
-                           "report."))
+                           "report." + reachable_note))
                 continue
 
             if cb_issues.is_observation(body):
@@ -1924,6 +1941,55 @@ class CoffeeBreakMixin:
         self._cb_artifacts["robots_checked"] = worth
         self._cb_artifacts["robots_entries"] = entries
         return worth
+
+    #: Statuses that mean "this really is here". A 401 or 403 counts: a
+    #: protected admin panel is still an admin panel, and arguably a better
+    #: finding than an open one.
+    _ALIVE = (200, 201, 202, 204, 301, 302, 303, 307, 308, 401, 403, 405)
+
+    def _cb_endpoint_alive(self, url):
+        """Re-request a path a tool claims exists. ``(alive, note)``.
+
+        ``alive`` is None when the question does not apply or could not be
+        answered — the finding is reported either way then, because a
+        network blip is not evidence of absence.
+
+        A soft 404 is caught too: plenty of applications answer 200 with a
+        "not found" page, and a signature scanner counts that as a hit.
+        """
+        if not url or not url.startswith(("http://", "https://")):
+            return None, ""
+        parsed = urllib.parse.urlparse(url)
+        if not parsed.path or parsed.path == "/":
+            return None, ""
+        try:
+            session = _session({"url": url})
+            response = session.get(url, timeout=10, allow_redirects=False)
+        except Exception:                               # noqa: BLE001
+            return None, ""
+        if response.status_code not in self._ALIVE:
+            return False, f"HTTP {response.status_code}"
+        body = (response.text or "")[:4000].lower()
+        if response.status_code == 200 and any(
+                phrase in body for phrase in
+                ("404", "not found", "nothing at", "page cannot be found",
+                 "does not exist", "no such page")):
+            # Only call it a soft 404 when the page says so AND has
+            # nothing else going on; a login form that mentions "not
+            # found" in a cookie banner is still a login form.
+            if len(body.strip()) < 3000 and "<form" not in body:
+                return False, f"HTTP 200 but the page says it is not there"
+        return True, f"re-requested, HTTP {response.status_code}"
+
+    def _cb_log_dropped(self, url, note, body):
+        """Say what was dropped and why, rather than silently binning it."""
+        try:
+            self.console.append_ansi(
+                f"[i] not reported — {url} returned {note or 'nothing'} "
+                f"when re-requested, so the signature that matched it is "
+                f"stale: {body[:120]}\n")
+        except Exception:                               # noqa: BLE001
+            pass
 
     def _cb_where_for(self, key, body):
         """The URL a finding belongs to, pulled out of the tool's own line.

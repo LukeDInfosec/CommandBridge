@@ -193,6 +193,10 @@ class Evidence:
         return clone
 
     # ── what is present ──────────────────────────────────────────────────
+    #: A payload a person can see work, when the one that was sent is a
+    #: silent marker. See scanner.model.Evidence.proof_payload.
+    proof_payload: str = ""
+
     def attack_url(self):
         """The one line a tester actually wants: the URL, with the payload in.
 
@@ -208,17 +212,27 @@ class Evidence:
         payload, a POST body (where a URL would be a lie about how it was
         sent), or an injection point that is not in the query string.
         """
-        if not self.payload:
+        payload = self.proof_payload or self.payload
+        if not payload:
             return ""
         base = self.url or self.endpoint or self.target
         if not base or not str(base).startswith(("http://", "https://")):
             return ""
-        location = (self.location or "").lower()
         # A header, cookie or body parameter cannot be expressed as a URL,
         # and pretending otherwise sends someone to a page that works fine
-        # and makes them distrust the finding.
-        if location and not any(word in location for word in
-                                ("query", "url", "path", "get")):
+        # and makes them distrust the finding. The insertion point says
+        # which it is in two different places depending on which check
+        # recorded it — the location field, or inside the parameter label
+        # ("body parameter 'author'") — so both are consulted. A stored-XSS
+        # finding on a POST field produced "/guestbook?author=cbx9r4tab03",
+        # which is not how it was sent and does nothing when visited.
+        where = f"{self.location or ''} {self.parameter or ''}".lower()
+        if any(word in where for word in
+               ("body", "post", "cookie", "header", "json", "form data",
+                "multipart")):
+            return ""
+        if self.location and not any(word in self.location.lower() for word in
+                                     ("query", "url", "path", "get")):
             return ""
         name = (self.parameter or "").strip()
         # Parameter labels arrive as "query parameter 'id'" or "query 'id'".
@@ -234,12 +248,12 @@ class Evidence:
         rebuilt = []
         for key, value in pairs:
             if key == name:
-                rebuilt.append((key, self.payload))
+                rebuilt.append((key, payload))
                 found = True
             else:
                 rebuilt.append((key, value))
         if not found:
-            rebuilt.append((name, self.payload))
+            rebuilt.append((name, payload))
         query = "&".join(f"{key}={_url_safe(value)}"
                          for key, value in rebuilt)
         return urllib.parse.urlunparse(parsed._replace(query=query,
@@ -968,8 +982,26 @@ def detail_html(finding):
         html.append(f"<p><b>Endpoint:</b> "
                     f"<code>{_esc(getattr(finding, 'where', ''))}</code></p>")
     else:
-        html.append(f"<p><b>Where:</b> "
-                    f"<code>{_esc(getattr(finding, 'where', ''))}</code></p>")
+        # No payload, but if the finding points at a specific page the
+        # reader is going to click it, so give it the same prominence. An
+        # exposed admin panel, a .git directory, a backup file — the URL is
+        # the finding.
+        where = str(getattr(finding, "where", "") or "")
+        path = ""
+        if where.startswith(("http://", "https://")):
+            path = urllib.parse.urlparse(where).path or ""
+        if path and path != "/":
+            html.append(
+                "<p style='margin:10px 0 2px 0'><b>Go to this URL</b> "
+                "<span style='color:palette(mid);font-weight:400'>"
+                "&mdash; re-requested during the scan and still there"
+                "</span></p>"
+                "<pre style='white-space:pre-wrap;margin:0 0 10px 0;"
+                "padding:8px 10px;border-left:3px solid #f6b73c;"
+                "background:rgba(246,183,60,0.08);color:#f6b73c;"
+                "font-weight:600'>" + _esc(where) + "</pre>")
+        else:
+            html.append(f"<p><b>Where:</b> <code>{_esc(where)}</code></p>")
         if proof.parameter:
             html.append(
                 f"<p><b>Parameter:</b> <code>{_esc(proof.parameter)}</code>"
@@ -1169,6 +1201,10 @@ def evidence_from_scan(scan_finding):
         parameter=getattr(scan_finding, "point", ""),
         detector="active-scan",
         payload=payload or payload_from_label(getattr(lead, "label", "")),
+        proof_payload=(getattr(lead, "proof_payload", "") if lead else "")
+                      or next((getattr(item, "proof_payload", "")
+                               for item in items
+                               if getattr(item, "proof_payload", "")), ""),
         request=getattr(lead, "request", "") if lead else "",
         # Prefer the decisive step's wire form; fall back to any step that
         # captured one, so a finding whose lead step never got a response
