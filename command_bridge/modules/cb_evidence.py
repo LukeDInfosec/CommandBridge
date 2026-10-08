@@ -29,6 +29,7 @@ import copy
 import itertools
 import re
 import time
+import urllib.parse
 from dataclasses import dataclass, field, asdict
 
 
@@ -92,6 +93,28 @@ def correlation_id(prefix="cb"):
 #: a cookie wastes the reader's time when they try to reproduce it.
 QUERY, BODY, JSON, XML, HEADER, COOKIE, PATH, MULTIPART = (
     "query", "body", "json", "xml", "header", "cookie", "path", "multipart")
+
+
+#: Only the characters that genuinely break a URL. Everything else is left
+#: alone deliberately: this string exists to be read, pasted into a browser
+#: and recognised, and `..%2F..%2Fetc%2Fpasswd` is none of those things. The
+#: fully percent-encoded form is still printed in the proof-of-concept block
+#: for anyone who wants to replay it exactly as the scanner sent it.
+_URL_BREAKERS = {
+    "&": "%26", "#": "%23", " ": "%20", "+": "%2B",
+    "\n": "%0A", "\r": "%0D", "\t": "%09", "%": "%25",
+}
+
+
+def _url_safe(value):
+    text = str(value or "")
+    # % first, or the replacements below get double-encoded.
+    text = text.replace("%", "%25")
+    for char, code in _URL_BREAKERS.items():
+        if char == "%":
+            continue
+        text = text.replace(char, code)
+    return text
 
 
 @dataclass
@@ -170,6 +193,58 @@ class Evidence:
         return clone
 
     # ── what is present ──────────────────────────────────────────────────
+    def attack_url(self):
+        """The one line a tester actually wants: the URL, with the payload in.
+
+        Everything else in a finding is supporting material. What gets
+        clicked, pasted into a browser or dropped into a ticket is a single
+        URL with the payload already in the right parameter — and that was
+        the one thing the report never printed. It gave the endpoint on one
+        line, the parameter on another and the payload on a third, and left
+        the reader to reassemble them by hand, every time, for every
+        finding.
+
+        Returns "" when there is nothing honest to build: a finding with no
+        payload, a POST body (where a URL would be a lie about how it was
+        sent), or an injection point that is not in the query string.
+        """
+        if not self.payload:
+            return ""
+        base = self.url or self.endpoint or self.target
+        if not base or not str(base).startswith(("http://", "https://")):
+            return ""
+        location = (self.location or "").lower()
+        # A header, cookie or body parameter cannot be expressed as a URL,
+        # and pretending otherwise sends someone to a page that works fine
+        # and makes them distrust the finding.
+        if location and not any(word in location for word in
+                                ("query", "url", "path", "get")):
+            return ""
+        name = (self.parameter or "").strip()
+        # Parameter labels arrive as "query parameter 'id'" or "query 'id'".
+        match = re.search(r"'([^']+)'", name)
+        if match:
+            name = match.group(1)
+        name = name.split()[-1] if name else ""
+        if not name:
+            return ""
+        parsed = urllib.parse.urlparse(str(base))
+        pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        found = False
+        rebuilt = []
+        for key, value in pairs:
+            if key == name:
+                rebuilt.append((key, self.payload))
+                found = True
+            else:
+                rebuilt.append((key, value))
+        if not found:
+            rebuilt.append((name, self.payload))
+        query = "&".join(f"{key}={_url_safe(value)}"
+                         for key, value in rebuilt)
+        return urllib.parse.urlunparse(parsed._replace(query=query,
+                                                       fragment=""))
+
     def has_injection_point(self):
         return bool(self.parameter or self.location)
 
@@ -693,19 +768,36 @@ _TICK, _CROSS, _WARN = "✓", "✗", "⚠"
 
 
 def evidence_checklist(key, evidence):
-    """The §12 block: what we have, and what we do not, spelled out."""
+    """What this finding actually has. Not a list of what it is missing.
+
+    This used to print "Payload: NOT CAPTURED / Exploitation evidence: NOT
+    OBSERVED / Injection point: NOT IDENTIFIED" on every finding that was
+    never going to have those — a signature match from Nikto, a missing
+    header — which is three lines of nothing on most of the report. The
+    absences still matter, but they belong in the one place that explains
+    why the finding is not confirmed, not repeated as a table of blanks
+    beside every entry.
+    """
     lines = []
     if key in EXPLOIT_REQUIRED:
-        lines.append(f"  Injection point: "
-                     + (f"{evidence.parameter or '(unnamed)'}"
-                        + (f" [{evidence.location}]" if evidence.location else "")
-                        if evidence.has_injection_point() else "NOT IDENTIFIED"))
-        lines.append(f"  Payload: "
-                     + (evidence.payload if evidence.has_payload()
-                        else "NOT CAPTURED"))
-        lines.append(f"  Exploitation evidence: "
-                     + (evidence.comparison or evidence.oob_interaction
-                        or evidence.observed or "NOT OBSERVED"))
+        # The line a tester actually uses, first and on its own.
+        attack = evidence.attack_url()
+        if attack:
+            lines.append(f"  Vulnerable URL: {attack}")
+        if evidence.has_injection_point():
+            lines.append(f"  Injection point: {evidence.parameter or '(unnamed)'}"
+                         + (f" [{evidence.location}]"
+                            if evidence.location else ""))
+        if evidence.has_payload():
+            lines.append(f"  Payload: {evidence.payload}")
+        proof = (evidence.comparison or evidence.oob_interaction
+                 or evidence.observed)
+        if proof:
+            lines.append(f"  Exploitation evidence: {proof}")
+        if not lines:
+            lines.append("  Nothing was captured for this finding — it rests "
+                         "on the detecting tool's signature alone.")
+            return lines
     else:
         # A configuration finding's evidence IS the thing that was observed,
         # so show it rather than listing what an exploit would have needed.
@@ -713,9 +805,12 @@ def evidence_checklist(key, evidence):
                 ", ".join(str(x) for x in evidence.extracted)[:400]) \
             or evidence.matcher or evidence.body_excerpt[:400] \
             or evidence.raw.splitlines()[0][:400] if evidence.raw else ""
-        lines.append(f"  Observed: {seen or 'NOT CAPTURED'}")
-    lines.append("  Response evidence: "
-                 + ("captured" if evidence.has_exchange() else "NOT CAPTURED"))
+        if seen:
+            lines.append(f"  Observed: {seen}")
+        else:
+            lines.append("  Nothing was captured beyond the detecting "
+                         "tool's own statement.")
+            return lines
     if evidence.has_timing():
         lines.append(f"  Response timing: {evidence.timing_ms} ms")
     if evidence.has_oob():
@@ -730,8 +825,14 @@ SEV_COLOURS = {
     "CRITICAL": "#ff3b5c",
     "HIGH": "#ff6b4a",
     "MEDIUM": "#f6b73c",
-    "LOW": "#4f8cff",
-    "INFO": "#8b9bb4",
+    # Low is green and Info is blue, not the other way round. Blue reads as
+    # "a note"; green reads as "nothing to do here". A Low is something you
+    # may choose to live with, which is the green end of the scale — and
+    # putting Low in the same blue as an informational note made the two
+    # indistinguishable at a glance, which is the one thing a severity
+    # colour exists to prevent.
+    "LOW": "#3fb950",
+    "INFO": "#4f8cff",
 }
 
 #: One colour per state, on the same principle.
@@ -846,12 +947,34 @@ def detail_html(finding):
     if getattr(verdict, "detection_method", ""):
         html.append(f"<p><b>Detected by:</b> "
                     f"{_esc(verdict.detection_method)}</p>")
-    html.append(f"<p><b>Where:</b> "
-                f"<code>{_esc(getattr(finding, 'where', ''))}</code></p>")
-    if proof.parameter:
-        html.append(f"<p><b>Parameter:</b> <code>{_esc(proof.parameter)}</code>"
-                    + (f" [{_esc(proof.location)}]" if proof.location else "")
-                    + "</p>")
+    # The attack URL goes first, before anything else, because it is the
+    # only line most readers need. Everything underneath is the argument
+    # for it. Reassembling endpoint + parameter + payload by hand, for
+    # every finding, was work the report was making the reader do.
+    attack = proof.attack_url()
+    if attack:
+        html.append(
+            "<p style='margin:10px 0 2px 0'><b>Vulnerable URL</b> "
+            "<span style='color:palette(mid);font-weight:400'>"
+            "&mdash; paste this into a browser</span></p>"
+            "<pre style='white-space:pre-wrap;margin:0 0 10px 0;"
+            "padding:8px 10px;border-left:3px solid #ff3b5c;"
+            "background:rgba(255,59,92,0.08);color:#ff6b7f;"
+            "font-weight:600'>" + _esc(attack) + "</pre>")
+        html.append(f"<p><b>Vulnerable parameter:</b> "
+                    f"<code>{_esc(proof.parameter or '(unnamed)')}</code>"
+                    + (f" [{_esc(proof.location)}]"
+                       if proof.location else "") + "</p>")
+        html.append(f"<p><b>Endpoint:</b> "
+                    f"<code>{_esc(getattr(finding, 'where', ''))}</code></p>")
+    else:
+        html.append(f"<p><b>Where:</b> "
+                    f"<code>{_esc(getattr(finding, 'where', ''))}</code></p>")
+        if proof.parameter:
+            html.append(
+                f"<p><b>Parameter:</b> <code>{_esc(proof.parameter)}</code>"
+                + (f" [{_esc(proof.location)}]" if proof.location else "")
+                + "</p>")
 
     scanner_severity = getattr(finding, "scanner_severity", "")
     if scanner_severity and scanner_severity != severity:
@@ -926,6 +1049,37 @@ def detail_html(finding):
                 f"</p>")
         elif validation.action:
             html.append(f"<p><b>Next step:</b> {_esc(validation.action)}</p>")
+
+    # Outdated-software findings get the one thing they were missing: what
+    # the current release actually is, and somewhere to read about what
+    # this version is vulnerable to. The figure comes from the operator's
+    # own catalogue (Target tab -> Update Version Data), never from the
+    # scanner's built-in idea of "current", which is as old as its database.
+    key_name = getattr(finding, "key", "")
+    if key_name in ("outdated_software", "version_disclosure",
+                    "js_library_outdated"):
+        try:
+            from command_bridge.modules import version_catalog
+            haystack = " ".join(str(x) for x in (
+                getattr(finding, "title", ""), proof.raw, proof.observed,
+                proof.matcher, getattr(finding, "where", "")))
+            product, version = version_catalog.identify(haystack)
+            if product:
+                verdict, detail = version_catalog.assess(product, version)
+                colour = {"outdated": "#ff6b4a", "current": "#3fb950"}.get(
+                    verdict, "#8b9bb4")
+                html.append(
+                    f"<p><b>Version check</b> "
+                    f"<span style='color:{colour};font-weight:600'>"
+                    f"{_esc(product)} {_esc(version)} \u2014 "
+                    f"{_esc(verdict)}</span><br>{_esc(detail)}</p>")
+                references = version_catalog.links_for(product, version)
+                if references:
+                    html.append("<p><b>Look it up</b></p><ul>" + "".join(
+                        f'<li><a href="{_esc(url)}">{_esc(label)}</a></li>'
+                        for label, url in references) + "</ul>")
+        except Exception:                               # noqa: BLE001
+            pass
 
     sources = [s for s in (getattr(finding, "sources", []) or [stage]) if s]
     if len(sources) > 1:

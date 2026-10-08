@@ -147,27 +147,37 @@ class TargetTabMixin:
         install_tools_btn.clicked.connect(self.run_install_tools)
         tools_btn_row.addWidget(install_tools_btn)
 
-        # Reset All Commands — the escape hatch for the override problem. An
-        # older build saved every command to disk the moment one was edited,
-        # so a lot of installs are running commands frozen from whenever that
-        # happened, with shipped fixes silently ignored.
-        reset_row = QHBoxLayout()
-        reset_cmds_btn = QPushButton("Reset All Commands to Shipped Defaults")
-        reset_cmds_btn.setObjectName("secondaryButton")
-        reset_cmds_btn.setMinimumHeight(38)
-        reset_cmds_btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
-        reset_cmds_btn.setToolTip(
-            "Discards every saved command override and goes back to the commands "
-            "that ship with this version. Use this if buttons are behaving like an "
-            "older release. Your target, headers, theme and output directory are "
-            "not affected — only command templates."
-        )
-        reset_cmds_btn.clicked.connect(self.confirm_reset_all_commands)
-        reset_row.addWidget(reset_cmds_btn)
-        reset_row.addStretch()
-        tools_layout.addLayout(reset_row)
+        # Version data. Deliberately a button and not something that happens
+        # during a scan: it is the only part of the application that sends
+        # anything to a third party, so pressing it is a decision. It
+        # carries no target data — only the names of well-known products.
+        self.versions_btn = QPushButton("\U0001F4E6 Update Version Data")
+        self.versions_btn.setObjectName("secondaryButton")
+        self.versions_btn.setMinimumHeight(38)
+        self.versions_btn.setCursor(
+            QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        self.versions_btn.setToolTip(
+            "Fetches the current release of PHP, Apache, nginx, OpenSSL, "
+            "WordPress, Tomcat, jQuery and about thirty other common "
+            "products from endoflife.date, and checks that every reference "
+            "link the reports use still resolves.\n\n"
+            "Why a button: this is the only outbound request Command Bridge "
+            "makes that is not to your target. It sends product names only "
+            "\u2014 nothing about the engagement \u2014 and it happens when "
+            "you press this and at no other time.\n\n"
+            "The result is cached in ~/.config/CommandBridge and used "
+            "offline, so 'outdated software' findings cite a figure you "
+            "fetched on a date you chose, rather than whatever was true "
+            "when Nikto's database was built.")
+        self.versions_btn.clicked.connect(self.run_update_versions)
+        tools_btn_row.addWidget(self.versions_btn)
 
         tools_layout.addLayout(tools_btn_row)
+        self.versions_age = QLabel("")
+        self.versions_age.setObjectName("autoDesc")
+        self.versions_age.setWordWrap(True)
+        tools_layout.addWidget(self.versions_age)
+        self._refresh_version_age()
         tools_group.layout().addLayout(tools_layout)
         layout.addWidget(tools_group)
 
@@ -217,3 +227,108 @@ class TargetTabMixin:
         layout.addStretch()
 
         return scroll
+
+    # ── version catalogue ────────────────────────────────────────────────
+    def _refresh_version_age(self):
+        """Say how old the cached version data is, in plain words."""
+        try:
+            from command_bridge.modules import version_catalog
+            data = version_catalog.load()
+            age = version_catalog.age_days(data)
+            count = len(data.get("products") or {})
+        except Exception:                               # noqa: BLE001
+            return
+        if not count or age is None:
+            self.versions_age.setText(
+                "No version data yet \u2014 'outdated software' findings "
+                "will link you to NVD and Snyk but will not state a current "
+                "release.")
+            return
+        if age < 1:
+            when = "today"
+        elif age < 2:
+            when = "yesterday"
+        else:
+            when = f"{int(age)} days ago"
+        stale = "  \u2014 worth refreshing" if age > 60 else ""
+        self.versions_age.setText(
+            f"{count} products, last updated {when}.{stale}")
+
+    def run_update_versions(self):
+        """Fetch current versions and verify the reference links.
+
+        Runs on a worker thread: it is a few dozen HTTPS requests and the
+        window must not freeze while they happen. Progress goes to the
+        console, because this is the one place the application talks to
+        somebody other than the target and the operator should see it.
+        """
+        from PyQt6.QtCore import QThread, QObject, pyqtSignal
+        from command_bridge.modules import version_catalog
+
+        if getattr(self, "_versions_thread", None) is not None:
+            self.console.append_ansi("[i] A version refresh is already "
+                                     "running.\n")
+            return
+
+        self.goto_tab("console")
+        self.console.append_ansi(
+            "\n[i] Updating version data. This contacts endoflife.date and "
+            "the reference sites; no target information is sent.\n")
+        self.versions_btn.setEnabled(False)
+
+        class _Worker(QObject):
+            line = pyqtSignal(str)
+            done = pyqtSignal(object, str)
+
+            def run(self):
+                try:
+                    summary = version_catalog.refresh(
+                        report=lambda text: self.line.emit(text))
+                    self.done.emit(summary, "")
+                except Exception as exc:                # noqa: BLE001
+                    self.done.emit(None, f"{type(exc).__name__}: {exc}")
+
+        self._versions_thread = QThread()
+        self._versions_worker = _Worker()
+        self._versions_worker.moveToThread(self._versions_thread)
+        self._versions_thread.started.connect(self._versions_worker.run)
+        self._versions_worker.line.connect(
+            lambda text: self.console.append_ansi(text + "\n"))
+        self._versions_worker.done.connect(self._on_versions_done)
+        self._versions_thread.start()
+
+    def _on_versions_done(self, summary, error):
+        try:
+            self._versions_thread.quit()
+            self._versions_thread.wait(3000)
+        except Exception:                               # noqa: BLE001
+            pass
+        self._versions_thread = None
+        self._versions_worker = None
+        self.versions_btn.setEnabled(True)
+
+        if error:
+            self.console.append_ansi(
+                f"[!] Version refresh failed: {error}\n"
+                f"    Findings will still link to NVD and Snyk; they just "
+                f"will not state a current release.\n")
+            return
+        dead = [k for k, v in (summary.get("links") or {}).items()
+                if not v.get("ok")]
+        self.console.append_ansi(
+            f"[+] Version data updated: {len(summary['updated'])} product(s) "
+            f"refreshed, {len(summary['failed'])} failed, "
+            f"{summary['count']} in the catalogue.\n")
+        if summary["failed"]:
+            for product, why in summary["failed"][:8]:
+                self.console.append_ansi(f"    - {product}: {why}\n")
+        if dead:
+            self.console.append_ansi(
+                f"[!] {len(dead)} reference link(s) did not resolve and have "
+                f"been recorded as dead:\n")
+            for url in dead[:8]:
+                self.console.append_ansi(f"    - {url}\n")
+        else:
+            self.console.append_ansi(
+                "    Every reference link resolved.\n")
+        self._refresh_version_age()

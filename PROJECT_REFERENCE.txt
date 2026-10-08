@@ -19,6 +19,124 @@ HOW TO USE THIS FILE
  CHANGELOG (most recent first)
 ================================================================================
 
+## 2026-10-08 - THE REPORT ANSWERS THE QUESTION (6.8.2)
+
+Field feedback from a Coffee Break and an Active Scan run against the new
+demo target. Fourteen changes, all of them about the report being usable
+rather than merely correct.
+
+1. THE VULNERABLE URL, FIRST, IN RED
+
+   Every finding gave the endpoint on one line, the parameter on another
+   and the payload on a third, and left the reader to reassemble them by
+   hand - for every finding. Evidence.attack_url() builds the one line that
+   actually gets used, and detail_html prints it above everything else.
+   Encoded only where a URL genuinely breaks (& # space + %), so
+   /download?file=../../../../etc/passwd stays readable rather than
+   becoming ..%2F..%2Fetc%2Fpasswd. It refuses to build one for a body
+   parameter, a cookie or a header, where a URL would be a lie about how
+   the request was sent.
+
+2. NO MORE COLUMNS OF BLANKS
+
+   evidence_checklist printed "Injection point: NOT IDENTIFIED / Payload:
+   NOT CAPTURED / Exploitation evidence: NOT OBSERVED" on every finding
+   that was never going to have them - every Nikto signature, every
+   missing header. It now prints what it has; the absences stay in the one
+   place that explains why a finding is unproved.
+
+3. HEADER FINDINGS SHOW THE EXCHANGE
+
+   A header finding's evidence was the list of header NAMES
+   ("Response headers: content-length, content-type, date, server"), which
+   answers none of the questions a reader has. _header_exchange() puts the
+   request and the full response head in verbatim.
+
+4. SEVERITY WEIGHTS
+
+   csp_missing MEDIUM -> LOW (a missing defence-in-depth header is not a
+   way in). xfo_missing LOW -> MEDIUM and retitled "X-Frame-Options
+   missing - no framing protection" (directly exploitable; header named so
+   it is searchable). New hsts_short_max_age at INFO, for HSTS that is
+   present but under a year - a different finding from HSTS that is absent.
+
+5. NIKTO'S HEADER LINES REACHED THE LIBRARY AT LAST
+
+   "Suggested security header missing: referrer-policy" matched no library
+   key, fell through to the keyword heuristic, read the word "missing" and
+   came out LOW - while the same finding from the headers stage was INFO.
+   _header_issue_from_nikto() joins them by looking for a known header name
+   plus a word meaning absent, rather than guessing at Nikto's grammar.
+
+6. LOW IS GREEN, INFO IS BLUE
+
+   They were the other way round, which made a Low and an informational
+   note indistinguishable at a glance. tabs_coffee.py also held its own
+   copy of the colour table, so the two findings screens had already
+   drifted; it now imports the shared one.
+
+7. THE PANEL IS NAMED
+
+   "Administrative login panel publicly reachable" -> "Publicly accessible
+   WordPress login panel" (and Joomla, Drupal, phpMyAdmin, Tomcat Manager,
+   Jenkins, cPanel, Webmin, Magento), from the path Nikto reported.
+
+8. VERSION CATALOGUE AND CVE LINKS - new modules/version_catalog.py
+
+   Nikto says "current is at least 8.5.1" from a database that may be
+   years old, and repeating it makes it the tester's claim. A new button on
+   the Target tab ("Update Version Data") fetches current releases for ~35
+   common products from endoflife.date, caches them in
+   ~/.config/CommandBridge/version_catalog.json, and VERIFIES that every
+   reference link still resolves - so a dead link is found there rather
+   than in front of a client. Outdated-software findings then show the
+   current release, whether the branch is end-of-life, and one-click NVD,
+   CVE Program, Snyk and WPScan lookups.
+
+   Deliberately a button: this is the only outbound request the
+   application makes that is not to the target. It carries product names
+   only, it happens when pressed and at no other time, and the console
+   says so while it runs.
+
+9. ACTIVE SCAN: AN ANONYMOUS SCAN NO LONGER CLAIMS IT LOGGED IN
+
+   With no credentials the Authenticator reports "ok" - nothing was
+   attempted, nothing failed - and that was passed straight through,
+   lighting the indicator green over "Authentication Successful" on a scan
+   that had never sent a credential. The configured strategy now wins:
+   green, but reading "No Auth Required - unauthenticated scan". The
+   dropdown option is named "Unauthenticated Scan" too.
+
+10. THREAD COUNT AND RATE LIMIT ON THE FORM
+
+    profile.threads and profile.rate already existed and were unreachable.
+    Fragile infrastructure is the normal case on an engagement, not the
+    exception. Both are now spinboxes, they track the profile's defaults
+    until the operator touches them, and then they stop moving.
+
+11. XSS NEVER CONFIRMED, AND THE REASON WAS UNREADABLE
+
+    The report printed "Execution could not be observed
+    ('PlaywrightContextManager' object has no attribute '_playwright')",
+    which tells the reader nothing - least of all that every XSS finding
+    in the report was capped at POTENTIAL for a reason that has nothing to
+    do with the application. _browser_problem() now names the cause and
+    the fix ("playwright install chromium"), and says plainly what it
+    means for the findings.
+
+12. SORT ORDER RE-ASSERTED
+
+    Could not be reproduced, but clicking a column header re-sorts the
+    table and Qt remembers it, with nothing on screen saying so. Severity
+    order is now re-applied whenever the filter changes.
+
+All four suites pass: test_scanner 284, test_coffee_break 309,
+test_coffee_chain 13, test_gui_smoke 248 - 854 assertions.
+
+Verified end to end against vulnshop: 9 findings, all genuine, no false
+positives, both decoys silent.
+
+
 ## 2026-10-08 — READ THE VERDICT, NOT THE NARRATION (6.8.1)
 
 Reported from a live engagement: sqlmap tested every technique against an

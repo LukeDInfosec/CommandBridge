@@ -298,7 +298,10 @@ ISSUES = {
 
     # ── Response headers ─────────────────────────────────────────────────
     "csp_missing": _issue(
-        "MEDIUM", "Content-Security-Policy is missing",
+        # LOW, not MEDIUM: the absence of a defence-in-depth header is not
+        # itself a way in. A *misconfigured* CSP rates higher, because the
+        # operator believes they are covered when they are not.
+        "LOW", "Content-Security-Policy is missing",
         "Without a CSP an injected script runs with the full privileges of "
         "the page. It is the single most effective mitigation against XSS, "
         "and the only one that limits the damage when everything else fails.",
@@ -340,10 +343,18 @@ ISSUES = {
         "preloading.",
         "CWE-319"),
     "xfo_missing": _issue(
-        "LOW", "No framing protection",
+        # MEDIUM, not LOW: unlike the advisory headers this sits beside,
+        # the absence of framing protection is directly exploitable — it is
+        # the whole precondition for clickjacking. The header is named in
+        # the title so the finding is searchable by it in a report.
+        "MEDIUM", "X-Frame-Options missing \u2014 no framing protection",
         "The page can be embedded in a frame on another origin, which is what "
-        "clickjacking needs.",
-        "Send X-Frame-Options: DENY or a CSP frame-ancestors directive.",
+        "clickjacking needs. Neither X-Frame-Options nor a CSP "
+        "frame-ancestors directive is set, so any site can frame this one "
+        "and overlay it.",
+        "Send 'X-Frame-Options: DENY' and, for modern browsers, a CSP "
+        "'frame-ancestors' directive \u2014 frame-ancestors supersedes "
+        "X-Frame-Options where both are understood.",
         "CWE-1021"),
     "nosniff_missing": _issue(
         "LOW", "X-Content-Type-Options is missing",
@@ -351,6 +362,18 @@ ISSUES = {
         "can be executed as script.",
         "Send 'X-Content-Type-Options: nosniff'.",
         "CWE-430"),
+    "hsts_short_max_age": _issue(
+        # INFO: the protection is present and working. This is advice about
+        # the length of the window, not a hole — and reporting it at the
+        # same level as a missing header teaches the reader to ignore both.
+        "INFO", "Strict-Transport-Security max-age is short",
+        "HSTS is enforced, so this is not a gap — but the policy expires "
+        "sooner than the usual guidance. A browser that has not visited "
+        "within the window falls back to plain HTTP for the first request, "
+        "which is the request an attacker on the path wants.",
+        "Raise max-age to 31536000 (one year). Preload lists will not accept "
+        "a policy below that, and it is the figure most baselines ask for.",
+        "CWE-319"),
     "referrer_policy": _issue(
         "INFO", "Referrer-Policy is missing",
         "Full URLs — including anything sensitive in the path or query — are "

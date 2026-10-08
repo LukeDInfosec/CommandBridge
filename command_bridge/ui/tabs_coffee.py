@@ -28,15 +28,11 @@ from PyQt6.QtWidgets import (
 from command_bridge.modules import cb_evidence
 from command_bridge.modules.coffee_break import SEVERITIES, SEV_ORDER
 
-#: One colour per severity, picked to read on every theme in the app rather
-#: than to match any single one.
-SEV_COLOURS = {
-    "CRITICAL": "#ff3b5c",
-    "HIGH": "#ff6b4a",
-    "MEDIUM": "#f6b73c",
-    "LOW": "#4f8cff",
-    "INFO": "#8b9bb4",
-}
+#: One colour per severity. Taken from cb_evidence rather than written out
+#: again here — this file used to hold its own copy, and the copies drifted:
+#: the Active Scan screen and the Coffee Break screen were painting the same
+#: severity two different colours.
+SEV_COLOURS = cb_evidence.SEV_COLOURS
 
 #: The checklist marks. A tick for done, an arrow for the one in flight, an
 #: empty circle for what is still to come — the point of the list is that you

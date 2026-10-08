@@ -71,6 +71,67 @@ BROWSER_MARK = f"window.{MARKER}=1"
 TEXT_MARK = f"window.{MARKER}=1"
 
 
+_BROWSER_STATE = {}
+
+
+def _browser_problem(exc):
+    """Turn a Playwright failure into something a tester can act on.
+
+    The report used to print the exception verbatim. What that looked like
+    in the field was:
+
+        Execution could not be observed ('PlaywrightContextManager' object
+        has no attribute '_playwright')
+
+    which tells the reader nothing, and in particular does not tell them
+    the one thing that matters: XSS will never reach CONFIRMED on this
+    machine until a browser is installed, so every XSS finding in the
+    report is capped at Potential for a reason that has nothing to do with
+    the application.
+    """
+    text = str(exc)
+    low = text.lower()
+    advice = ("Execution could not be confirmed because the scanner's "
+              "browser did not start, so every cross-site scripting finding "
+              "in this scan is capped at POTENTIAL regardless of how strong "
+              "the reflection is. ")
+    if "_playwright" in text or "executable doesn" in low or \
+            "looks like playwright" in low or "browsertype.launch" in low:
+        advice += ("The Playwright Python package is installed but its "
+                   "browser is not. Run:  playwright install chromium")
+    elif "no module named" in low or "importerror" in low:
+        advice += ("Playwright is not installed. Run:  pip install "
+                   "playwright  then  playwright install chromium")
+    elif "timeout" in low:
+        advice += ("The browser started but the page did not finish "
+                   "loading in time. Re-run, or confirm this one by hand.")
+    else:
+        advice += f"The browser reported: {text[:200]}"
+    advice += ("  Until then, open the Vulnerable URL above in a browser "
+               "and see whether it fires — that is the whole confirmation.")
+    return advice
+
+
+def _browser_available():
+    """Is Playwright importable at all? ``(ok, why)``.
+
+    Deliberately only an import check. An earlier version launched a real
+    browser here to find out, which broke confirmation outright: the launch
+    opens a second ``sync_playwright()`` context around the one the caller
+    is about to open, and nested contexts fail. The launch failure is
+    diagnosed where it happens instead, by ``_browser_problem``.
+    """
+    if "ok" in _BROWSER_STATE:
+        return _BROWSER_STATE["ok"], _BROWSER_STATE["why"]
+    try:
+        import playwright.sync_api                     # noqa: F401
+    except Exception as exc:                            # noqa: BLE001
+        _BROWSER_STATE.update(ok=False, why=_browser_problem(exc))
+        return False, _BROWSER_STATE["why"]
+    _BROWSER_STATE.update(ok=True, why="")
+    return True, ""
+
+
 class XssCheck:
     key = "xss"
     name = "Cross-site scripting"
@@ -199,12 +260,10 @@ class XssCheck:
             return None, ("Execution was inferred from the reflection context "
                           "rather than observed, because the scan ran without "
                           "a browser. Confirm by hand before reporting it.")
-        try:
-            from playwright.sync_api import sync_playwright
-        except Exception:                               # noqa: BLE001
-            return None, ("Execution could not be observed — Playwright is "
-                          "not installed — so this is based on the reflection "
-                          "context alone.")
+        available, why = _browser_available()
+        if not available:
+            return None, why
+        from playwright.sync_api import sync_playwright
 
         try:
             with sync_playwright() as playwright:
@@ -239,8 +298,7 @@ class XssCheck:
                 fired = bool(page.evaluate(f"() => !!window.{MARKER}"))
                 browser.close()
         except Exception as exc:                        # noqa: BLE001
-            return None, (f"Execution could not be observed ({exc}); this is "
-                          f"based on the reflection context alone.")
+            return None, _browser_problem(exc)
 
         if fired:
             return True, ("The payload was loaded in a real browser and the "

@@ -988,8 +988,11 @@ def main():
               csp.proof.template_id, "weak-csp-detect")
         check("so do nuclei's tags", csp.proof.template_tags,
               ["csp", "misconfig"])
+        # csp_missing is LOW in the library as of 6.8.2 — a missing
+        # defence-in-depth header is not a Medium beside things that
+        # actually do something. nuclei's own rating stays separate.
         check("and nuclei's own severity is kept apart from ours",
-              (csp.scanner_severity, csp.severity), ("INFO", "MEDIUM"))
+              (csp.scanner_severity, csp.severity), ("INFO", "LOW"))
         check("the raw detection is still available",
               "weak-csp-detect" in csp.proof.raw_detection())
 
@@ -1260,9 +1263,16 @@ def main():
             remediation=contaminated.remediation, cwe=contaminated.cwe)
         check("the console block leads with the state",
               report_line.startswith("[INCONCLUSIVE] OS command injection"))
+        # What is missing is still spelled out — it moved. The evidence
+        # checklist no longer prints a column of "NOT CAPTURED" beside
+        # every finding that was never going to have a payload; the one
+        # place that explains why a finding is unproved now carries it.
         check("and spells out what is missing",
-              "Injection point: NOT IDENTIFIED" in report_line
-              and "Payload: NOT CAPTURED" in report_line)
+              "No test payload was recorded" in report_line
+              or "No injection point" in report_line
+              or "rests on the detecting tool" in report_line)
+        check("without a column of blanks beside every finding",
+              "Payload: NOT CAPTURED" not in report_line)
 
         # ─────────────────────────────────────────────────────────────────
         #  Pause means stop touching the target

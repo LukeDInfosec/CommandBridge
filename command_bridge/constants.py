@@ -33,7 +33,7 @@ Palette roles
 from pathlib import Path
 
 APP_TITLE = "Command Bridge"
-APP_VERSION = "6.8.1"
+APP_VERSION = "6.8.2"
 BASE_DIR = Path(__file__).resolve().parent.parent  # Project root (Test26/)
 DEFAULT_OUTPUT_DIR = Path.cwd()
 

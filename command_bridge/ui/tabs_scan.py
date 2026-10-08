@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
     QFrame, QScrollArea, QProgressBar, QTableWidget, QTableWidgetItem,
     QSplitter, QTextEdit, QHeaderView, QAbstractItemView, QComboBox,
+    QSpinBox,
     QLineEdit, QCheckBox, QFileDialog, QMessageBox, QSizePolicy, QGroupBox,
 )
 
@@ -244,7 +245,7 @@ class ActiveScanTabMixin:
         grid.setVerticalSpacing(8)
 
         self.as_auth_mode = QComboBox()
-        for label, value in (("None — scan as an anonymous user", "none"),
+        for label, value in (("Unauthenticated Scan — no login, anonymous user", "none"),
                              ("Form login (username and password)", "form"),
                              ("Browser login (headless Chromium)", "browser"),
                              ("Cookies / headers I paste in", "static"),
@@ -364,6 +365,7 @@ class ActiveScanTabMixin:
                 ("Full — everything, for staging only", "full")):
             self.as_profile.addItem(label, value)
         self.as_profile.setCurrentIndex(1)
+        self.as_profile.currentIndexChanged.connect(self._as_profile_defaults)
         grid.addWidget(QLabel("Profile"), 0, 0)
         grid.addWidget(self.as_profile, 0, 1, 1, 3)
 
@@ -380,6 +382,42 @@ class ActiveScanTabMixin:
         grid.addWidget(self.as_subdomains, 2, 0, 1, 2)
         grid.addWidget(self.as_browser, 2, 2, 1, 2)
         grid.addWidget(self.as_browser_crawl, 3, 0, 1, 2)
+
+        # Fragile infrastructure is the normal case on an engagement, not the
+        # exception, and a scanner that cannot be slowed down is a scanner
+        # that gets banned from the next test. Both of these already existed
+        # on the profile; they were simply not reachable from the interface.
+        self.as_threads = QSpinBox()
+        self.as_threads.setRange(1, 32)
+        self.as_threads.setValue(6)
+        self.as_threads.setToolTip(
+            "How many requests are in flight at once.\n\n"
+            "6 is a reasonable default against a healthy application. Drop "
+            "it to 1 or 2 for anything hosted on tired infrastructure, "
+            "anything behind a rate limiter you do not want to trip, or any "
+            "target where a support call is more expensive than a slow "
+            "scan.\n\n"
+            "One finding does need concurrency to be low to be trustworthy: "
+            "a behavioural differential seen only while sixty requests are "
+            "in flight is usually the server truncating under load, not a "
+            "vulnerability. The scanner re-checks those serially before "
+            "confirming them, but a lower thread count avoids the question.")
+        self.as_rate = QSpinBox()
+        self.as_rate.setRange(1, 200)
+        self.as_rate.setValue(12)
+        self.as_rate.setSuffix(" req/s")
+        self.as_rate.setToolTip(
+            "A ceiling on requests per second across every worker. The "
+            "thread count decides how many run at once; this decides how "
+            "fast they are allowed to go.")
+        self.as_threads.valueChanged.connect(
+            lambda _v: setattr(self, "_as_threads_touched", True))
+        self.as_rate.valueChanged.connect(
+            lambda _v: setattr(self, "_as_rate_touched", True))
+        grid.addWidget(QLabel("Threads"), 4, 0)
+        grid.addWidget(self.as_threads, 4, 1)
+        grid.addWidget(QLabel("Rate limit"), 4, 2)
+        grid.addWidget(self.as_rate, 4, 3)
 
         self.as_timing_only = QCheckBox(
             "Report time-based-only command injection")
@@ -398,6 +436,26 @@ class ActiveScanTabMixin:
 
         card.layout().addLayout(grid)
         return card
+
+    def _as_profile_defaults(self):
+        """Move the thread and rate boxes to the chosen profile's defaults.
+
+        Only when the operator has not already changed them: a deliberate
+        "1 thread, this box is fragile" must survive flipping the profile,
+        or the setting is a trap rather than a control.
+        """
+        try:
+            profile = PROFILES[self.as_profile.currentData()]()
+        except Exception:                               # noqa: BLE001
+            return
+        if not getattr(self, "_as_threads_touched", False):
+            self.as_threads.blockSignals(True)
+            self.as_threads.setValue(int(profile.threads))
+            self.as_threads.blockSignals(False)
+        if not getattr(self, "_as_rate_touched", False):
+            self.as_rate.blockSignals(True)
+            self.as_rate.setValue(int(profile.rate))
+            self.as_rate.blockSignals(False)
 
     def _as_build_findings(self):
         card = self.create_card("Findings")
@@ -617,6 +675,10 @@ class ActiveScanTabMixin:
         profile.use_browser = self.as_browser.isChecked()
         profile.browser_crawl = self.as_browser_crawl.isChecked()
         profile.report_timing_only = self.as_timing_only.isChecked()
+        # These override whatever the profile shipped with: the operator
+        # knows what the target can take and the profile does not.
+        profile.threads = self.as_threads.value()
+        profile.rate = float(self.as_rate.value())
 
         target = self.target
         if not target.startswith(("http://", "https://")):
@@ -697,7 +759,13 @@ class ActiveScanTabMixin:
     #: the words cannot drift apart.
     _AUTH_STYLES = {
         None:          ("Auth: not configured", "transparent", "#8b9bb4"),
-        "none":        ("Unauthenticated scan", "transparent", "#8b9bb4"),
+        # Deliberately green, and deliberately not "Authentication
+        # Successful". An anonymous scan is a valid, complete state — not a
+        # failure — but saying the authentication succeeded when no
+        # credentials were ever sent is simply untrue, and it was the first
+        # thing anyone noticed.
+        "none":        ("No Auth Required \u2014 unauthenticated scan",
+                        "#102a16", "#3fb950"),
         "checking":    ("Checking authentication…", "#3a2f10", "#f6b73c"),
         "ok":          ("Authentication Successful", "#102a16", "#3fb950"),
         "unverified":  ("Authentication Unverified", "#3a2f10", "#f6b73c"),
@@ -731,8 +799,18 @@ class ActiveScanTabMixin:
         self._as_auth_state = state
 
     def _as_show_auth_outcome(self, outcome):
-        """Reflect an Authenticator's verdict, whatever produced it."""
+        """Reflect an Authenticator's verdict, whatever produced it.
+
+        With no credentials configured the Authenticator reports state "ok",
+        because from its point of view there was nothing to do and nothing
+        failed. Passing that straight through lit the indicator green and
+        wrote "Authentication Successful" over a scan that had never sent a
+        credential. The configured strategy wins here.
+        """
         if outcome is None:
+            return
+        if self.as_auth_mode.currentData() == "none":
+            self._as_set_auth_state("none")
             return
         self._as_set_auth_state(outcome.state, outcome.reason,
                                 getattr(outcome, "method", ""))
@@ -955,6 +1033,11 @@ class ActiveScanTabMixin:
         self._as_update_count()
 
     def _as_apply_filter(self):
+        # Always re-assert severity order. Clicking a column
+        # header re-sorts the table and Qt remembers it, so a
+        # stray click could leave findings ordered by title for
+        # the rest of the scan with nothing on screen saying so.
+        self.as_table.sortByColumn(0, Qt.SortOrder.DescendingOrder)
         findings = list(self._as_findings)
         self.as_table.setRowCount(0)
         for finding in findings:

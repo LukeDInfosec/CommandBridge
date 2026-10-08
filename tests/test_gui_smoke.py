@@ -375,6 +375,12 @@ def main():
           "because" in window.as_auth_light.toolTip()
           and "because" not in window.as_auth_light.text())
 
+    # An outcome only drives the indicator when credentials were actually
+    # configured. Select a login method first, as the operator would.
+    for index in range(window.as_auth_mode.count()):
+        if window.as_auth_mode.itemData(index) == "form":
+            window.as_auth_mode.setCurrentIndex(index)
+            break
     good = AuthOutcome("Username/Password").finish(True, "verified")
     window._as_show_auth_outcome(good)
     check("a real outcome drives the indicator",
@@ -386,6 +392,30 @@ def main():
           "Failed" in window.as_auth_light.text())
     check("with the reason available on hover",
           "rejected" in window.as_auth_light.toolTip())
+
+    # The bug this guards against: with no credentials configured the
+    # Authenticator reports "ok" — nothing was attempted and nothing
+    # failed — and that was passed straight through, lighting the
+    # indicator green over the words "Authentication Successful" on a scan
+    # that had never sent a credential.
+    for index in range(window.as_auth_mode.count()):
+        if window.as_auth_mode.itemData(index) == "none":
+            window.as_auth_mode.setCurrentIndex(index)
+            break
+    window._as_show_auth_outcome(
+        AuthOutcome("none").finish(True, "nothing to do"))
+    check("an anonymous scan never claims the login succeeded",
+          "Successful" not in window.as_auth_light.text())
+    check("it says no authentication was required",
+          "No Auth Required" in window.as_auth_light.text())
+    check("and the option is named as an unauthenticated scan",
+          "Unauthenticated Scan" in window.as_auth_mode.currentText())
+
+    # Threads and rate are reachable from the form, not buried in a profile.
+    check("the scan exposes a thread count", hasattr(window, "as_threads"))
+    check("which can be dropped to one for fragile infrastructure",
+          window.as_threads.minimum(), 1)
+    check("and a request rate ceiling", hasattr(window, "as_rate"))
 
     # ── live progress detail ─────────────────────────────────────────────
     check("the Scan tab has a detail line",

@@ -429,6 +429,38 @@ def _session(context):
     return cb_control.gate_session(session, context.get("gate"))
 
 
+def _header_exchange(response, limit=40):
+    """The request and the response head, verbatim, as a tester reads them.
+
+    A header finding is about what the server sent, so the evidence should
+    be what the server sent — not a summary of it, and not a list of the
+    header names with the values thrown away.
+    """
+    try:
+        request = getattr(response, "request", None)
+        method = getattr(request, "method", "GET")
+        url = getattr(request, "url", response.url)
+        parsed = urllib.parse.urlparse(str(url))
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+        lines = [f"{method} {path} HTTP/1.1", f"Host: {parsed.netloc}"]
+        for name, value in (getattr(request, "headers", {}) or {}).items():
+            if name.lower() in ("host",):
+                continue
+            lines.append(f"{name}: {value}")
+        lines.append("")
+        lines.append("")
+        reason = getattr(response, "reason", "") or ""
+        lines.append(f"HTTP/1.1 {response.status_code} {reason}".rstrip())
+        for name, value in list(response.headers.items())[:limit]:
+            lines.append(f"{name}: {value}")
+        return "\n".join(lines)
+    except Exception:                                   # noqa: BLE001
+        return "Response headers: " + ", ".join(
+            sorted(k.lower() for k in response.headers))[:400]
+
+
 def probe_headers(context, report):
     """Fetch the target once and read everything the response says."""
     session = _session(context)
@@ -448,11 +480,32 @@ def probe_headers(context, report):
     report(f"{response.status_code} {response.reason} — "
            f"{len(response.content)} bytes, {len(headers)} headers")
 
-    seen_headers = "Response headers: " + ", ".join(sorted(headers))[:400]
+    # The exchange itself, written the way a tester reads one. A list of
+    # header *names* ("Response headers: content-length, content-type,
+    # date, server") was what this used to show, and it answered none of the
+    # questions a reader of a header finding has: what was sent, what came
+    # back, and what the headers actually said. The request and the full
+    # response head go in verbatim instead.
+    seen_headers = _header_exchange(response)
     for header, key in SECURITY_HEADERS.items():
         if header not in headers:
             findings.append(_finding_from(key, response.url, seen_headers,
                                           "headers"))
+
+    # HSTS that is present but short-lived is a different finding from HSTS
+    # that is absent, and a much smaller one: the protection works, the
+    # window is just narrow.
+    hsts = headers.get("strict-transport-security", "")
+    if hsts:
+        age = re.search(r"max-age\s*=\s*(\d+)", hsts, re.I)
+        if age and int(age.group(1)) < 31536000:
+            days = int(age.group(1)) // 86400
+            findings.append(_finding_from(
+                "hsts_short_max_age", response.url,
+                f"Strict-Transport-Security: {hsts[:200]}\n\n"
+                f"max-age is {age.group(1)} seconds (about {days} days). "
+                f"One year (31536000) is what the preload list and most "
+                f"baselines ask for.", "headers"))
 
     # A CSP that is present but permits what it exists to prevent is its own
     # finding — and a more interesting one than a missing header, because the
@@ -793,6 +846,69 @@ def probe_403_bypass(context, report):
 # ─────────────────────────────────────────────────────────────────────────────
 #  The mixin
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+#: Words that mean a header is absent rather than merely mentioned.
+_HEADER_ABSENT = re.compile(
+    r"\b(missing|not (?:defined|present|set|sent)|absent|no\s+\w*\s*header)",
+    re.I)
+
+
+#: Path or wording → what the panel actually is. "Administrative login
+#: panel publicly reachable" is true but makes the reader go and look;
+#: naming the product says what it is, what the default accounts are and
+#: which wordlist to point at it.
+_PANEL_PRODUCTS = (
+    ("wordpress", ("wp-login", "wp-admin", "wordpress")),
+    ("Joomla", ("/administrator", "joomla")),
+    ("Drupal", ("/user/login", "drupal")),
+    ("phpMyAdmin", ("phpmyadmin", "/pma", "/pma2")),
+    ("Tomcat Manager", ("/manager/html", "tomcat")),
+    ("Jenkins", ("/jenkins", "jenkins")),
+    ("cPanel", ("cpanel", ":2083")),
+    ("Webmin", ("webmin", ":10000")),
+    ("Magento", ("/admin_", "magento")),
+)
+
+
+def _panel_title(key, body):
+    """A product-specific title for a login-panel finding, or ""."""
+    if key not in ("login_panel_exposed", "admin_exposed"):
+        return ""
+    text = (body or "").lower()
+    for product, needles in _PANEL_PRODUCTS:
+        if any(needle in text for needle in needles):
+            name = "WordPress" if product == "wordpress" else product
+            return f"Publicly accessible {name} login panel"
+    return ""
+
+
+def _header_issue_from_nikto(body):
+    """Map Nikto's missing-header sentences onto the library.
+
+    Nikto writes these two ways round —
+
+        + /: Suggested security header missing: referrer-policy
+        + /: The X-Content-Type-Options header is not defined.
+
+    — so rather than guess at the grammar, look for a header the library
+    knows and a word that means it is absent. The library already rates
+    referrer-policy and permissions-policy as Informational; without this
+    join the generic fallback below read the word "missing" and called them
+    Low, so the same finding came out at two different severities depending
+    on which tool happened to notice it.
+    """
+    text = (body or "").lower()
+    if not _HEADER_ABSENT.search(text):
+        return "", None
+    # Longest name first: x-content-type-options must win over any shorter
+    # name that is a substring of it.
+    for name in sorted(SECURITY_HEADERS, key=len, reverse=True):
+        if name in text:
+            key = SECURITY_HEADERS[name]
+            return key, cb_issues.ISSUES.get(key)
+    return "", None
+
 
 class CoffeeBreakMixin:
     """Sequencing, parsing and state for the Coffee Break chain."""
@@ -1716,6 +1832,9 @@ class CoffeeBreakMixin:
                 continue                      # the scan talking about itself
 
             key, issue = cb_issues.for_text(body)
+            if not key:
+                key, issue = _header_issue_from_nikto(body)
+            override_title = _panel_title(key, body)
             if key == "robots_disclosure" and \
                     not self._cb_robots_worth_reporting():
                 continue
@@ -1725,6 +1844,7 @@ class CoffeeBreakMixin:
                 self._cb_record(self._cb_issue(
                     key, self._cb_where_for(key, body), body[:500],
                     stage["key"], confidence="tentative",
+                    **({"title": override_title} if override_title else {}),
                     detail=issue["detail"] + f"\n\nNikto reported: {body}\n\n"
                            "Nikto matches signatures and does not confirm "
                            "what it finds; verify before this goes in a "
