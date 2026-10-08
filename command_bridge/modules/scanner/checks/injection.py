@@ -193,6 +193,39 @@ class CodeInjectionCheck:
         return []
 
 
+def _without_payload(body, payload):
+    """``body`` with every literal copy of the payload removed.
+
+    The anti-reflection rule this replaces was "if the payload came back,
+    nothing ran" — which is right about reflection and wrong about a whole
+    class of real target. A diagnostic endpoint typically prints the command
+    it ran *and then its output*:
+
+        $ ping -c 1 -W 1 127.0.0.1; echo CB4F2A91
+        ping: not found
+        CB4F2A91
+
+    The payload is in the page, so the old rule skipped it, and command
+    injection on exactly the kind of endpoint that usually has command
+    injection went unreported. Removing the echoed payload first keeps the
+    protection — a token that appears *only* inside the reflected payload
+    still disappears with it — while letting real output through.
+    """
+    if not payload:
+        return body or ""
+    cleaned = (body or "").replace(payload, " ")
+    # The payload may come back HTML-escaped, URL-encoded, or with its
+    # whitespace collapsed, so take those out too before deciding.
+    import html as _html
+    import urllib.parse as _url
+    for variant in (_html.escape(payload), _html.escape(payload, quote=False),
+                    _url.quote(payload), _url.quote_plus(payload),
+                    " ".join(payload.split())):
+        if variant and variant != payload:
+            cleaned = cleaned.replace(variant, " ")
+    return cleaned
+
+
 class CommandInjectionCheck:
     """Prove the shell ran something, then make it say what it is.
 
@@ -243,10 +276,14 @@ class CommandInjectionCheck:
                     body = response.text or ""
                     if expected not in body:
                         continue
-                    # Reflection is not execution. If the whole payload came
-                    # back, or the token is still sitting next to the word
-                    # that was supposed to print it, nothing ran.
-                    if payload in body or f"echo {expected}" in body:
+                    # Reflection is not execution — but an endpoint that
+                    # prints the command it ran is not reflection either.
+                    # Strip the echoed payload and ask whether the expected
+                    # output survives on its own.
+                    residue = _without_payload(body, payload)
+                    if expected not in residue:
+                        continue
+                    if f"echo {expected}" in residue:
                         continue
                     if expected in baseline_body:
                         continue
@@ -282,8 +319,9 @@ class CommandInjectionCheck:
                 if response is None:
                     continue
                 body = response.text or ""
-                if payload in body:
-                    continue
+                # Same correction as above: the command being printed back
+                # is normal for this kind of endpoint and is not reflection.
+                body = _without_payload(body, payload)
                 matches = oracles.command_output(body, baseline_body, payload)
                 matches = [m for m in matches if m[1] == family]
                 if not matches:

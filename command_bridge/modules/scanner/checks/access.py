@@ -43,8 +43,8 @@ from __future__ import annotations
 import re
 import urllib.parse
 
-from command_bridge.modules.scanner.model import Evidence, ScanFinding, \
-    response_summary, step
+from command_bridge.modules.scanner.model import Evidence, Request, \
+    ScanFinding, response_summary, step
 from command_bridge.modules.scanner import oracles
 from command_bridge.modules.scanner import grading
 
@@ -244,6 +244,37 @@ class AccessControlCheck:
         likeness = oracles.similarity(authorised.text, anonymous.text)
         if likeness < 0.9:
             return None
+
+        # The part this check was missing, and it is the same mistake the
+        # static-asset filter was added to fix, one level up.
+        #
+        # "An anonymous request returned the same page as a logged-in one"
+        # describes every public page ever served: a home page, a catalogue,
+        # a search form, a login page. Reported as broken access control it
+        # produces a finding for most of the application, and the first
+        # scan of a shop front came back with eight of them — /products,
+        # /search, /wp-login.php — none of which are meant to need a
+        # session in the first place.
+        #
+        # So something has to establish that this page was *supposed* to be
+        # protected. The same two things the vertical check accepts:
+        #
+        #   * the path says so (/admin, /manage, /billing), or
+        #   * the page carries the logged-in account's own data, which a
+        #     public page does not — if an anonymous request gets a page
+        #     with alice's name and address on it, authentication is not
+        #     being enforced, whatever the URL looks like.
+        #
+        # A protected page at an unremarkable URL showing no owner is missed.
+        # That is the deliberate trade, and it is the right way round: a
+        # missed finding costs one endpoint, and "broken access control on
+        # /search" costs the reader's trust in the whole report.
+        privileged_path = bool(PRIVILEGED_PATH.search(request.url))
+        marker = self._owner_marker(authorised.text, ctx.auth.config)
+        leaked = self._leaked(marker, request, anonymous,
+                              self.unauthenticated)
+        if not (privileged_path or leaked):
+            return None
         # A login page served with HTTP 200 looks nothing like the real page,
         # which the similarity test already catches — but check anyway,
         # because an application that renders a shell around a login form can
@@ -289,10 +320,17 @@ class AccessControlCheck:
             reproduced=repeated))
         finding.add(grading.Signal(
             grading.OBSERVATION,
-            "The response to the unauthenticated request was not a redirect "
-            "to a login page, a 401, a 403, or a login form rendered with "
-            "HTTP 200.",
-            {"status": anonymous.status_code}))
+            (f"The anonymous response still contains '{marker}', which "
+             f"belongs to {ctx.auth.config.name} — so this is not a public "
+             f"page being served to everyone."
+             if leaked else
+             "The URL is an administrative or otherwise privileged path, so "
+             "it is not a page an anonymous visitor is meant to reach.")
+            + " The response was not a redirect to a login page, a 401, a "
+              "403, or a login form rendered with HTTP 200.",
+            {"status": anonymous.status_code,
+             "privileged_path": privileged_path,
+             "owner_marker": marker if leaked else ""}))
         return finding.settle()
 
     # ── replay as somebody else ──────────────────────────────────────────
@@ -540,9 +578,28 @@ class AccessControlCheck:
         if marker in urllib.parse.unquote_plus(haystack):
             return False
         # A shared listing: the reader's own identifier is on the page too.
+        #
+        # This used to veto on the challenger's name appearing anywhere in
+        # the visible text, which is far too strong. Almost every
+        # application puts the logged-in user's name in its own furniture —
+        # "Signed in as bob", a nav bar, a greeting — so the test fired on
+        # every page and suppressed the real IDORs along with the listings.
+        # It was found by scanning a target whose order page genuinely does
+        # leak one customer's record to another: the finding was correct,
+        # the evidence was there, and this line threw it away because the
+        # word "bob" was in the header.
+        #
+        # So the comparison is made against the page's *content* rather than
+        # the whole of it. Anything that also appears on the challenger's
+        # own ordinary page is site furniture and is removed first; a shared
+        # listing still names both accounts in what is left, and a leaked
+        # record no longer does.
+        content = _without_chrome(body, challenger)
+        if marker not in content:
+            return False
         for own in (getattr(challenger.config, "username", ""),
                     getattr(challenger.config, "name", "")):
-            if own and len(own) >= 3 and own in body:
+            if own and len(own) >= 3 and own in content:
                 return False
         return True
 
@@ -631,6 +688,43 @@ class AccessControlCheck:
                 if username in local or local in username:
                     return match.group(0)
         return ""
+
+
+def _without_chrome(body, challenger):
+    """``body`` with the challenger's own site furniture removed.
+
+    The furniture is established empirically rather than guessed at: fetch a
+    page the challenger is plainly entitled to — their session-check URL —
+    and treat every line of visible text on it as chrome. A navigation bar
+    saying "Signed in as bob" appears on both pages and drops out; the body
+    of somebody else's record does not appear on it and stays.
+
+    Cached on the Authenticator, so this costs one request per identity per
+    scan rather than one per finding.
+    """
+    lines = [line.strip() for line in (body or "").splitlines()
+             if line.strip()]
+    chrome = getattr(challenger, "_chrome_lines", None)
+    if chrome is None:
+        chrome = set()
+        check_url = getattr(challenger.config, "check_url", "")
+        if check_url:
+            try:
+                own = challenger.send(Request("GET", check_url),
+                                      allow_redirects=True)
+                if own is not None and own.text:
+                    chrome = {line.strip() for line
+                              in visible_text(own.text).splitlines()
+                              if line.strip()}
+            except Exception:                                 # noqa: BLE001
+                chrome = set()
+        try:
+            challenger._chrome_lines = chrome
+        except Exception:                                     # noqa: BLE001
+            pass
+    if not chrome:
+        return "\n".join(lines)
+    return "\n".join(line for line in lines if line not in chrome)
 
 
 def anonymous_identity(template):
