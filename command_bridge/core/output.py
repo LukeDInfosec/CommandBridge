@@ -436,90 +436,49 @@ class OutputMixin:
             self._handle_sqlmap_line(line, newline=True)
 
     def _handle_sqlmap_line(self, line: str, newline: bool = True) -> None:
-        """Analyse one sqlmap output line and emit it with optional highlighting.
+        """Emit one sqlmap line, and accumulate the raw output for the verdict.
 
-        The original text of the line is preserved. On the first line that
-        clearly indicates a successful or confirmed SQL injection, we render
-        that whole line in green (or red for critical impact). Subsequent
-        lines are passed through unchanged to avoid excessive highlighting.
+        This used to decide, line by line, whether sqlmap had found an
+        injection — and got it wrong, because it was reading sqlmap's
+        narration. "testing 'Oracle stacked queries (…)'" contains the words
+        "stacked queries", and that substring alone was enough to report a
+        confirmed critical SQL injection on a run that ended with sqlmap
+        saying nothing was injectable.
+
+        So nothing is decided here any more. The line is kept, coloured only
+        when it is part of sqlmap's own verdict block, and the conclusion is
+        read from the whole output at the end by
+        :mod:`command_bridge.modules.sqlmap_verdict` — which reads what
+        sqlmap concluded rather than inferring it from what sqlmap said
+        while it was working.
         """
-        import re as _re
         from html import escape as _esc
+        from command_bridge.modules import sqlmap_verdict
 
         text = line.rstrip("\r")
-        lower = text.lower()
 
-        vuln = False
-        critical = False
-        dbms = None
-        param = None
+        # Keep the raw output. The verdict is parsed from all of it at the
+        # end, so a sentence cannot be read out of context.
+        if not hasattr(self, "_sqlmap_raw"):
+            self._sqlmap_raw = []
+        self._sqlmap_raw.append(text)
 
-        # Extract back-end DBMS if sqlmap reports it (e.g. "the back-end DBMS is 'MySQL'")
-        m = _re.search(r"back-end dbms is\s*(?:'|\")?([^'\"]+)", text, _re.IGNORECASE)
-        if m:
-            dbms = m.group(1).strip()
+        # Colour only sqlmap's verdict block. Narration stays plain however
+        # alarming its wording.
+        seen = getattr(self, "_sqlmap_seen_verdict", False)
+        probe = sqlmap_verdict.Verdict(confirmed=seen)
+        colour = sqlmap_verdict.highlight_colour(text, probe)
+        if sqlmap_verdict.IDENTIFIED.search(text) or \
+                sqlmap_verdict.RESUMED.search(text):
+            self._sqlmap_seen_verdict = True
 
-        # Extract parameter name from common sqlmap messages
-        m = _re.search(r"(?:parameter|param)\s*'([^']+)'(?:\s*\(.*\))?\s+appears to be", text, _re.IGNORECASE)
-        if not m:
-            m = _re.search(r"(get|post|put|cookie)\s+parameter\s+'([^']+)'", text, _re.IGNORECASE)
-        if not m:
-            m = _re.search(r"parameter\s*:?\s*'([^']+)'", text, _re.IGNORECASE)
-        if m:
-            # Use the last capturing group which holds the actual name in all patterns
-            groups = m.groups()
-            param = groups[-1].strip()
-
-        # Indicators of successful / confirmed SQL injection
-        success_patterns = [
-            r"is vulnerable\\b",
-            r"sql injection vulnerability has been detected",
-            r"appears to be .*injectable",
-            r"appears to be injectable",
-            r"payload .*? worked",
-        ]
-        if any(_re.search(p, lower) for p in success_patterns):
-            vuln = True
-        # "available databases" is only meaningful once injection was already found
-        if "available databases" in lower and getattr(self, "_sqlmap_vuln_found", False):
-            vuln = True
-        # If sqlmap reports the back-end DBMS, it has already confirmed injection
-        if dbms:
-            vuln = True
-
-        # Critical impact indicators (e.g. stacked queries, file write / outfile)
-        if "stacked queries" in lower or "stacked query" in lower:
-            critical = True
-            vuln = True
-        if "file write" in lower or "into outfile" in lower or "into dumpfile" in lower:
-            critical = True
-            vuln = True
-        if "[critical]" in lower:
-            # Generic CRITICAL messages are treated as high importance
-            critical = True
-
-        # Update accumulated state for later summary
-        if dbms and not getattr(self, "_sqlmap_dbms", None):
-            self._sqlmap_dbms = dbms
-        if param and not getattr(self, "_sqlmap_param", None):
-            self._sqlmap_param = param
-        if critical:
-            self._sqlmap_critical = True
-        if vuln:
-            self._sqlmap_vuln_found = True
-
-        # Decide how to render this line
-        if vuln and not getattr(self, "_sqlmap_first_vuln_highlighted", False):
-            # First confirmed finding: highlight entire line (green or red)
-            self._sqlmap_first_vuln_highlighted = True
-            color = "#ef4444" if critical else "#22c55e"  # red for critical, green otherwise
-            safe = _esc(text)
+        if colour:
             suffix = "<br>" if newline else ""
-            self.console.append_html(f'<span style="color: {color}; font-weight: bold;">{safe}</span>{suffix}')
+            self.console.append_html(
+                f'<span style="color: {colour}; font-weight: bold;">'
+                f'{_esc(text)}</span>{suffix}')
         else:
-            # Pass through unchanged; preserve exact text content
-            out = text + ("\n" if newline else "")
-            self.console.append_ansi(out)
+            self.console.append_ansi(text + ("\n" if newline else ""))
 
     def on_command_finished(self, exit_code):
         """Handle command completion"""

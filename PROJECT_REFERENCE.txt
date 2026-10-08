@@ -1,7 +1,7 @@
 ================================================================================
  COMMAND BRIDGE v4 — PROJECT REFERENCE & CHANGELOG
  (Reference doc for Claude / future sessions. Keep this updated after changes.)
- Last updated: 2026-10-02
+ Last updated: 2026-10-08
 ================================================================================
 
 HOW TO USE THIS FILE
@@ -18,6 +18,121 @@ HOW TO USE THIS FILE
 ================================================================================
  CHANGELOG (most recent first)
 ================================================================================
+
+## 2026-10-08 — READ THE VERDICT, NOT THE NARRATION (6.8.1)
+
+Reported from a live engagement: sqlmap tested every technique against an
+endpoint, found nothing, and ended with
+
+    [WARNING] (custom) POST parameter '#1*' does not seem to be injectable
+    [CRITICAL] all tested parameters do not appear to be injectable.
+
+and Command Bridge printed
+
+    [+] SQL INJECTION FOUND - DBMS: Unknown - PARAMETER: #1* - CRITICAL
+
+Same disease as the timing bug in 6.8.0, in a part of the codebase the
+6.8.0 rewrite never touched: a conclusion inferred from prose instead of
+read from the tool's own verdict.
+
+1. THE SQLMAP OUTPUT PARSER - new modules/scanner/../sqlmap_verdict.py
+
+   Two causes, both reproduced in tests/test_coffee_break.py:
+
+   a) core/output.py flagged a finding on any line containing the substring
+      "stacked queries". sqlmap prints
+
+          [INFO] testing 'Microsoft SQL Server/Sybase stacked queries (comment)'
+
+      while ANNOUNCING a test it is about to run. Every sqlmap run that got
+      as far as the stacked-queries phase - nearly all of them - was
+      therefore reported as a confirmed critical SQL injection.
+
+   b) "[CRITICAL]" was read as a vulnerability severity. In sqlmap it is a
+      log level, and the line it appears on most often is the one saying
+      nothing was injectable.
+
+   modules/sqlmap_verdict.py now parses the whole run at the end and reads
+   only what sqlmap actually concluded: the "sqlmap identified the following
+   injection point(s)" block, and the Parameter/Type/Title/Payload fields
+   inside it. Negative statements are authoritative and clear the state.
+   A line matching NARRATION (an INFO/DEBUG line that is testing, checking,
+   trying, loading...) is never evidence, however alarming its wording.
+
+   Severity is earned from the verdict block's own Type/Title - stacked
+   queries or file access make it CRITICAL, anything else confirmed is HIGH.
+   Several runs appended to one output file are split and judged separately,
+   so a failed attempt cannot suppress a real one or the other way round.
+
+   A run that found nothing now SAYS SO ("sqlmap did not confirm SQL
+   injection - nothing reported") and explains why. The old code had no way
+   to say that, which is half of why it over-claimed.
+
+   Streaming colour follows the same rule: only the verdict block is
+   coloured, so a "testing ... stacked queries" line no longer reads as a
+   finding before the summary even prints.
+
+2. BROKEN ACCESS CONTROL ON PUBLIC PAGES - checks/access.py
+
+   Found by scanning the new demo target: a first scan returned eight
+   "broken access control" findings on /products, /search, /wp-login.php,
+   /wp-json/ and the home page. _forced_browsing reported any page an
+   anonymous request could fetch and that looked the same as the logged-in
+   version - which describes every public page ever served.
+
+   It now requires what the vertical check already required: either the URL
+   is a privileged path, or the anonymous response carries the logged-in
+   account's own data. Eight false positives became zero, and the real
+   findings on the same target were unaffected.
+
+3. IDOR SUPPRESSED BY A NAV BAR - checks/access.py _leaked
+
+   The shared-listing guard vetoed whenever the challenger's own name
+   appeared anywhere in the visible text. Almost every application prints
+   the logged-in user's name in its own furniture ("Signed in as bob"), so
+   the guard fired on every page and threw away the real IDORs with the
+   listings - including one on the demo target that genuinely leaks one
+   customer's order to another.
+
+   _without_chrome() now establishes the furniture empirically: fetch a page
+   the challenger is plainly entitled to (their session-check URL) and treat
+   every line of visible text on it as chrome. A shared listing still names
+   both accounts in what remains; a leaked record no longer does. One extra
+   request per identity per scan, cached on the Authenticator.
+
+4. COMMAND INJECTION MISSED ON THE ENDPOINTS THAT USUALLY HAVE IT
+
+   checks/injection.py skipped any result where the payload came back in the
+   page, as an anti-reflection guard. But a diagnostic endpoint prints the
+   command it ran AND THEN its output:
+
+       $ ping -c 1 -W 1 127.0.0.1; echo CB4F2A91
+       ping: not found
+       CB4F2A91
+
+   so the payload is always in the body and the check always skipped - on
+   exactly the kind of endpoint command injection lives on. _without_payload()
+   strips every literal copy of the payload (plus its HTML-escaped and
+   URL-encoded forms) and then looks for the expected output in what is
+   left. Reflection is still caught; execution is no longer thrown away.
+
+Verified end to end against the new vulnshop target (see below): 9 findings,
+all genuine, no false positives, and both planted decoys correctly silent.
+All four suites pass (test_scanner 284, test_coffee_break 308,
+test_coffee_chain 13, test_gui_smoke 242 - 847 assertions).
+
+A NOTE ON THE DEMO TARGET
+
+A deliberately vulnerable application was built alongside this release to
+test against, and every fix above except the sqlmap one was found BY it
+rather than reported from the field. It is a separate deliverable
+(vulnshop/) and is not part of this repository. It has working SQL
+injection, command injection and path traversal, binds to loopback, and
+refuses any other address without an explicit flag. Two of its endpoints are
+deliberately NOT vulnerable - a latency-scaling endpoint with no database
+behind it, and a parameterised twin of the injectable product page - so a
+scan of it tests the false-positive half as well as the detection half.
+
 
 ## 2026-10-02 — EVIDENCE DECIDES, NOT THE DETECTOR (6.8.0)
 

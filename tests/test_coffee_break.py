@@ -1352,6 +1352,93 @@ def main():
     finally:
         server.shutdown()
 
+    print("\n\033[1msqlmap's verdict, not sqlmap's narration\033[0m")
+    from command_bridge.modules import sqlmap_verdict
+
+    # The exact shape of the field false positive: sqlmap tested everything,
+    # found nothing, and said so. The old parser reported CONFIRMED CRITICAL
+    # because one INFO line contained the words "stacked queries".
+    refuted = """
+[11:27:24] [INFO] testing if (custom) POST parameter '#1*' is dynamic
+[11:27:24] [WARNING] heuristic (basic) test shows that (custom) POST parameter '#1*' might not be injectable
+[11:27:24] [INFO] testing for SQL injection on (custom) POST parameter '#1*'
+[11:28:02] [INFO] testing 'Microsoft SQL Server/Sybase stacked queries (comment)'
+[11:28:03] [INFO] testing 'Oracle stacked queries (DBMS_PIPE.RECEIVE_MESSAGE - comment)'
+[11:28:07] [WARNING] (custom) POST parameter '#1*' does not seem to be injectable
+[11:28:07] [CRITICAL] all tested parameters do not appear to be injectable.
+"""
+    verdict = sqlmap_verdict.parse(refuted)
+    check("a run that found nothing is not a finding", verdict.confirmed, False)
+    check("it is recorded as refuted, not merely silent",
+          verdict.refuted, True)
+    check("'testing ... stacked queries' is narration, not evidence",
+          verdict.stacked, False)
+    check("sqlmap's [CRITICAL] log level is not a severity",
+          verdict.severity, "")
+    check("and nothing is printed", verdict.banner(), "")
+    check("but the reason is still explained",
+          any("not a result" in line for line in verdict.explain()))
+
+    # The genuine article: sqlmap prints a block that cannot be mistaken.
+    confirmed = """
+        ___
+[11:40:03] [INFO] testing 'Microsoft SQL Server/Sybase stacked queries (comment)'
+sqlmap identified the following injection point(s) with a total of 71 HTTP(s) requests:
+---
+Parameter: id (GET)
+    Type: boolean-based blind
+    Title: AND boolean-based blind - WHERE or HAVING clause
+    Payload: id=1 AND 4821=4821
+---
+[11:40:05] [INFO] the back-end DBMS is MySQL
+back-end DBMS: MySQL >= 5.6
+"""
+    verdict = sqlmap_verdict.parse(confirmed)
+    check("a real injection point is confirmed", verdict.confirmed, True)
+    check("the parameter comes from the block", verdict.parameters, ["id (GET)"])
+    check("so does the technique",
+          verdict.injections[0].technique, "boolean-based blind")
+    check("and the payload, for replay",
+          verdict.injections[0].payload, "id=1 AND 4821=4821")
+    check("the DBMS is read without the colon",
+          verdict.dbms, "MySQL >= 5.6")
+    check("a confirmed boolean-based finding is HIGH, not CRITICAL",
+          verdict.severity, "HIGH")
+    check("and the banner names the parameter",
+          "id (GET)" in verdict.banner())
+
+    # CRITICAL is earned by a technique confirmed in the block itself.
+    stacked = confirmed.replace("Type: boolean-based blind",
+                                "Type: stacked queries")
+    verdict = sqlmap_verdict.parse(stacked)
+    check("stacked queries in the verdict block does raise it to CRITICAL",
+          verdict.severity, "CRITICAL")
+
+    # An output file holding several runs must not blend them.
+    both = sqlmap_verdict.parse(refuted + confirmed)
+    check("a failed run before a real one does not suppress it",
+          both.confirmed, True)
+    both = sqlmap_verdict.parse(confirmed + refuted)
+    check("a failed run after a real one does not erase it",
+          both.confirmed, True)
+
+    check("an interrupted run claims nothing either",
+          sqlmap_verdict.parse("[INFO] testing connection to the target URL"
+                               ).confirmed, False)
+    check("and says it could not tell",
+          any("did not state a verdict" in line for line in
+              sqlmap_verdict.parse("[INFO] testing connection").explain()))
+
+    # Colouring follows the same rule: narration is never dressed as a result.
+    plain = sqlmap_verdict.Verdict()
+    check("a 'testing ... stacked queries' line is not highlighted",
+          sqlmap_verdict.highlight_colour(
+              "[INFO] testing 'Oracle stacked queries (comment)'", plain), "")
+    check("the identification line is",
+          sqlmap_verdict.highlight_colour(
+              "sqlmap identified the following injection point(s)",
+              plain) != "")
+
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

@@ -131,6 +131,8 @@ class CommandBridgeV5(
         self._sqlmap_param: str | None = None
         self._sqlmap_critical: bool = False
         self._sqlmap_buffer: str = ""
+        self._sqlmap_raw: list = []
+        self._sqlmap_seen_verdict: bool = False
 
         # Fuzzing readiness tracking
         self._fuzzing_ready: set[str] = set()

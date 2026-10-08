@@ -449,31 +449,56 @@ class StatusMixin:
             raise
 
     def _summarize_sqlmap_if_applicable(self, exit_code: int) -> None:
-        """Append a summary banner if the last command was sqlmap and SQLi was found."""
+        """Print what sqlmap concluded — including when it concluded nothing.
+
+        The old version printed "[+] SQL INJECTION FOUND" whenever a flag had
+        been tripped somewhere in the stream, and the flag was tripped by
+        sqlmap announcing that it was about to test stacked queries. It had
+        no way of saying "sqlmap found nothing", so a clean run was either
+        silent or a false positive.
+
+        Now the whole output is parsed once, here, and sqlmap's own verdict
+        decides. A run that found nothing says so.
+        """
         try:
             cmd = self.current_command or ""
             if "sqlmap" not in cmd:
                 return
-            if not getattr(self, "_sqlmap_vuln_found", False):
-                return
 
             from html import escape as _esc
+            from command_bridge.modules import sqlmap_verdict
 
-            dbms = getattr(self, "_sqlmap_dbms", None) or "Unknown"
-            param = getattr(self, "_sqlmap_param", None) or "Unknown"
-            critical = getattr(self, "_sqlmap_critical", False)
-            color = "#ef4444" if critical else "#22c55e"
+            raw = "\n".join(getattr(self, "_sqlmap_raw", []) or [])
+            if not raw.strip():
+                return
+            verdict = sqlmap_verdict.parse(raw)
 
-            banner = f"[+] SQL INJECTION FOUND — DBMS: {dbms} — PARAMETER: {param}"
-            if critical:
-                banner += " — CRITICAL"
+            if verdict.confirmed:
+                colour = "#ef4444" if verdict.severity == "CRITICAL" \
+                    else "#22c55e"
+                self.console.append_html(
+                    "<br>" + f'<span style="color: {colour}; font-weight: '
+                    f'bold;">{_esc(verdict.banner())}</span><br>')
+            else:
+                # Saying so plainly is the point. A tester who sees nothing
+                # cannot tell a clean result from a crashed parser.
+                self.console.append_html(
+                    "<br>" + '<span style="color: #94a3b8; font-weight: '
+                    'bold;">[i] sqlmap did not confirm SQL injection — '
+                    'nothing reported.</span><br>')
 
-            self.console.append_html(
-                "<br>" +
-                f'<span style="color: {color}; font-weight: bold;">{_esc(banner)}</span><br>'
-            )
+            for note in verdict.explain():
+                self.console.append_html(
+                    f'<span style="color: #94a3b8;">{_esc(note)}</span><br>')
+        except Exception:
+            # A summary that throws must never lose the run's output.
+            try:
+                self.console.append_ansi(
+                    "[!] Could not summarise the sqlmap run; its full output "
+                    "is above.\n")
+            except Exception:
+                pass
         finally:
-            # Always reset SQLMap state for the next command
             if hasattr(self, "_sqlmap_vuln_found"):
                 self._reset_sqlmap_state()
 
