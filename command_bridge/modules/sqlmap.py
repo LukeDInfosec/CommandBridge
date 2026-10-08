@@ -601,10 +601,18 @@ class SqlmapMixin:
                 pass
 
     def _reset_sqlmap_state(self) -> None:
-        """Reset per-command SQLMap highlighting and summary state."""
+        """Reset per-command SQLMap state.
+
+        ``_sqlmap_raw`` is the one that matters now: the verdict is parsed
+        from the whole run at the end, so it has to start empty or the last
+        run's output would be read as part of this one.
+        """
+        self._sqlmap_raw = []
+        self._sqlmap_seen_verdict = False
+        self._sqlmap_buffer = ""
+        # Kept so older call sites and saved state do not break.
         self._sqlmap_vuln_found = False
         self._sqlmap_first_vuln_highlighted = False
         self._sqlmap_dbms = None
         self._sqlmap_param = None
         self._sqlmap_critical = False
-        self._sqlmap_buffer = ""
