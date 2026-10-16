@@ -152,7 +152,14 @@ class CommandBridgeV5(
 
         # Surface any saved commands that are not the shipped versions — an
         # invisible stale override is how a fixed command keeps looking broken.
-        QTimer.singleShot(0, self.report_command_overrides)
+        #
+        # Guarded because this is a startup nicety, not a dependency: it is
+        # provided by ApiTestingMixin, and a window that cannot report its
+        # overrides should still open. Calling it unguarded turned a missing
+        # convenience into an application that would not start at all.
+        reporter = getattr(self, "report_command_overrides", None)
+        if callable(reporter):
+            QTimer.singleShot(0, reporter)
 
         self.load_target_and_headers()
         self.load_window_geometry()

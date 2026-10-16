@@ -911,6 +911,77 @@ def main():
     check("and the close did not hang", took < 10)
     window._cb_active = False
 
+
+    # ── Nothing relies on a name this tree cannot verify ─────────────────
+    #
+    # The regression: window.py did `QTimer.singleShot(0,
+    # self.report_command_overrides)`. That name is provided by
+    # ApiTestingMixin, whose real source is not in this working copy — a
+    # stub stood in for it, so the call resolved here and the suite went
+    # green. On a real checkout the method does not exist and the
+    # application raised AttributeError in __init__, before the window
+    # appeared. A startup nicety took the whole program down.
+    #
+    # Any call to a stubbed name must therefore be guarded (getattr +
+    # callable, or hasattr), because this tree cannot prove it is there.
+    print("\n\033[1mNo unguarded use of an unverifiable name\033[0m")
+    import re as _re
+    from command_bridge.modules.api_testing import STUBBED
+
+    pkg = Path(__file__).resolve().parent.parent / "command_bridge"
+    sources = {}
+    for path in sorted(pkg.rglob("*.py")):
+        if path.name == "api_testing.py":
+            continue
+        try:
+            sources[path] = path.read_text(errors="replace")
+        except Exception:
+            continue
+
+    # Several names on the stub list DO exist in real source — the list
+    # was reconstructed from call sites, so it over-reaches. Subtract
+    # anything genuinely defined somewhere, and what remains is the set
+    # this tree truly cannot vouch for.
+    everything = "\n".join(sources.values())
+    unverifiable = [n for n in STUBBED
+                    if not _re.search(r"^\s*def %s\b" % _re.escape(n),
+                                      everything, _re.MULTILINE)]
+    check("the stub list is narrowed to names defined nowhere else",
+          "report_command_overrides" in unverifiable
+          and "run_graphw00f" not in unverifiable)
+
+    offenders = []
+    for path, source in sources.items():
+        for name in unverifiable:
+            for match in _re.finditer(r"self\.%s\b" % _re.escape(name), source):
+                line_no = source.count("\n", 0, match.start()) + 1
+                line = source.splitlines()[line_no - 1]
+                # A guarded call names the attribute as a STRING to
+                # getattr/hasattr; an unguarded one reaches it directly.
+                window = "\n".join(
+                    source.splitlines()[max(0, line_no - 4):line_no])
+                guarded = (
+                    f'"{name}"' in window or f"'{name}'" in window
+                    or "getattr" in line or "hasattr" in line
+                )
+                if not guarded and f"def {name}" not in line:
+                    offenders.append(
+                        f"{path.relative_to(pkg.parent)}:{line_no}: {line.strip()}")
+
+    check("no shipped file calls an unverifiable method without a guard",
+          offenders, [])
+    if offenders:
+        for o in offenders:
+            print(f"      {o}")
+
+    # And the specific line that broke it, pinned by name.
+    win = (pkg / "ui" / "window.py").read_text()
+    check("window.py's override report is guarded",
+          "report_command_overrides" not in win
+          or 'getattr(self, "report_command_overrides"' in win)
+    check("constructing the window does not require it",
+          "QTimer.singleShot(0, self.report_command_overrides)" in win, False)
+
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

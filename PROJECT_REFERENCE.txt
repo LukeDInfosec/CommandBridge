@@ -19,6 +19,62 @@ HOW TO USE THIS FILE
  CHANGELOG (most recent first)
 ================================================================================
 
+## 2026-10-16 — A TEST THAT PASSED AGAINST A FICTION (6.8.6)
+
+6.8.5 would not start:
+
+    File "command_bridge/ui/window.py", line 155, in __init__
+      QTimer.singleShot(0, self.report_command_overrides)
+    AttributeError: 'CommandBridgeV5' object has no attribute
+    'report_command_overrides'
+
+The method is provided by ApiTestingMixin. The real api_testing.py is
+about 12 KB and is NOT in the sandbox working copy these changes are
+made in. An earlier session papered over that with a sourceless
+api_testing.pyc defining fourteen no-op stubs, one of them
+report_command_overrides, so that window.py would import.
+
+That is why the GUI smoke test passed. It was asserting against the
+stub. The call site was shipped; the method it calls has never existed
+in the repository.
+
+Three fixes, in increasing order of importance:
+
+1. THE CALL IS GUARDED — ui/window.py
+
+   Reporting stale command overrides at startup is a nicety. An
+   unguarded call turned a missing nicety into an application that
+   would not open. getattr + callable; if the method is there it runs,
+   and if it is not the window still appears.
+
+2. THE STUB IS SOURCE, NOT BYTECODE — modules/api_testing.py
+
+   The .pyc is deleted. A placeholder that cannot be grepped is a
+   placeholder nobody finds, and the whole failure here was a fiction
+   that was invisible. The replacement is a .py whose docstring says
+   what it is, says not to upload it, and says why the previous shape
+   of it caused this bug. Its STUBBED tuple is the machine-readable
+   list of names this tree cannot vouch for.
+
+3. A TEST THAT WOULD HAVE CAUGHT IT — tests/test_gui_smoke.py
+
+   Scans every shipped file for a call to a stubbed name and fails
+   unless it is guarded. Names genuinely defined somewhere in real
+   source are subtracted first — run_graphw00f and show_api_fuzz_menu
+   are on the stub list but really do exist, in graphql_tools.py and
+   tabs_api.py, so flagging them would be noise. What remains is the
+   set that only resolves through the stub, and nothing may call one of
+   those unguarded.
+
+   THE STANDING RULE for this working copy: a name that resolves only
+   through the stub is not defined. Before shipping a file that calls a
+   method on the window, grep the tree for its "def". A green test
+   suite in a tree with a stub in it is not evidence the call works.
+
+All four suites pass: test_scanner 284, test_coffee_break 351,
+test_coffee_chain 13, test_gui_smoke 252 — 900 assertions.
+
+
 ## 2026-10-16 — THE HEADER WAS COLLECTED AND THEN THROWN AWAY (6.8.5)
 
 Reported from a live engagement against an authenticated API: an
