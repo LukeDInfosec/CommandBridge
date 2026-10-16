@@ -19,6 +19,51 @@ HOW TO USE THIS FILE
  CHANGELOG (most recent first)
 ================================================================================
 
+## 2026-10-16 — THE THIRD ONE, FOUND BY THE SCRIPT (6.8.8)
+
+verify_startup.py run on the user's actual checkout — the first time
+anything in this sequence checked the real tree rather than this
+working copy — reported two faults:
+
+    command_bridge/ui/cards.py:204
+        self.register_default_command(...)
+    command_bridge/modules/tool_setup.py:74
+        self.reset_all_commands_to_defaults(...)
+
+The first was known. The second was not, and nobody had hit it yet: it
+is wired to a button on the Environment / Tool Setup card, so it would
+have raised AttributeError the first time anyone clicked it, long after
+this sequence of releases was assumed finished.
+
+reset_all_commands_to_defaults() completes the set. It restores every
+button whose shipped default is known, saves, and says what it did.
+Two details worth keeping:
+
+  * ``*_args``, because Qt passes a ``checked`` bool to a clicked
+    handler. A signature that refuses it fails at click time rather
+    than at import — the same shape of fault as the three before it.
+
+  * A registry entry with no matching default is LEFT ALONE. It came
+    from a saved file for a button this version no longer shows, and
+    deleting it is not a reset, it is data loss.
+
+The script also cleared open_rate_limit_dialog, which appears in the
+September logs: it is defined in the real api_testing.py and only ever
+looked missing from here.
+
+DELIVERY, which is the other half of this failure: 6.8.7 was uploaded
+through the GitHub web uploader and only its TOP-LEVEL files arrived —
+verify_startup.py and PROJECT_REFERENCE.txt landed, everything under
+command_bridge/ did not, and constants.py still read 6.8.6. Three
+rounds of "the fix did not work" were two code faults and one upload
+that silently dropped the nested files. Push from a clone instead.
+
+All four suites pass: test_scanner 284, test_coffee_break 351,
+test_coffee_chain 13, test_gui_smoke 269 — 917 assertions — and
+verify_startup.py reports OK here. The only run of it that counts is
+the one on the machine that runs the app.
+
+
 ## 2026-10-16 — THE MISSING HALF OF THE COMMAND REGISTRY (6.8.7)
 
 The Web, API and Recon tabs would not build:

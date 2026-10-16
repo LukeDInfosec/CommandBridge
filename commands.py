@@ -662,6 +662,64 @@ class CommandsMixin:
         except Exception:                                   # noqa: BLE001
             pass
 
+    def reset_all_commands_to_defaults(self, *_args):
+        """Throw away every saved override and go back to what shipped.
+
+        The third member of the set, called from the Environment / Tool
+        Setup card. Found by verify_startup.py rather than by a user
+        hitting it, which is the whole point of that script.
+
+        ``*_args`` because this is wired to a button: Qt passes a
+        ``checked`` bool to a clicked handler, and a signature that
+        refuses it would fail at click time rather than at import —
+        exactly the kind of fault that gets shipped.
+
+        Only buttons whose shipped default is known are reset. An entry
+        in the registry with no corresponding default came from a saved
+        file for a button that no longer exists, and silently deleting
+        somebody's command for a button this version cannot show is not
+        a reset, it is data loss.
+        """
+        defaults = getattr(self, "default_commands", None) or {}
+        if not hasattr(self, "command_registry"):
+            self.command_registry = {}
+
+        reset = [button_id for button_id, shipped in defaults.items()
+                 if self.command_registry.get(button_id) != shipped]
+        for button_id in reset:
+            self.command_registry[button_id] = defaults[button_id]
+
+        try:
+            self.save_custom_commands()
+        except Exception as exc:                            # noqa: BLE001
+            try:
+                self.console.append_ansi(
+                    f"[!] commands were reset in this session but could not "
+                    f"be saved: {exc}\n")
+            except Exception:                               # noqa: BLE001
+                pass
+
+        try:
+            labels = getattr(self, "button_labels", {}) or {}
+            if not reset:
+                self.console.append_ansi(
+                    "[i] Every command is already the shipped version — "
+                    "nothing to reset.\n")
+            else:
+                self.console.append_ansi(
+                    f"[+] {len(reset)} command"
+                    f"{'' if len(reset) == 1 else 's'} reset to the shipped "
+                    f"version:\n")
+                for button_id in sorted(reset):
+                    self.console.append_ansi(
+                        f"      {labels.get(button_id, button_id)}\n")
+                self.console.append_ansi(
+                    "    Tooltips still show the old text until the tab is "
+                    "rebuilt; restart to refresh them.\n")
+        except Exception:                                   # noqa: BLE001
+            pass
+        return len(reset)
+
     def save_custom_commands(self):
         """Save custom commands to config file"""
         try:

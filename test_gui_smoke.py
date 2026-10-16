@@ -1049,6 +1049,33 @@ def main():
     check("reporting before any button is registered says nothing",
           empty.printed, [])
 
+
+    rst = _Reg()
+    rst.saved_calls = 0
+    rst.save_custom_commands = lambda: None
+    rst.register_default_command("a", "shipped-a")
+    rst.register_default_command("b", "shipped-b")
+    rst.command_registry["a"] = "my-edit"
+    rst.command_registry["orphan"] = "from an older version"
+    n = rst.reset_all_commands_to_defaults(False)
+    check("a Qt clicked(bool) argument does not break it", n, 1)
+    check("the edited command goes back to the shipped one",
+          rst.command_registry["a"], "shipped-a")
+    check("an untouched command is left alone",
+          rst.command_registry["b"], "shipped-b")
+    check("a saved command for a button this version lacks is NOT deleted",
+          rst.command_registry["orphan"], "from an older version")
+    check("and the reset is reported",
+          any("reset to the shipped version" in p for p in rst.printed))
+
+    clean = _Reg()
+    clean.save_custom_commands = lambda: None
+    clean.register_default_command("a", "x")
+    check("resetting when nothing is overridden reports that", 
+          clean.reset_all_commands_to_defaults(), 0)
+    check("and says so rather than claiming a reset",
+          any("nothing to reset" in p for p in clean.printed))
+
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 
