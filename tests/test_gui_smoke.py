@@ -946,9 +946,15 @@ def main():
     unverifiable = [n for n in STUBBED
                     if not _re.search(r"^\s*def %s\b" % _re.escape(n),
                                       everything, _re.MULTILINE)]
-    check("the stub list is narrowed to names defined nowhere else",
-          "report_command_overrides" in unverifiable
-          and "run_graphw00f" not in unverifiable)
+    # report_command_overrides WAS the example here. It is now a real
+    # method in core/commands.py, so it correctly drops out of this
+    # list — which is the mechanism working, not the test rotting.
+    # run_graphw00f is the stable example: on the stub list, and really
+    # defined in graphql_tools.py.
+    check("a stubbed name that really exists elsewhere is not flagged",
+          "run_graphw00f" not in unverifiable)
+    check("and the list still has something in it to check against",
+          len(unverifiable) > 0)
 
     offenders = []
     for path, source in sources.items():
@@ -981,6 +987,94 @@ def main():
           or 'getattr(self, "report_command_overrides"' in win)
     check("constructing the window does not require it",
           "QTimer.singleShot(0, self.report_command_overrides)" in win, False)
+
+
+    # ── Shipped defaults vs saved overrides ─────────────────────────────
+    #
+    # cards.py's create_editable_button delegates BOTH jobs to
+    # register_default_command: recording the shipped default, and
+    # seeding the registry. A version that only recorded would leave
+    # every button with no command at all.
+    print("\n\033[1mCommand defaults and overrides\033[0m")
+    from command_bridge.core.commands import CommandsMixin
+
+    class _Reg(CommandsMixin):
+        def __init__(self):
+            self.command_registry = {}
+            self.button_labels = {}
+            self.printed = []
+            self.console = self
+
+        def append_ansi(self, text):
+            self.printed.append(text)
+
+    reg = _Reg()
+    reg.register_default_command("web_js", "wget -A.js {TARGET}")
+    check("the shipped default is recorded",
+          reg.default_commands["web_js"], "wget -A.js {TARGET}")
+    check("and the registry is seeded, so the button has a command",
+          reg.command_registry["web_js"], "wget -A.js {TARGET}")
+
+    # The ordering that matters: load_custom_commands() runs before the
+    # tabs are built, so the registry may already hold an override.
+    saved = _Reg()
+    saved.command_registry["web_js"] = "wget --my-edit {TARGET}"
+    saved.register_default_command("web_js", "wget -A.js {TARGET}")
+    check("a saved override is NOT overwritten by the shipped default",
+          saved.command_registry["web_js"], "wget --my-edit {TARGET}")
+    check("but the shipped version is still remembered for comparison",
+          saved.default_commands["web_js"], "wget -A.js {TARGET}")
+
+    saved.button_labels["web_js"] = "Retrieve & Analyse JS Files"
+    saved.report_command_overrides()
+    blob = "".join(saved.printed)
+    check("the stale override is reported by its button caption",
+          "Retrieve & Analyse JS Files" in blob)
+    check("and the report says the saved copy wins",
+          "instead of it" in blob)
+
+    quiet = _Reg()
+    quiet.register_default_command("a", "x")
+    quiet.report_command_overrides()
+    check("a button left at its default is not reported",
+          quiet.printed, [])
+
+    bare = _Reg()
+    del bare.command_registry
+    bare.register_default_command("a", "x")
+    check("a registry that does not exist yet is created",
+          bare.command_registry, {"a": "x"})
+    empty = _Reg()
+    empty.report_command_overrides()
+    check("reporting before any button is registered says nothing",
+          empty.printed, [])
+
+
+    rst = _Reg()
+    rst.saved_calls = 0
+    rst.save_custom_commands = lambda: None
+    rst.register_default_command("a", "shipped-a")
+    rst.register_default_command("b", "shipped-b")
+    rst.command_registry["a"] = "my-edit"
+    rst.command_registry["orphan"] = "from an older version"
+    n = rst.reset_all_commands_to_defaults(False)
+    check("a Qt clicked(bool) argument does not break it", n, 1)
+    check("the edited command goes back to the shipped one",
+          rst.command_registry["a"], "shipped-a")
+    check("an untouched command is left alone",
+          rst.command_registry["b"], "shipped-b")
+    check("a saved command for a button this version lacks is NOT deleted",
+          rst.command_registry["orphan"], "from an older version")
+    check("and the reset is reported",
+          any("reset to the shipped version" in p for p in rst.printed))
+
+    clean = _Reg()
+    clean.save_custom_commands = lambda: None
+    clean.register_default_command("a", "x")
+    check("resetting when nothing is overridden reports that", 
+          clean.reset_all_commands_to_defaults(), 0)
+    check("and says so rather than claiming a reset",
+          any("nothing to reset" in p for p in clean.printed))
 
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0

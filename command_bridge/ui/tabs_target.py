@@ -181,6 +181,69 @@ class TargetTabMixin:
         tools_group.layout().addLayout(tools_layout)
         layout.addWidget(tools_group)
 
+        # UAT — a known-vulnerable target to test changes against.
+        uat_group = self.create_card("UAT \u2014 test against a known target")
+        uat_layout = QVBoxLayout()
+        uat_desc = QLabel(
+            "Start OWASP Juice Shop on a free loopback port and point the "
+            "scanner at it. Juice Shop's vulnerabilities are catalogued and "
+            "written up by other people, so it is the one target where "
+            "'did my change break a check?' has an answer that does not "
+            "come from me."
+        )
+        uat_desc.setObjectName("autoDesc")
+        uat_desc.setWordWrap(True)
+        uat_layout.addWidget(uat_desc)
+
+        uat_row = QHBoxLayout()
+        self.uat_start_btn = QPushButton("\U0001F9EA Start Juice Shop (UAT)")
+        self.uat_start_btn.setObjectName("primaryButton")
+        self.uat_start_btn.setMinimumHeight(38)
+        self.uat_start_btn.setCursor(
+            QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        self.uat_start_btn.setToolTip(
+            "Pulls the bkimminich/juice-shop image from Docker Hub and runs "
+            "it on 127.0.0.1 on a port nothing else is using, then opens it "
+            "and sets it as the target.\n\n"
+            "This downloads and runs third-party code, which is why it is a "
+            "button and not something that happens on its own. It binds to "
+            "loopback only and there is no option to change that: a "
+            "deliberately vulnerable application on a routable address is "
+            "an incident, not a test target.\n\n"
+            "First run takes a few minutes for the image.")
+        self.uat_start_btn.clicked.connect(self.run_start_uat)
+        uat_row.addWidget(self.uat_start_btn)
+
+        self.uat_stop_btn = QPushButton("\u23F9 Stop and remove")
+        self.uat_stop_btn.setObjectName("secondaryButton")
+        self.uat_stop_btn.setMinimumHeight(38)
+        self.uat_stop_btn.setEnabled(False)
+        self.uat_stop_btn.setCursor(
+            QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        self.uat_stop_btn.clicked.connect(self.run_stop_uat)
+        uat_row.addWidget(self.uat_stop_btn)
+
+        self.uat_coverage_btn = QPushButton("\U0001F4CB What it should find")
+        self.uat_coverage_btn.setObjectName("secondaryButton")
+        self.uat_coverage_btn.setMinimumHeight(38)
+        self.uat_coverage_btn.setCursor(
+            QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        self.uat_coverage_btn.setToolTip(
+            "Prints Juice Shop's 16 vulnerability categories and, against "
+            "each, whether this scanner can prove it, partly covers it, or "
+            "does not test for it at all. Read the scan against that rather "
+            "than against hope.")
+        self.uat_coverage_btn.clicked.connect(self.show_uat_coverage)
+        uat_row.addWidget(self.uat_coverage_btn)
+        uat_layout.addLayout(uat_row)
+
+        self.uat_status = QLabel("")
+        self.uat_status.setObjectName("autoDesc")
+        self.uat_status.setWordWrap(True)
+        uat_layout.addWidget(self.uat_status)
+        uat_group.layout().addLayout(uat_layout)
+        layout.addWidget(uat_group)
+
         # Software Updates — pulls the latest code from the git remote this
         # copy was cloned from and restarts in place, so a fix never has to
         # travel by zip file again. Everything the user has customised lives
@@ -332,3 +395,97 @@ class TargetTabMixin:
             self.console.append_ansi(
                 "    Every reference link resolved.\n")
         self._refresh_version_age()
+
+    # ── UAT mode ─────────────────────────────────────────────────────────
+    def show_uat_coverage(self):
+        from command_bridge.modules import uat
+        self.goto_tab("console")
+        self.console.append_ansi("\n" + uat.coverage_report() + "\n")
+
+    def run_start_uat(self):
+        """Start Juice Shop on a free loopback port, on a worker thread."""
+        from PyQt6.QtCore import QThread, QObject, pyqtSignal
+        from command_bridge.modules import uat
+
+        if getattr(self, "_uat_thread", None) is not None:
+            self.console.append_ansi("[i] UAT is already starting.\n")
+            return
+
+        engine, note = uat.runtime()
+        if engine is None:
+            self.goto_tab("console")
+            self.console.append_ansi(f"[!] Cannot start UAT: {note}\n")
+            self.uat_status.setText(note)
+            return
+
+        self.goto_tab("console")
+        self.console.append_ansi("\n" + uat.coverage_report() + "\n\n")
+        self.uat_start_btn.setEnabled(False)
+        self.uat_status.setText("Starting \u2014 the first run pulls a "
+                                "400 MB image.")
+
+        class _Worker(QObject):
+            line = pyqtSignal(str)
+            done = pyqtSignal(object, str)
+
+            def run(self):
+                url, why = uat.start(report=lambda t: self.line.emit(t))
+                self.done.emit(url, why)
+
+        self._uat_thread = QThread()
+        self._uat_worker = _Worker()
+        self._uat_worker.moveToThread(self._uat_thread)
+        self._uat_thread.started.connect(self._uat_worker.run)
+        self._uat_worker.line.connect(
+            lambda t: self.console.append_ansi(t + "\n"))
+        self._uat_worker.done.connect(self._on_uat_started)
+        self._uat_thread.start()
+
+    def _on_uat_started(self, url, why):
+        import webbrowser
+        try:
+            self._uat_thread.quit()
+            self._uat_thread.wait(3000)
+        except Exception:                               # noqa: BLE001
+            pass
+        self._uat_thread = None
+        self._uat_worker = None
+        self.uat_start_btn.setEnabled(True)
+
+        if not url:
+            self.console.append_ansi(f"[!] UAT did not start: {why}\n")
+            self.uat_status.setText(why)
+            return
+        self.uat_stop_btn.setEnabled(True)
+        self.uat_status.setText(
+            f"Running at {url} \u2014 set as the target. Stop it when you "
+            f"are done; it is deliberately vulnerable.")
+        # setText fires textChanged, which is wired to on_target_changed
+        # and save_target_preference — so the target, the header chip and
+        # the saved preference all follow from this one line.
+        #
+        # This used to call a self.set_target() that does not exist. It
+        # did not crash only because the AttributeError landed in the
+        # except below and the fallback set self.target directly, which
+        # left the header chip showing the previous target. A bare
+        # except that makes a missing method look like a working one is
+        # how the next person loses an afternoon.
+        self.target_input.setText(url)
+        self.console.append_ansi(
+            f"[+] {why}\n    Target set to {url}. Opening it in a "
+            f"browser.\n")
+        try:
+            webbrowser.open(url)
+        except Exception:                               # noqa: BLE001
+            self.console.append_ansi("    (could not open a browser — "
+                                     "open the URL yourself)\n")
+
+    def run_stop_uat(self):
+        from command_bridge.modules import uat
+        self.goto_tab("console")
+        if uat.stop(report=lambda t: self.console.append_ansi(t + "\n")):
+            self.uat_status.setText("Stopped and removed.")
+            self.uat_stop_btn.setEnabled(False)
+        else:
+            self.uat_status.setText("Could not stop it \u2014 see the "
+                                    "console.")

@@ -593,6 +593,133 @@ class CommandsMixin:
         except Exception:
             return cmd
 
+    # ── shipped defaults vs saved overrides ──────────────────────────────
+    #
+    # load_custom_commands() fills command_registry from
+    # ~/.config/CommandBridge/custom_commands.txt BEFORE the tabs are
+    # built, so by the time a button is created the registry may already
+    # hold an edited version of its command. That is the point — an
+    # override is meant to survive a restart.
+    #
+    # The cost is that a command fixed in a release stays broken for
+    # anyone who once edited that button, because their saved copy wins
+    # and nothing says so. These two methods are the pair that makes
+    # that visible: one records what the application shipped, the other
+    # reports where the saved copy differs from it.
+
+    def register_default_command(self, button_id, default_cmd):
+        """Record a button's shipped command, and seed the registry.
+
+        Called by create_editable_button for every button in the UI.
+        Both halves matter:
+
+          * The default is kept in ``self.default_commands`` so a saved
+            override can later be compared against it. Without this the
+            application has no idea what it originally shipped.
+
+          * ``command_registry`` is seeded ONLY if the button has no
+            entry yet. A saved override loaded at startup must not be
+            overwritten by the shipped default — doing so would silently
+            discard every command the operator has customised.
+        """
+        if not hasattr(self, "default_commands"):
+            self.default_commands = {}
+        self.default_commands[button_id] = default_cmd
+        if not hasattr(self, "command_registry"):
+            self.command_registry = {}
+        if button_id not in self.command_registry:
+            self.command_registry[button_id] = default_cmd
+
+    def report_command_overrides(self):
+        """Name the saved commands that are not the shipped versions.
+
+        Run once, just after the window is built. A stale override is
+        how a command that has been fixed upstream keeps looking broken:
+        the fix ships, the saved copy wins, and the operator sees the
+        old failure with no indication why. Right-click the button and
+        reset it, or edit it again.
+        """
+        defaults = getattr(self, "default_commands", None) or {}
+        registry = getattr(self, "command_registry", None) or {}
+        changed = sorted(
+            button_id for button_id, shipped in defaults.items()
+            if registry.get(button_id, shipped) != shipped)
+        if not changed:
+            return
+        try:
+            labels = getattr(self, "button_labels", {}) or {}
+            self.console.append_ansi(
+                f"[i] {len(changed)} saved command"
+                f"{'' if len(changed) == 1 else 's'} differ from the shipped "
+                f"version and will be used instead of it:\n")
+            for button_id in changed:
+                self.console.append_ansi(
+                    f"      {labels.get(button_id, button_id)}\n")
+            self.console.append_ansi(
+                "    Right-click a button and reset it to take the shipped "
+                "command, if one of these is an edit you have finished "
+                "with.\n")
+        except Exception:                                   # noqa: BLE001
+            pass
+
+    def reset_all_commands_to_defaults(self, *_args):
+        """Throw away every saved override and go back to what shipped.
+
+        The third member of the set, called from the Environment / Tool
+        Setup card. Found by verify_startup.py rather than by a user
+        hitting it, which is the whole point of that script.
+
+        ``*_args`` because this is wired to a button: Qt passes a
+        ``checked`` bool to a clicked handler, and a signature that
+        refuses it would fail at click time rather than at import —
+        exactly the kind of fault that gets shipped.
+
+        Only buttons whose shipped default is known are reset. An entry
+        in the registry with no corresponding default came from a saved
+        file for a button that no longer exists, and silently deleting
+        somebody's command for a button this version cannot show is not
+        a reset, it is data loss.
+        """
+        defaults = getattr(self, "default_commands", None) or {}
+        if not hasattr(self, "command_registry"):
+            self.command_registry = {}
+
+        reset = [button_id for button_id, shipped in defaults.items()
+                 if self.command_registry.get(button_id) != shipped]
+        for button_id in reset:
+            self.command_registry[button_id] = defaults[button_id]
+
+        try:
+            self.save_custom_commands()
+        except Exception as exc:                            # noqa: BLE001
+            try:
+                self.console.append_ansi(
+                    f"[!] commands were reset in this session but could not "
+                    f"be saved: {exc}\n")
+            except Exception:                               # noqa: BLE001
+                pass
+
+        try:
+            labels = getattr(self, "button_labels", {}) or {}
+            if not reset:
+                self.console.append_ansi(
+                    "[i] Every command is already the shipped version — "
+                    "nothing to reset.\n")
+            else:
+                self.console.append_ansi(
+                    f"[+] {len(reset)} command"
+                    f"{'' if len(reset) == 1 else 's'} reset to the shipped "
+                    f"version:\n")
+                for button_id in sorted(reset):
+                    self.console.append_ansi(
+                        f"      {labels.get(button_id, button_id)}\n")
+                self.console.append_ansi(
+                    "    Tooltips still show the old text until the tab is "
+                    "rebuilt; restart to refresh them.\n")
+        except Exception:                                   # noqa: BLE001
+            pass
+        return len(reset)
+
     def save_custom_commands(self):
         """Save custom commands to config file"""
         try:
