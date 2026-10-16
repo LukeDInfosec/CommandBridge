@@ -1610,6 +1610,57 @@ back-end DBMS: MySQL >= 5.6
     check("an already-written report is cleaned in place",
           "\x1b" in noisy_path.read_text(), False)
 
+
+    # ── A token pasted without its header name ──────────────────────────
+    #
+    # Reported mid-engagement against a GraphQL API: the token was in
+    # the Custom Headers box, graphw00f ran without -H, and graphql-cop
+    # said the endpoint "does not seem to be running GraphQL" — which
+    # is what an unauthenticated probe of an authenticated API looks
+    # like. A JWT contains no colon, so "Bearer eyJ..." on its own was
+    # dropped by the parser and nothing said so.
+    print("\n\033[1mA token pasted without its header name\033[0m")
+    JWT = "eyJhbGciOiJSUzI1NiIsImtpZCI6IjkwNGIw.eyJyb2xlcyI6W119.sig"
+
+    got, notes = hi.parse_detailed(f"Bearer {JWT}")
+    check("a bare 'Bearer <jwt>' becomes an Authorization header",
+          got, [("Authorization", f"Bearer {JWT}")])
+    check("and the guess is stated rather than made silently",
+          any("Authorization" in n for n in notes))
+
+    got, notes = hi.parse_detailed(JWT)
+    check("a naked JWT is recognised too",
+          got, [("Authorization", f"Bearer {JWT}")])
+    check("and it too is reported", len(notes), 1)
+
+    check("a proper header produces no note at all",
+          hi.parse_detailed(f"Authorization: Bearer {JWT}")[1], [])
+
+    got, notes = hi.parse_detailed("this is not a header")
+    check("an unusable line is reported, not silently skipped",
+          (got, len(notes)), ([], 1))
+    check("and the report says what the format should be",
+          "Authorization: Bearer" in notes[0])
+
+    check("a name with no value is reported",
+          "no value after the colon"
+          in hi.parse_detailed("Authorization:")[1][0])
+    check("a line that is prose with a colon in it is not a header",
+          hi.parse_detailed("my token is: abc")[0], [])
+
+    check("the token value is never echoed whole in a note",
+          all(JWT not in n for n in hi.parse_detailed(f"Bearer {JWT}")[1]))
+
+    # The two commands from the report, now carrying the credential.
+    w00f = hi.apply("graphw00f -d -f -t 'https://x' -o o.csv",
+                    hi.parse(f"Bearer {JWT}"))[0]
+    check("graphw00f now gets the token", f"-H 'Authorization: Bearer {JWT}'"
+          in w00f)
+    cop = hi.apply("graphql-cop -t 'https://x/graphql' -o json",
+                   hi.parse(f"Bearer {JWT}"))[0]
+    check("and graphql-cop gets it as the JSON object it expects",
+          f'-H \'{{"Authorization": "Bearer {JWT}"}}\'' in cop)
+
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

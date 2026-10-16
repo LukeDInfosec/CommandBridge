@@ -320,7 +320,28 @@ class CommandsMixin:
         copied into tickets.
         """
         from command_bridge.modules import header_injection
-        headers = self.get_custom_headers()
+        try:
+            text = self.headers_input.toPlainText()
+        except Exception:                                   # noqa: BLE001
+            return cmd
+        headers, problems = header_injection.parse_detailed(text)
+
+        # Say something whenever the box has content. Returning quietly
+        # here was the bug: a bearer token pasted without its header
+        # name produced no headers, no message, and a scan that looked
+        # clean because every request was a 401.
+        try:
+            for note in problems:
+                self.console.append_ansi(f"[!] Custom headers: {note}\n")
+            if (text or "").strip() and not headers:
+                self.console.append_ansi(
+                    "[!] Custom headers are set but none could be used — "
+                    "this command is going out UNAUTHENTICATED. Each line "
+                    "must read 'Name: Value', e.g. "
+                    "'Authorization: Bearer eyJ...'\n")
+        except Exception:                                   # noqa: BLE001
+            pass
+
         if not headers:
             return cmd
         new_cmd, applied, skipped = header_injection.apply(cmd, headers)

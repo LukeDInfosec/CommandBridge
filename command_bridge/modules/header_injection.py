@@ -64,28 +64,89 @@ SECRET = {"authorization", "cookie", "proxy-authorization", "x-api-key",
           "x-auth-token", "api-key", "x-csrf-token", "x-amz-security-token"}
 
 
-def parse(text):
-    """``"Authorization: Bearer ey..."`` lines -> ``[(name, value), ...]``.
+#: A JWT: three base64url segments separated by dots. Deliberately
+#: strict about the leading "eyJ" — that is '{"' base64url-encoded, so
+#: every JWT begins with it and almost nothing else does.
+_JWT = re.compile(r"^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$")
 
-    Tolerant of what people actually paste: a trailing colon with no
-    value is dropped, leading/trailing whitespace goes, blank lines and
-    ``#`` comments are skipped, and a value containing a colon (every
-    bearer token, every URL) is kept whole because only the FIRST colon
-    separates the name.
+
+def parse_detailed(text):
+    """``(headers, problems)`` from the Custom Headers box.
+
+    ``problems`` is the half that was missing. A line that could not be
+    used was previously skipped in silence, and the most likely line to
+    be skipped is the most important one: a JWT contains no colon, so
+
+        Bearer eyJhbGciOiJSUzI1NiIsImtpZCI6...
+
+    pasted on its own was dropped, every tool then ran unauthenticated,
+    and the scan reported — accurately — that it found nothing. Exactly
+    the failure 6.8.5 was meant to end, reached by a different route.
+
+    So a bare token is now accepted and named, rather than discarded:
+    "Bearer <jwt>" or a naked JWT becomes an Authorization header, and
+    the console says that is what happened. Guessing silently would be
+    as bad as dropping silently; the point is that the operator can see
+    which of the two the application did.
     """
-    out = []
-    for line in (text or "").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or ":" not in line:
+    out, problems = [], []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
             continue
+
+        if ":" not in line:
+            # No colon. Before calling it malformed, check whether it is
+            # the one thing people paste without a header name.
+            token = line
+            if token.lower().startswith("bearer "):
+                out.append(("Authorization", token))
+                problems.append(
+                    f"read {token[:13]}... as 'Authorization: {token[:13]}...'"
+                    f" — write the header name yourself to be explicit")
+                continue
+            if _JWT.match(token):
+                out.append(("Authorization", f"Bearer {token}"))
+                problems.append(
+                    "a bare JWT was read as 'Authorization: Bearer <token>'")
+                continue
+            problems.append(
+                f"ignored {_short(line)} — a header needs a name and a "
+                f"colon, as in 'Authorization: Bearer ...'")
+            continue
+
         name, _, value = line.partition(":")
         name, value = name.strip(), value.strip()
-        if not name or not value:
+        if not name:
+            problems.append(f"ignored {_short(line)} — no header name "
+                            f"before the colon")
+            continue
+        if not value:
+            problems.append(f"ignored '{name}:' — no value after the colon")
+            continue
+        if " " in name:
+            problems.append(
+                f"ignored {_short(line)} — '{name}' is not a header name; "
+                f"a space before the colon usually means the name is "
+                f"missing")
             continue
         if name.lower() in NEVER_FORWARD:
+            problems.append(
+                f"ignored '{name}' — it describes this connection and "
+                f"setting it by hand produces malformed requests")
             continue
         out.append((name, value))
-    return out
+    return out, problems
+
+
+def _short(line):
+    """A line, quoted and truncated — never a whole credential."""
+    return f"'{line[:24]}...'" if len(line) > 24 else f"'{line}'"
+
+
+def parse(text):
+    """``[(name, value), ...]`` — see parse_detailed for the problems."""
+    return parse_detailed(text)[0]
 
 
 def describe(headers):

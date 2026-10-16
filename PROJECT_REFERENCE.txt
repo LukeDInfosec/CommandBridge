@@ -19,6 +19,62 @@ HOW TO USE THIS FILE
  CHANGELOG (most recent first)
 ================================================================================
 
+## 2026-10-16 — THE TOKEN WITH NO COLON IN IT (6.8.9)
+
+Reported mid-engagement, on a GraphQL API pentest. A bearer token was
+set in the Target tab's Custom Headers box, and:
+
+    [*] Executing: graphw00f -d -f -t 'https://api.<redacted>' -o ...
+
+no -H. And GraphQL Cop:
+
+    https://api.<redacted>/graphql does not seem to be running GraphQL.
+
+which is what an unauthenticated probe of an authenticated API looks
+like. The endpoint was GraphQL; the same command run by hand with the
+token worked.
+
+1. A JWT HAS NO COLON IN IT — modules/header_injection.py
+
+   parse() required a colon to split name from value, and skipped any
+   line without one. A JWT is base64url: letters, digits, dash,
+   underscore and dots. So
+
+       Bearer eyJhbGciOiJSUzI1NiIsImtpZCI6...
+
+   pasted on its own — which is how a token arrives from Burp, from a
+   browser's devtools, from a colleague — produced ZERO headers.
+
+   This is 6.8.5's bug reached by another route, and worse than it,
+   because 6.8.5 was specifically the release that was supposed to end
+   silent header loss. _apply_custom_headers() returned early on an
+   empty header list without printing anything, so a box with a token
+   in it and a box with nothing in it behaved identically.
+
+   parse_detailed() now returns (headers, problems). A bare
+   "Bearer <jwt>" or a naked JWT is accepted AS an Authorization
+   header and the console says that is what was done — guessing in
+   silence would be no better than dropping in silence; what matters
+   is that the operator can see which happened. Every unusable line is
+   named with the format it should have had, truncated so a credential
+   is never echoed whole.
+
+   And whenever the box has content but yields no headers, the console
+   now says, in terms: this command is going out UNAUTHENTICATED.
+
+2. GRAPHQL COP IS FORCED — ui/tabs_api.py
+
+   -f added. Cop's auto-detection reads the response to an
+   unauthenticated probe, so against an API that requires auth a 401
+   is indistinguishable from "not GraphQL" and it refuses to run. With
+   a token in Custom Headers detection usually succeeds on its own;
+   -f means the verdict no longer gates the audit either way.
+
+All four suites pass: test_scanner 284, test_coffee_break 363,
+test_coffee_chain 13, test_gui_smoke 269 — 929 assertions — and
+verify_startup.py reports OK.
+
+
 ## 2026-10-16 — THE THIRD ONE, FOUND BY THE SCRIPT (6.8.8)
 
 verify_startup.py run on the user's actual checkout — the first time

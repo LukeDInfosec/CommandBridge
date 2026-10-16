@@ -97,7 +97,16 @@ class ApiTabMixin:
         graphql_cop_btn = self.create_editable_button(
             "GraphQL Cop",
             "api_graphql_cop",
-            "graphql-cop -t '{TARGET}/graphql' -o json > {SAFE_TARGET}_graphql_cop.json 2>&1; "
+            # -f forces the audit when auto-detection says the endpoint
+            # is not GraphQL. That verdict is unreliable on an API that
+            # requires auth: detection reads the response to an
+            # unauthenticated probe, so a 401 looks identical to "not
+            # GraphQL". Reported from a live GraphQL engagement, where
+            # the endpoint demonstrably was GraphQL and Cop refused to
+            # test it. With a token set in Custom Headers the detection
+            # usually succeeds anyway; -f means it does not matter
+            # either way.
+            "graphql-cop -f -t '{TARGET}/graphql' -o json > {SAFE_TARGET}_graphql_cop.json 2>&1; "
             "echo; echo '=== GraphQL Cop results ==='; cat {SAFE_TARGET}_graphql_cop.json",
         )
         graphql_cop_btn.setToolTip(
@@ -133,30 +142,23 @@ class ApiTabMixin:
         rest_layout = QGridLayout()
         rest_layout.setSpacing(12)
 
-        # API Fuzzing. The old command ran ffuf once against one small path
-        # list — a thin pass on REST, and worthless against SOAP, where the
-        # service is a single URL and the attack surface is its operation
-        # list. api_fuzz.py fingerprints the API first, chains several
-        # wordlists for REST (deduplicated, soft-404 calibrated) and then
-        # fuzzes HTTP verbs against what it finds, or parses the WSDL and
-        # enumerates operations and SOAPActions for SOAP.
+        # API Fuzzing — the old default wordlist ("api-wordlist.txt") did not
+        # exist anywhere on disk. Point at the real seclists API endpoint
+        # list, and add a right-click shortcut to swap just the wordlist
+        # without hand-editing the whole command.
         api_fuzz_btn = self.create_editable_button(
             "API Fuzzing",
             "api_ffuf",
-            "python3 {CB_DIR}/command_bridge/modules/api_fuzz.py '{TARGET}' "
-            "--out {SAFE_TARGET}_api_fuzz.json 2>&1 | tee {SAFE_TARGET}_api_fuzz.txt",
-        )
-        api_fuzz_btn.setToolTip(
-            "Fuzzes the API according to what it actually is.\n\n"
-            "REST: chains several endpoint wordlists (deduplicated), calibrates\n"
-            "against soft-404s, then fuzzes HTTP verbs on every endpoint found —\n"
-            "a path that refuses GET but accepts PUT is broken access control that\n"
-            "a GET-only sweep never sees.\n\n"
-            "SOAP: finds the WSDL (?wsdl, ?singleWsdl, /service.svc?wsdl, ...) and\n"
-            "enumerates its operations and SOAPAction values. Path fuzzing finds\n"
-            "nothing against SOAP, which is why the old sweep finished in seconds.\n\n"
-            "Right-click to pick wordlists, force REST or SOAP mode, or edit the\n"
-            "command. Findings saved as JSON."
+            # ffuf's raw "-of json" dump (duration, resultfile, scraper,
+            # position, ...) goes to a "_raw.json" file; ffuf_clean.py turns
+            # that into the plain "[STATUS] URL" list actually saved as
+            # {SAFE_TARGET}_api_fuzz.txt (and printed to the console) — see
+            # the identical fix applied to the Web tab's FFUF button.
+            "ffuf -u '{TARGET}/api/FUZZ' "
+            "-w /usr/share/seclists/Discovery/Web-Content/api/api-endpoints.txt "
+            "-ac -s -mc 200,201,204,301,302,307,401,403 -of json -o {SAFE_TARGET}_api_fuzz_raw.json; "
+            "python3 {CB_DIR}/command_bridge/modules/ffuf_clean.py "
+            "{SAFE_TARGET}_api_fuzz_raw.json {SAFE_TARGET}_api_fuzz.txt",
         )
         api_fuzz_btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         api_fuzz_btn.customContextMenuRequested.connect(
@@ -169,54 +171,59 @@ class ApiTabMixin:
         )
         rest_layout.addWidget(arjun_btn, 0, 1)
 
-        # Rate Limiting. Firing bare GETs at {TARGET}/api meant that against
-        # anything needing a method, content type, auth or a body, every
-        # request was rejected identically and the verdict came from nothing.
-        # This now opens an editor for a request known to work — pasted from
-        # a proxy or copied as curl — and replays that.
-        ratelimit_btn = QPushButton("Rate Limiting")
-        ratelimit_btn.setObjectName("secondaryButton")
-        ratelimit_btn.setMinimumHeight(40)
-        ratelimit_btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
-        ratelimit_btn.setToolTip(
-            "Opens an editor to paste the request to replay — raw HTTP from Burp/ZAP,\n"
-            "or a curl command copied from browser DevTools. Both are parsed for\n"
-            "method, headers and body, so SOAP and authenticated JSON work.\n\n"
-            "One request is sent on its own first to confirm it is accepted; if it is\n"
-            "rejected the run stops and says so rather than reporting a verdict drawn\n"
-            "from a hundred identical errors.\n\n"
-            "Then a modest capped burst (adjustable) watches for 429/503 and\n"
-            "Retry-After. A detection probe, not a load test. Writes a console table\n"
-            "and a JSON report."
+        # Rate Limiting — replaced wfuzz command (which had no FUZZ keyword
+        # anywhere in the target, so wfuzz had nothing to iterate on and
+        # would just error) with a dedicated safe PoC tester that sends a
+        # modest, capped, concurrency-limited burst and reports a clear
+        # detected/not-detected verdict with a summary table — see
+        # modules/rate_limit_check.py.
+        ratelimit_btn = self.create_editable_button(
+            "Rate Limiting",
+            "api_ratelimit",
+            "python3 {CB_DIR}/command_bridge/modules/rate_limit_check.py '{TARGET}/api' "
+            "--requests 150 --concurrency 10 "
+            "--json-out {SAFE_TARGET}_ratelimit.json 2>&1 | tee {SAFE_TARGET}_ratelimit.txt",
         )
-        ratelimit_btn.clicked.connect(self.open_rate_limit_dialog)
+        ratelimit_btn.setToolTip(
+            "Safely tests whether the target rate-limits requests, without attempting a DoS.\n"
+            "Sends a modest, capped burst (default 150 requests, 10 concurrent — both\n"
+            "adjustable via right-click) and watches for HTTP 429 responses and Retry-After\n"
+            "headers. Prints a summary table (requests sent, time elapsed, req/sec, response\n"
+            "breakdown) and a clear DETECTED / NOT DETECTED verdict — copy-paste ready for a\n"
+            "pentest report. Also writes a JSON report alongside the console log."
+        )
         rest_layout.addWidget(ratelimit_btn, 1, 0)
 
-        # Swagger/OpenAPI discovery. The previous shell loop only accepted a
-        # JSON body, so a client saying "docs are at /swagger" — which serves
-        # Swagger UI, an HTML page that loads the spec from somewhere else —
-        # came back as "no documentation found". swagger_discover.py probes
-        # the real spec paths, recognises a documentation UI and reads the
-        # spec URL back out of it (including out of swagger-initializer.js),
-        # and accepts YAML as well as JSON.
+        # Swagger/OpenAPI — renamed for clarity, and now tries every common
+        # spec path (not just the literal Target URL) so it actually finds
+        # documentation that isn't hosted at exactly the target path.
         swagger_cmd = (
-            "python3 {CB_DIR}/command_bridge/modules/swagger_discover.py '{TARGET}' "
-            "--out {SAFE_TARGET}_swagger.json 2>&1 | tee {SAFE_TARGET}_swagger_discovery.txt"
+            "echo '[*] Probing for Swagger/OpenAPI documentation on {TARGET}'; "
+            "FOUND=0; "
+            "for p in \"\" \"/swagger.json\" \"/openapi.json\" \"/v2/api-docs\" \"/v3/api-docs\" "
+            "\"/api-docs\" \"/swagger/v1/swagger.json\" \"/swagger/index.html\"; do "
+            "URL=\"{TARGET}$p\"; "
+            "echo \"[*] Trying: $URL\"; "
+            "curl -sk -m 8 \"$URL\" -o {SAFE_TARGET}_swagger.json; "
+            "if python3 -m json.tool {SAFE_TARGET}_swagger.json >/dev/null 2>&1 "
+            "&& grep -qE '\"(swagger|openapi)\"' {SAFE_TARGET}_swagger.json; then "
+            "echo \"[+] Valid Swagger/OpenAPI spec found at: $URL\"; "
+            "echo '[+] Saved to {SAFE_TARGET}_swagger.json'; "
+            "python3 -m json.tool {SAFE_TARGET}_swagger.json | head -120; "
+            "FOUND=1; break; fi; "
+            "done; "
+            "if [ \"$FOUND\" -eq 0 ]; then "
+            "echo '[!] No Swagger/OpenAPI documentation found at the target path or common "
+            "spec locations. Try right-clicking to point the target at a known doc path.'; fi"
         )
         swagger_btn = self.create_editable_button(
             "Detect Swagger/OpenAPI Documentation", "api_swagger", swagger_cmd
         )
         swagger_btn.setToolTip(
-            "Finds the API specification, not just the URL you typed.\n\n"
-            "Tries the target itself, then ~20 common spec paths (/swagger.json,\n"
-            "/openapi.json|yaml, /v2|v3/api-docs, /swagger/v1/swagger.json, ...).\n"
-            "If it lands on a documentation UI instead — Swagger UI, Redoc, RapiDoc,\n"
-            "Stoplight, Scalar — it reads the spec URL back out of the page and\n"
-            "follows it, which is what makes a bare /swagger URL work.\n\n"
-            "Accepts YAML specs as well as JSON. Only counts a document as a spec if\n"
-            "it declares swagger/openapi, so an ordinary JSON response is not\n"
-            "reported as documentation.\n\n"
-            "Spec saved to <target>_swagger.json, full probe log alongside it."
+            "Checks the target URL itself, then automatically tries the common\n"
+            "Swagger/OpenAPI spec paths (/swagger.json, /openapi.json, /v2/api-docs,\n"
+            "/v3/api-docs, /api-docs, /swagger/v1/swagger.json, /swagger/index.html)\n"
+            "and stops at the first one that returns a valid swagger/openapi JSON spec."
         )
         rest_layout.addWidget(swagger_btn, 1, 1)
 
@@ -227,3 +234,48 @@ class ApiTabMixin:
 
         return scroll
 
+    def show_api_fuzz_menu(self, button, pos):
+        """Right-click menu for API Fuzzing: quick wordlist swap or full manual edit."""
+        from PyQt6.QtWidgets import QMenu, QFileDialog
+        import re as _re
+
+        menu = QMenu(self)
+        menu.setObjectName("contextMenu")
+        try:
+            self.apply_theme_to_menu(menu)
+        except Exception:
+            pass
+
+        wordlist_action = menu.addAction("📄 Manually Configure API Wordlist")
+        edit_action = menu.addAction("✏️ Manually Modify Underlying Command")
+
+        action = menu.exec(button.mapToGlobal(pos))
+        if action == wordlist_action:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Select API wordlist",
+                "/usr/share/seclists/Discovery/Web-Content/api",
+                "Text Files (*.txt);;All Files (*)",
+            )
+            if not path:
+                return
+            current_cmd = self.command_registry.get(
+                "api_ffuf",
+                "ffuf -u '{TARGET}/api/FUZZ' -w /usr/share/seclists/Discovery/"
+                "Web-Content/api/api-endpoints.txt -ac -s -of json -o {SAFE_TARGET}_api_fuzz_raw.json; "
+                "python3 {CB_DIR}/command_bridge/modules/ffuf_clean.py "
+                "{SAFE_TARGET}_api_fuzz_raw.json {SAFE_TARGET}_api_fuzz.txt",
+            )
+            new_cmd, n = _re.subn(r"-w\s+\S+", f"-w '{path}'", current_cmd, count=1)
+            if n == 0:
+                new_cmd = current_cmd.rstrip() + f" -w '{path}'"
+            self.command_registry["api_ffuf"] = new_cmd
+            self.save_custom_commands()
+            try:
+                tt = self._build_tooltip_from_command("API Fuzzing", new_cmd)
+                if tt:
+                    button.setToolTip(tt)
+            except Exception:
+                pass
+            self.show_themed_message("API Wordlist Updated", f"API Fuzzing wordlist set to:\n{path}")
+        elif action == edit_action:
+            self.open_command_edit_dialog(button, "api_ffuf", self.command_registry.get("api_ffuf", ""))
