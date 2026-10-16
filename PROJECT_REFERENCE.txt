@@ -19,6 +19,76 @@ HOW TO USE THIS FILE
  CHANGELOG (most recent first)
 ================================================================================
 
+## 2026-10-16 — THE MISSING HALF OF THE COMMAND REGISTRY (6.8.7)
+
+The Web, API and Recon tabs would not build:
+
+    File "command_bridge/ui/cards.py", line 204, in create_editable_button
+      self.register_default_command(button_id, default_cmd)
+    AttributeError: 'CommandBridgeV5' object has no attribute
+    'register_default_command'
+
+Same root cause as 6.8.6's report_command_overrides, and it should have
+been diagnosed as a class of fault then rather than patched as one bug.
+cards.py calls register_default_command; core/commands.py does not
+define it. Both halves of the shipped-default / saved-override pair
+were missing from this working copy, and there is no mechanism in a
+twenty-six-mixin composition that notices a method nobody defines until
+the line runs — which for a tab builder is when that tab is clicked.
+
+1. THE PAIR IS IMPLEMENTED — core/commands.py
+
+   register_default_command(button_id, default_cmd) records the shipped
+   command in self.default_commands AND seeds command_registry when the
+   button has no entry. Both halves matter: cards.py delegates the
+   seeding, so a version that only recorded would leave every button
+   with no command at all. It seeds ONLY when absent, because
+   load_custom_commands() runs before the tabs are built and a saved
+   override must not be discarded by the shipped default.
+
+   report_command_overrides() names the buttons whose saved command
+   differs from the shipped one. A stale override is how a command
+   fixed upstream keeps looking broken: the fix ships, the saved copy
+   wins, and nothing says why.
+
+2. A CALL THAT NEVER WORKED — ui/tabs_target.py
+
+   Found by the new checker, not by a user. The UAT handler called
+   self.set_target(), which does not exist anywhere. It never crashed
+   because the AttributeError landed in a bare `except Exception` and
+   the fallback assigned self.target directly — leaving the header chip
+   showing the previous target. setText already fires textChanged,
+   which is wired to on_target_changed and save_target_preference, so
+   the call was redundant as well as wrong. Removed.
+
+3. A CHECK THAT DOES NOT DEPEND ON THIS TREE — verify_startup.py
+
+   python3 verify_startup.py, from the repository root. Parses every
+   file, collects each self.NAME(...) inside a *Mixin or
+   CommandBridgeV5 class, and fails if the name is defined nowhere —
+   skipping names reached through getattr/hasattr, which are already
+   guarded, and Qt's own methods.
+
+   It only considers classes that ARE the window. The first version
+   checked every self in the package and reported seven lines from
+   widgets/console.py (a QTextEdit subclass) and a QTableWidgetItem
+   subclass, and zero real faults — output that teaches the reader to
+   ignore it.
+
+   It exists because the test suite cannot be trusted for this. The
+   suite runs in a working copy that is NOT identical to the
+   repository — api_testing.py is a stub here — so a green suite is
+   evidence about this tree, not about a checkout. verify_startup.py
+   reads whatever tree it is standing in, which makes it the only check
+   here worth running on the machine that will actually run the app.
+
+   RUN IT AFTER EVERY UPDATE, BEFORE LAUNCHING.
+
+All four suites pass: test_scanner 284, test_coffee_break 351,
+test_coffee_chain 13, test_gui_smoke 262 — 910 assertions — and
+verify_startup.py reports OK.
+
+
 ## 2026-10-16 — A TEST THAT PASSED AGAINST A FICTION (6.8.6)
 
 6.8.5 would not start:
