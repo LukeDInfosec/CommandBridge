@@ -1117,12 +1117,21 @@ class CoffeeBreakMixin:
         log_path = shlex.quote(f"{out}/{safe}_testssl.log")
         json_path = shlex.quote(f"{out}/{safe}_testssl.json")
         txt_path = shlex.quote(f"{out}/{safe}_testssl.txt")
+        # --color 0 is not cosmetic. testssl decides on colour from the
+        # TERM variable, not from whether its output is a terminal, so
+        # under this application's QProcess it emits ANSI escapes and
+        # writes them into --logfile and through tee into the .txt as
+        # well. The saved reports came out as walls of ESC[1m, which is
+        # what a tester opens when they want to paste a finding into a
+        # report. The JSON was fine; the two human-readable files were
+        # not. Asking for no colour at the source fixes all three
+        # outputs, and _strip_ansi below catches any that still arrive.
         default = (
             f"if command -v testssl >/dev/null 2>&1; then "
-            f"testssl --logfile {log_path} --jsonfile {json_path} "
+            f"testssl --color 0 --logfile {log_path} --jsonfile {json_path} "
             f"{host} | tee {txt_path}; "
             f"elif command -v testssl.sh >/dev/null 2>&1; then "
-            f"testssl.sh --logfile {log_path} --jsonfile {json_path} "
+            f"testssl.sh --color 0 --logfile {log_path} --jsonfile {json_path} "
             f"{host} | tee {txt_path}; "
             f"else echo '[i] testssl is not installed — skipping the TLS "
             f"stage. Install it with: sudo apt install testssl'; fi")
@@ -1487,15 +1496,21 @@ class CoffeeBreakMixin:
         return target
 
     def _cb_extra_headers(self):
-        headers = {}
+        """The operator's custom headers, for Coffee Break's own requests.
+
+        This read ``self.custom_headers_input``, which does not exist —
+        the widget is ``headers_input``. Every call raised
+        AttributeError into the bare ``except`` below and returned {},
+        so Coffee Break made every request unauthenticated no matter
+        what was in the box. Same root cause as the API tab's version of
+        this bug: the header was collected and then quietly discarded.
+        """
+        from command_bridge.modules import header_injection
         try:
-            for line in (self.custom_headers_input.toPlainText() or "").splitlines():
-                if ":" in line:
-                    name, _, value = line.partition(":")
-                    headers[name.strip()] = value.strip()
-        except Exception:
-            pass
-        return headers
+            text = self.headers_input.toPlainText()
+        except Exception:                                   # noqa: BLE001
+            return {}
+        return dict(header_injection.parse(text))
 
     def _cb_record(self, finding):
         """Keep a finding — or, if we already have this issue, another instance.
@@ -1650,6 +1665,45 @@ class CoffeeBreakMixin:
             self.console.append_ansi(f"    open: {', '.join(ports)}\n")
         return produced
 
+    #: Every ANSI escape, not just the colour ones. testssl emits cursor
+    #: moves and erase-line sequences during its progress display too,
+    #: and a report with ESC[2K in it is no more readable than one with
+    #: ESC[1m. ``\x1b\[[0-9;]*m`` — the pattern used elsewhere in this
+    #: file — matches only the colour subset and leaves the rest.
+    _ANSI = re.compile(r"\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])")
+
+    @classmethod
+    def strip_ansi(cls, text):
+        return cls._ANSI.sub("", text or "")
+
+    def _cb_clean_testssl_reports(self, safe):
+        """Rewrite the saved .log and .txt without escape sequences.
+
+        ``--color 0`` on the command is the real fix, but it only helps
+        the run that has it: a tester on an older testssl, or one who
+        has edited the command by hand, still gets escape codes. These
+        two files are the ones a human opens, so they are cleaned after
+        the stage regardless of how the command was built. The JSON is
+        left alone — it never had colour in it, and rewriting a file the
+        parser depends on to fix a problem it does not have is how you
+        acquire a new one.
+        """
+        for suffix in (".log", ".txt"):
+            path = Path(self.output_dir) / f"{safe}_testssl{suffix}"
+            try:
+                if not path.is_file():
+                    continue
+                raw = path.read_text(errors="replace")
+                clean = self.strip_ansi(raw)
+                if clean != raw:
+                    path.write_text(clean)
+            except Exception as exc:                        # noqa: BLE001
+                try:
+                    self.console.append_ansi(
+                        f"[i] could not clean {path.name}: {exc}\n")
+                except Exception:                           # noqa: BLE001
+                    pass
+
     def _cb_parse_testssl(self, stage, text):
         """Read testssl's JSON, and report named issues rather than its prose.
 
@@ -1663,6 +1717,12 @@ class CoffeeBreakMixin:
         Records testssl marks OK or INFO are what "not vulnerable" looks like;
         they are not findings and are not reported.
         """
+        try:
+            self._cb_clean_testssl_reports(
+                self.sanitize_target_for_filename(self.target))
+        except Exception:                                   # noqa: BLE001
+            pass
+
         records = self._cb_testssl_records(stage, text)
         if not records:
             return 0

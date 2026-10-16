@@ -1501,6 +1501,115 @@ back-end DBMS: MySQL >= 5.6
               "sqlmap identified the following injection point(s)",
               plain) != "")
 
+    # ── Custom headers reaching the tool that is being run ──────────────
+    #
+    # Reported from a live engagement: an Authorization bearer token set
+    # on the Target tab, and every API check (graphw00f, Introspection,
+    # GraphQL Cop) failing against an API that requires it. The header
+    # was collected and then applied to nothing but curl.
+    print("\n\033[1mCustom headers\033[0m")
+    from command_bridge.modules import header_injection as hi
+
+    H = hi.parse("Authorization: Bearer eyJhbGciOiJSUzI1Ni.payload.sig\n"
+                 "X-Tenant: acme\n"
+                 "Content-Length: 99\n"
+                 "\n"
+                 "# a comment\n"
+                 "Broken:\n")
+    check("a bearer token whose value contains colons survives whole",
+          H[0], ("Authorization", "Bearer eyJhbGciOiJSUzI1Ni.payload.sig"))
+    check("Content-Length is never forwarded",
+          any(n.lower() == "content-length" for n, _ in H), False)
+    check("a header with no value is dropped", len(H), 2)
+    check("the credential's value is never printed",
+          "eyJhbGciOiJSUzI1Ni" in hi.describe(H), False)
+    check("but the header is named, so it is visible that it was used",
+          "Authorization" in hi.describe(H))
+
+    cop, applied, _ = hi.apply(
+        "graphql-cop -t 'https://x/graphql' -o json", H)
+    check("graphql-cop gets its headers as JSON objects, not Name: Value",
+          '-H \'{"Authorization": "Bearer eyJhbGciOiJSUzI1Ni.payload.sig"}\''
+          in cop)
+    check("and graphql-cop is reported as having received them",
+          "graphql-cop" in applied)
+
+    w00f, _, skipped = hi.apply("graphw00f -d -f -t 'https://x/graphql'", H)
+    check("graphw00f gets Name: Value", "-H 'Authorization: Bearer" in w00f)
+    check("graphw00f's -H is not repeatable, so only one is sent",
+          w00f.count("-H "), 1)
+    check("the credential is the one chosen, not the first in the box",
+          "Authorization" in w00f.split("-H ")[1])
+    check("and the dropped header is reported rather than silently lost",
+          any("graphw00f" in s for s in skipped))
+
+    # The command this was actually reported against. Its curl already
+    # sets Content-Type, and the first version of the fix treated that
+    # as "the operator has set headers by hand" and added nothing.
+    intro = ("echo '[*] Sending'; curl -sk -X POST 'https://x/graphql' "
+             "-H 'Content-Type: application/json' --data '{\"query\":\"q\"}' "
+             "-o out.json; if python3 -m json.tool out.json >/dev/null 2>&1; "
+             "then echo ok; else echo no; fi")
+    got, applied, skipped = hi.apply(intro, H)
+    check("an existing Content-Type does not block the bearer token",
+          "-H 'Authorization: Bearer" in got)
+    check("and Content-Type is not duplicated",
+          got.count("Content-Type"), 1)
+    check("the shell keywords in the command are not mistaken for tools",
+          skipped, [])
+    check("nor is the 1 in a 2>&1 redirection",
+          "1" not in skipped)
+
+    manual = "curl -H 'Authorization: Bearer MINE' https://x"
+    got, _, _ = hi.apply(manual, H)
+    check("a hand-written Authorization is left alone",
+          got.count("Authorization"), 1)
+    check("but other headers are still added alongside it",
+          "-H 'X-Tenant: acme'" in got)
+
+    check("arjun takes one newline-separated --headers string",
+          "--headers 'Authorization: Bearer eyJhbGciOiJSUzI1Ni.payload.sig\n"
+          "X-Tenant: acme'" in hi.apply("arjun -u 'https://x' -o a.txt", H)[0])
+
+    check("ffuf gets a repeated -H",
+          hi.apply("ffuf -u 'https://x/FUZZ' -w /l.txt", H)[0].count("-H "), 2)
+
+    _, applied, skipped = hi.apply(
+        "nmap -sV -p443 example.org", H)
+    check("a port scan is not reported as a missed header",
+          (applied, skipped), ([], []))
+
+    check("the word curl inside a filename is not a curl invocation",
+          hi.apply("cat curl_notes.txt", H)[0], "cat curl_notes.txt")
+    check("and no headers means the command is returned untouched",
+          hi.apply("curl https://x", [])[0], "curl https://x")
+
+    # ── testssl writes reports a human can read ─────────────────────────
+    print("\n\033[1mtestssl report encoding\033[0m")
+    engine = Engine("example.org")
+    cmd = engine._cb_testssl_command()
+    check("testssl is asked for no colour", "--color 0" in cmd)
+    check("both the testssl and testssl.sh branches ask for it",
+          cmd.count("--color 0"), 2)
+
+    noisy = ("\x1b[1m\n####################\x1b[m\n"
+             "  \x1b[1mtestssl\x1b[m version \x1b[1m3.2.2\x1b[m\n"
+             "\x1b[2K\x1b[0;33mTLS 1.0\x1b[m   offered\n")
+    clean = CoffeeBreakMixin.strip_ansi(noisy)
+    check("colour sequences are stripped from a saved report",
+          "\x1b" in clean, False)
+    check("erase-line sequences are stripped too, not just colour",
+          "[2K" in clean, False)
+    check("and the text itself is kept",
+          "testssl version 3.2.2" in clean and "TLS 1.0" in clean)
+
+    safe = engine.sanitize_target_for_filename(engine.target)
+    noisy_path = Path(engine.output_dir) / f"{safe}_testssl.txt"
+    noisy_path.write_text(noisy)
+    engine._cb_clean_testssl_reports(safe)
+    check("an already-written report is cleaned in place",
+          "\x1b" in noisy_path.read_text(), False)
+
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

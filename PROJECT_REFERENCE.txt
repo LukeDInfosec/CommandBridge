@@ -19,6 +19,149 @@ HOW TO USE THIS FILE
  CHANGELOG (most recent first)
 ================================================================================
 
+## 2026-10-16 — THE HEADER WAS COLLECTED AND THEN THROWN AWAY (6.8.5)
+
+Reported from a live engagement against an authenticated API: an
+Authorization bearer token set in the Target tab's Custom Headers box,
+and GraphQL Engine Fingerprint, Introspection Query and GraphQL Cop all
+"failing". They were not failing. They were scanning a 401 page and
+reporting, accurately, that they found no GraphQL engine.
+
+1. CUSTOM HEADERS REACHED ONLY CURL — new modules/header_injection.py
+
+   The whole of the feature was one line in core/commands.py:
+
+       headers_str = self.get_headers_string()
+       if headers_str and 'curl' in cmd:
+           cmd = cmd.replace('curl', f'curl {headers_str}')
+
+   Three faults, all reproduced in tests/test_coffee_break.py:
+
+   a) ONLY CURL. graphw00f, graphql-cop, ffuf, arjun, nuclei, sqlmap,
+      nikto, dalfox, gobuster, katana and httpx all accept headers and
+      all of them were being run anonymously.
+
+   b) THE SUBSTRING. "'curl' in cmd" and cmd.replace('curl', ...) match
+      those four letters anywhere — in a filename, an echo string, a
+      URL — and spliced arguments into the middle of words.
+
+   c) SILENTLY. Nothing said a header had been dropped, so an
+      unauthenticated scan was indistinguishable from a clean one. That
+      is the fault that cost the time, not (a).
+
+   The new module holds a table of each tool's REAL header syntax,
+   because they differ in ways that fail silently rather than loudly:
+   graphql-cop takes a JSON object ('{"Authorization": "Bearer ey"}')
+   and ignores a Name: Value string without erroring; arjun takes one
+   newline-separated --headers string; graphw00f's -H is plain optparse
+   and not repeatable, so of several headers only the last survives —
+   the module sends the credential and reports what it could not send.
+   A tool not in the table is left alone AND NAMED in the console, so
+   an unapplied header is visible rather than assumed.
+
+   Header values are never written to the console. The note names the
+   header and prints "(value hidden)" for anything credential-shaped,
+   because console output gets pasted into tickets.
+
+   A header the operator has already written into the command by hand
+   is never overwritten — per header NAME, not per flag. The first cut
+   of this fix checked only whether a -H appeared anywhere in the
+   invocation, which meant the Introspection command (which sets
+   Content-Type) was still the one command guaranteed not to get a
+   bearer token.
+
+2. COFFEE BREAK HAD THE SAME BUG, FOR A DIFFERENT REASON
+
+   _cb_extra_headers() read self.custom_headers_input. The widget is
+   called headers_input. Every call raised AttributeError into a bare
+   except and returned {}, so Coffee Break's own probes also ran
+   unauthenticated whatever was in the box. Now shares the one parser.
+
+3. TESTSSL REPORTS WERE FULL OF ESCAPE CODES
+
+   Reported alongside the above: the saved testssl output opens as
+   ESC[1m####ESC[m. testssl decides on colour from TERM rather than
+   from whether stdout is a terminal, and under QProcess it guesses
+   wrong, so the escapes went into --logfile and through tee into the
+   .txt. The JSON was unaffected; the two files a human opens were not.
+
+   --color 0 is now inserted into any testssl invocation that does not
+   already set --color, in run_command_template rather than at each of
+   the five call sites, because a fix applied to four of five comes
+   back. Anyone who deliberately passes --color is left alone.
+
+   Belt and braces for older testssl builds and hand-edited commands:
+   _cb_clean_testssl_reports() rewrites the .log and .txt without
+   escape sequences after the stage. strip_ansi() covers cursor and
+   erase-line sequences too, not just the colour subset the previous
+   inline regex matched. The JSON is not touched.
+
+All four suites pass: test_scanner 284, test_coffee_break 351,
+test_coffee_chain 13, test_gui_smoke 248 — 896 assertions.
+
+STILL OUTSTANDING from 6.8.4: session cookies and Authorization headers
+are written verbatim into report files (_TRANSPORT_HEADERS in
+scanner/model.py). This release makes that worse, not better — more
+tools now receive the bearer token, so more of them can echo it into
+their output. Worth fixing next.
+
+
+## 2026-10-09 — A TARGET SOMEBODY ELSE WROTE (6.8.4)
+
+Three things, all pointed at the same problem: a scanner tested only
+against a target you also wrote proves that the two agree with each other.
+
+1. UAT MODE — new modules/uat.py, card on the Target tab
+
+   One button. Pulls OWASP Juice Shop, starts it on a free high port bound
+   to 127.0.0.1 only, waits for it to answer, opens it in the browser and
+   sets it as the scan target. A second button stops and removes the
+   container. Nothing starts automatically and nothing survives Stop.
+
+   It pulls a third-party image from Docker Hub, which is a supply-chain
+   decision, so it happens on a button press and the console says so
+   before it happens. Falls back to npx where no container runtime exists.
+
+   COVERAGE is the point of the module, not the start() function. It maps
+   Juice Shop's own 16 challenge categories (from the project's companion
+   guide) to what this scanner can actually prove, and it is written to be
+   honest rather than flattering — the "Coverage" button prints it so a
+   run's result is read against a stated expectation. Six categories are
+   marked NOT TESTED. Finding nothing in those is the expected result.
+
+   Known gaps it names, in order of how much they matter against Juice
+   Shop specifically: NoSQL injection (Juice Shop is MongoDB-backed and
+   several of its injection challenges are NoSQL — this is the big one),
+   JWT handling (alg:none, weak secret), weak and default credentials,
+   XXE, insecure deserialization, and anti-automation. All six are graded
+   correctly if imported and never detected. None are implemented yet.
+
+2. ONE FINDING, ONE FILE — scanner/report.py write_findings()
+
+   The claim "outputs each finding into its own .txt" was not true before
+   this. It is now: findings/NN_severity_confidence_issue.txt per finding,
+   each holding the severity and the separately-derived confidence, how it
+   reads in a report, the URL to paste into a browser, the raw detection
+   output, what it means, the PoC, the Burp replay, the false-positive
+   indicators and the fix. write_all() calls it.
+
+3. THE PROXY FIELD WAS NOT WIRED — scanner/engine.py, ui/tabs_scan.py
+
+   Profile.proxy existed in nothing. There is now a proxy field on the
+   Scope and aggression card, it reaches the Authenticator and the step
+   requests, and "point it through Burp and watch" is a true statement
+   about the tool rather than an intention.
+
+OUTSTANDING, UNFIXED, AND WORTH FIXING BEFORE THE NEXT RELEASE: session
+cookies and Authorization headers are written verbatim into report files,
+because _TRANSPORT_HEADERS in scanner/model.py lists only content-length,
+transfer-encoding, connection, proxy-connection and host. A report file
+from an authenticated scan currently contains a live session token.
+
+All four suites pass: test_scanner 284, test_coffee_break 323,
+test_coffee_chain 13, test_gui_smoke 248 — 868 assertions.
+
+
 ## 2026-10-08 - THE URL IN THE REPORT HAS TO ACTUALLY WORK (6.8.3)
 
 Three field reports, all variants of the same failure: the report said
