@@ -26,7 +26,7 @@ from command_bridge.modules import cb_issues                 # noqa: E402
 from command_bridge.modules.cb_evidence import Evidence      # noqa: E402
 from command_bridge.modules.coffee_break import (          # noqa: E402
     CBFinding, SEVERITIES, SEV_ORDER, CoffeeBreakMixin, finding_from_scan,
-    _session,
+    _session, _same_location,
     probe_headers, probe_redirects, probe_traversal, probe_403_bypass,
     BYPASS_TRICKS, TRAVERSAL_PAYLOADS,
 )
@@ -100,6 +100,22 @@ class Handler(BaseHTTPRequestHandler):
                     self.headers.get("X-Forwarded-For") == "127.0.0.1":
                 return self._send(200, b"<h1>admin console</h1>")
             return self._send(403, b"forbidden")
+
+        # A login panel that is actually distinguishable from the generic
+        # page. This server answers 200 with the same body for every
+        # unknown path — it is a catch-all, like a single-page app behind
+        # a cache — and the Nikto parser now re-requests a claimed path
+        # and compares it against a path that cannot exist. A panel whose
+        # page is byte-identical to every 404 is not a panel, and the
+        # parser is right to drop it; so the fixture has to serve one
+        # that differs, the way a real login page does.
+        if path.rstrip("/") in ("/umbraco", "/wp-login.php"):
+            return self._send(200, b"<html><head><title>Login</title></head>"
+                                   b"<body><form method='post' id='login'>"
+                                   b"<input name='username'>"
+                                   b"<input name='password' type='password'>"
+                                   b"<button>Sign in</button></form>"
+                                   b"</body></html>")
 
         body = (b"<html><head><title>Target</title>"
                 b"<script src='/static/app.js'></script></head>"
@@ -1660,6 +1676,299 @@ back-end DBMS: MySQL >= 5.6
                    hi.parse(f"Bearer {JWT}"))[0]
     check("and graphql-cop gets it as the JSON object it expects",
           f'-H \'{{"Authorization": "Bearer {JWT}"}}\'' in cop)
+
+
+    # ── A host that answers 200 for everything ──────────────────────────
+    #
+    # Reported from an engagement: Nikto claimed /.bash_history had been
+    # retrieved. The target is a single-page app behind a cache that
+    # answers 200 with the app shell for EVERY path. The shell never says
+    # "404" — it is a <title>, some script tags and an empty root div —
+    # so the wording-based soft-404 test could not see it, and the
+    # finding was reported as observed directly.
+    print("\n\033[1mA host that answers 200 for everything\033[0m")
+
+    SHELL = (b"<!doctype html><html><head><title>Shop</title>"
+             b"<script src='/main.js'></script></head>"
+             b"<body><div id=\"root\"></div></body></html>")
+
+    class _CatchAll(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/genuine.txt":
+                body, kind = b"a real text file, nothing like the shell\n", \
+                             "text/plain"
+            else:
+                body, kind = SHELL, "text/html; charset=utf-8"
+            self.send_response(200)
+            self.send_header("Content-Type", kind)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    spa = ThreadingHTTPServer(("127.0.0.1", 0), _CatchAll)
+    threading.Thread(target=spa.serve_forever, daemon=True).start()
+    spa_base = f"http://127.0.0.1:{spa.server_address[1]}"
+    spa_engine = Engine(spa_base)
+
+    signature = spa_engine._cb_catch_all_signature(spa_base + "/anything")
+    check("the catch-all is detected from a path that cannot exist",
+          signature is not None)
+
+    alive, note = spa_engine._cb_endpoint_alive(spa_base + "/.bash_history")
+    check("a claimed file on a catch-all host is not alive", alive, False)
+    check("and the reason says the host serves a catch-all",
+          "catch-all" in note)
+    check("a response that really differs is still alive",
+          spa_engine._cb_endpoint_alive(spa_base + "/genuine.txt")[0], True)
+
+    reported = Engine(spa_base)
+    reported._cb_parse_nikto({"key": "nikto"}, (
+        "+ [002743] /.bash_history: A user's home directory may be set to "
+        "the web root, the shell history was retrieved. This should not be "
+        "accessible via the web.\n"))
+    check("so the finding never reaches the report", reported._cb_findings, [])
+    check("and the console says why it was dropped",
+          any("not reported" in line for line in reported.printed))
+
+    # A real host, where the same signature IS worth reporting.
+    class _RealFile(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/.bash_history":
+                body, kind, code = (b"cd /var/www\nmysql -u root -phunter2\n",
+                                    "text/plain", 200)
+            else:
+                body, kind, code = b"<h1>404</h1>", "text/html", 404
+            self.send_response(code)
+            self.send_header("Content-Type", kind)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    real = ThreadingHTTPServer(("127.0.0.1", 0), _RealFile)
+    threading.Thread(target=real.serve_forever, daemon=True).start()
+    real_base = f"http://127.0.0.1:{real.server_address[1]}"
+    real_engine = Engine(real_base)
+
+    check("a host that 404s properly has no catch-all signature",
+          real_engine._cb_catch_all_signature(real_base + "/x"), None)
+    real_engine._cb_parse_nikto({"key": "nikto"}, (
+        "+ [002743] /.bash_history: A user's home directory may be set to "
+        "the web root, the shell history was retrieved.\n"))
+    check("a genuinely readable .bash_history IS reported",
+          len(real_engine._cb_findings), 1)
+    kept = real_engine._cb_findings[0]
+    check("at HIGH, because the path is sensitive and it answered",
+          kept.severity, "HIGH")
+    check("and the finding points at the file, not the home page",
+          kept.where.endswith("/.bash_history"))
+
+    # The severity must come from the verified path, not from the word
+    # "shell" appearing in "the shell history was retrieved" — which is
+    # what used to grade it alongside remote code execution.
+    check("'shell history' alone does not mean shell access",
+          real_engine._cb_sensitive_path(real_base + "/readme.txt"), False)
+
+    # An HTML document is not a shell history, whatever the status code.
+    plausible, why = real_engine._cb_file_contents_plausible(
+        "https://x/.bash_history", "<!doctype html><title>App</title>",
+        "text/html")
+    check("an HTML body cannot be the file the signature claims",
+          plausible, False)
+    check("and the reason says so", "HTML" in why)
+    check("a plain-text body can be",
+          real_engine._cb_file_contents_plausible(
+              "https://x/.bash_history", "cd /tmp\nls\n", "text/plain")[0],
+          True)
+
+    spa.shutdown()
+    real.shutdown()
+
+    # ── A run is not lost when the application is killed ────────────────
+    #
+    # Reported alongside the freeze: the application had to be killed
+    # partway through a long run and forty-five minutes of findings went
+    # with it, because the report was only written when somebody clicked
+    # Export and chose a filename.
+    print("\n\033[1mFindings survive a kill\033[0m")
+    saver = Engine("example.org")
+    saver._cb_started_at = time.time()
+    saver._cb_active = True          # a run in flight, as when it matters
+    saver._cb_record(CBFinding("HIGH", "Something real", "https://example.org",
+                               evidence="proof"))
+    md_path, json_path = saver._cb_autosave_paths()
+    check("a finding is written to disk as soon as it is recorded",
+          md_path.is_file())
+    check("and the Markdown holds it",
+          "Something real" in md_path.read_text())
+    check("and so does the JSON", json_path.is_file())
+    saved = json.loads(json_path.read_text())
+    check("the JSON names the target", saved["target"], "example.org")
+    check("and carries the finding",
+          saved["findings"][0]["title"], "Something real")
+    check("and records that the run had not finished",
+          saved["complete"], False)
+    saver._cb_active = False
+    saver._cb_autosave()
+    check("a finished run is recorded as finished",
+          json.loads(json_path.read_text())["complete"], True)
+
+    stale = Engine("example.org")
+    stale.output_dir = saver.output_dir
+    stale._cb_report_previous_run()
+    check("a previous run's file is announced before it is overwritten",
+          any("earlier Coffee Break run" in line for line in stale.printed))
+    check("and the operator is told it will be overwritten",
+          any("overwrites" in line for line in stale.printed))
+
+
+    # ── "rce" inside "Subresource" ───────────────────────────────────────
+    #
+    # Reported from an engagement: nuclei's missing-sri template (INFO,
+    # CWE-353) was published as a CRITICAL CWE-78 OS command injection
+    # with an SRI-less script URL as its proof. for_nuclei already
+    # refuses to classify on a template's description — this came in
+    # through its NAME, "Missing Subresource Integrity", because the
+    # command_injection pattern had `rce\b` with no LEADING word
+    # boundary. "Subresou(rce)" matches. So does "sou(rce)" and
+    # "resou(rce)": any finding mentioning a source or a resource became
+    # a critical.
+    print("\n\033[1mPatterns match words, not fragments of words\033[0m")
+    for benign in ("Missing Subresource Integrity",
+                   "Source map file exposed",
+                   "Cross-origin resource sharing misconfiguration",
+                   "Email addresses disclosed in page source",
+                   "Subresource integrity attribute absent"):
+        check(f"{benign[:38]!r} is not command injection",
+              cb_issues.for_text(benign)[0] == "command_injection", False)
+    for real in ("RCE in the upload handler",
+                 "Remote code execution via deserialisation",
+                 "OS command injection on the host parameter"):
+        check(f"{real[:34]!r} still is",
+              cb_issues.for_text(real)[0], "command_injection")
+    check("and the nuclei template itself no longer maps to an exploit",
+          cb_issues.for_nuclei("missing-sri", "Missing Subresource Integrity",
+                               "Checks if external script tags are missing "
+                               "the Subresource Integrity attribute.")[0]
+          == "command_injection", False)
+
+    # ── Nikto findings get titles, not truncated sentences ──────────────
+    print("\n\033[1mNikto titles name the problem and the file\033[0m")
+    check("a shell history file is named as one",
+          cb_issues.nikto_title(
+              "[002743] /.bash_history: A user's home directory may be set "
+              "to the web root, the shell history was retrieved. This should "
+              "not be accessible via the web."),
+          "Shell history file is readable (/.bash_history)")
+    check("and so is the other one Nikto reports",
+          cb_issues.nikto_title("[002756] /.sh_history: A user's home "
+                                "directory may be set to the web root."),
+          "Shell history file is readable (/.sh_history)")
+    check("an env file too",
+          cb_issues.nikto_title("/.env: may contain secrets."),
+          "Environment file is readable (/.env)")
+    check("an unknown path keeps Nikto's sentence but gains the path",
+          cb_issues.nikto_title("/odd.aspx: Server may leak inodes via ETags")
+          .endswith("(/odd.aspx)"))
+    check("the boilerplate is not in the title",
+          "accessible via the web" in cb_issues.nikto_title(
+              "/x.txt: Something. This should not be accessible via the "
+              "web."), False)
+    check("a line that is not in Nikto's path form returns nothing",
+          cb_issues.nikto_title("Retrieved x-powered-by header: PHP/8.1"), "")
+    check("no title is a truncated raw line any more",
+          "…" in cb_issues.nikto_title(
+              "[002743] /.bash_history: A user's home directory may be set "
+              "to the web root, the shell history was retrieved."), False)
+
+    # ── A header cannot be absent and misconfigured at once ─────────────
+    #
+    # Reported: "CSP allows clickjacking", "CSP does not restrict
+    # object-src or base-uri", "CSP allows form hijacking" AND
+    # "Content-Security-Policy is missing", on the same target. The last
+    # contradicts the first three. probe_headers cannot produce that
+    # pair on its own, so the "missing" one came from a signature tool.
+    # Parsing the header is first-hand evidence that it is there.
+    print("\n\033[1mPresent and missing are mutually exclusive\033[0m")
+    csp = Engine("https://example.bike")
+    for parsed_key in ("csp_clickjacking", "csp_missing_object_base",
+                       "csp_form_hijack"):
+        csp._cb_record(csp._cb_issue(
+            parsed_key, "https://example.bike/",
+            "Content-Security-Policy: default-src 'self'", "headers"))
+    csp._cb_record(csp._cb_issue("csp_missing", "https://example.bike",
+                                 "no CSP header seen", "nuclei"))
+    titles = [f.title for f in csp._cb_findings]
+    check("the three analyses of the policy are kept", len(titles), 3)
+    check("and 'CSP is missing' is not reported alongside them",
+          any("missing" in t and "object-src" not in t for t in titles),
+          False)
+    check("with the reason said out loud",
+          any("contradicts" in line for line in csp.printed))
+
+    # The stages do not run in a fixed order, so the other direction too.
+    rev = Engine("https://example.bike")
+    rev._cb_record(rev._cb_issue("csp_missing", "https://example.bike",
+                                 "no CSP header seen", "nuclei"))
+    rev._cb_record(rev._cb_issue(
+        "csp_clickjacking", "https://example.bike/",
+        "Content-Security-Policy: default-src 'self'", "headers"))
+    check("a 'missing' already recorded is withdrawn when the header is read",
+          [f.key for f in rev._cb_findings], ["csp_clickjacking"])
+
+    only = Engine("https://example.bike")
+    only._cb_record(only._cb_issue("csp_missing", "https://example.bike",
+                                   "no CSP header seen", "headers"))
+    check("a genuinely missing header is still reported",
+          [f.key for f in only._cb_findings], ["csp_missing"])
+
+    print("\n\033[1mA trailing slash is the same location\033[0m")
+    check("root with and without a slash", 
+          _same_location("https://x", "https://x/"))
+    check("but two different paths are not",
+          _same_location("https://x/a", "https://x/b"), False)
+    check("and a sub-path's slash is left alone",
+          _same_location("https://x/a", "https://x/a/"), False)
+
+    # ── Lucky 13 names the suites ───────────────────────────────────────
+    #
+    # Reported: the finding's entire proof was testssl's own sentence,
+    # "LUCKY13: potentially vulnerable, uses obsolete TLS CBC ciphers",
+    # which cannot be written up — a report has to say which suites.
+    print("\n\033[1mLucky 13 lists the cipher suites\033[0m")
+    from command_bridge.modules import cbc_suites
+
+    sample = [("TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA", 256, "ECDHE-RSA-AES256-SHA"),
+              ("TLS_RSA_WITH_AES_128_CBC_SHA", 128, "AES128-SHA")]
+    block = cbc_suites.as_evidence(sample, "example.bike:443")
+    check("each suite is on its own line", block.count("\n"), 2)
+    check("the IANA name is used, not OpenSSL's short name",
+          "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA" in block)
+    check("the key size is given", block.rstrip().endswith("128"))
+    check("and nothing was invented when there is nothing to list",
+          cbc_suites.as_evidence([], "x"), "")
+    check("every suite in the table has an IANA name and a size",
+          all(iana.startswith("TLS_") and bits > 0
+              for _, iana, bits in cbc_suites.SUITES))
+    check("TLS 1.3 is excluded, since it has no CBC suites at all",
+          "TLSv1_2" in Path(cbc_suites.__file__).read_text())
+
+    print("\n\033[1mCopying a finding keeps its line breaks\033[0m")
+    from command_bridge.widgets.plain_copy import as_plain_text
+    check("Qt's paragraph separator becomes a newline",
+          as_plain_text("a b"), "a\nb")
+    check("and its line separator does too, which is what <br> gives",
+          as_plain_text("a b"), "a\nb")
+    check("non-breaking spaces become ordinary ones",
+          as_plain_text("a b"), "a b")
+    check("a cipher list survives a round trip",
+          as_plain_text("Lucky13   TLS_RSA_WITH_AES_128_CBC_SHA "
+                        "  TLS_RSA_WITH_AES_256_CBC_SHA").count("\n"), 2)
 
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0

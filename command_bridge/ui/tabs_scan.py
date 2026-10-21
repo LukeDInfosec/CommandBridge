@@ -31,6 +31,7 @@ from PyQt6.QtWidgets import (
 from command_bridge.modules import cb_evidence, cb_issues
 from command_bridge.modules.scanner.engine import PARAMETER_FILENAME
 from command_bridge.modules.coffee_break import finding_from_scan
+from command_bridge.widgets.plain_copy import PlainCopyTextEdit
 
 #: Shared with Coffee Break so the two findings screens cannot drift apart.
 SEV_COLOURS = cb_evidence.SEV_COLOURS
@@ -510,7 +511,12 @@ class ActiveScanTabMixin:
         self.as_table.setMinimumWidth(260)
         splitter.addWidget(self.as_table)
 
-        self.as_detail = QTextEdit()
+        # PlainCopyTextEdit, not QTextEdit: selecting a finding
+        # and copying it out of a plain QTextEdit yields U+2029
+        # and U+2028 instead of newlines, so a cipher list that
+        # reads one-per-line on screen pastes into a report as a
+        # single line. See widgets/plain_copy.py.
+        self.as_detail = PlainCopyTextEdit()
         self.as_detail.setReadOnly(True)
         self.as_detail.setMinimumHeight(360)
         self.as_detail.setMinimumWidth(320)
@@ -917,6 +923,12 @@ class ActiveScanTabMixin:
 
     def _as_on_finished(self, result, error):
         self._as_timer.stop()
+        # Hand the status bar's clock back, or it keeps the scan's final
+        # time on screen until something else happens to reset it.
+        try:
+            self.update_status_elapsed("00:00")
+        except Exception:                               # noqa: BLE001
+            pass
         self.as_start_btn.setEnabled(True)
         self.as_stop_btn.setEnabled(False)
         self.as_pause_btn.setEnabled(False)
@@ -962,6 +974,16 @@ class ActiveScanTabMixin:
         elapsed = int(time.time() - self._as_started)
         self.as_elapsed.setText(f"running for {elapsed // 60}m "
                                 f"{elapsed % 60:02d}s")
+        # The status bar's clock is started by run_command_template, which
+        # an Active Scan never calls — it is pure Python in a worker
+        # thread, not an external command. So the bar said RUNNING with
+        # the time stuck at 00:00 while this label counted up beside it.
+        # Coffee Break's tick already does this; Active Scan's did not.
+        try:
+            minutes, seconds = divmod(elapsed, 60)
+            self.update_status_elapsed(f"{minutes:02d}:{seconds:02d}")
+        except Exception:                               # noqa: BLE001
+            pass
 
     # ── the table ────────────────────────────────────────────────────────
     def _as_severity(self, finding):

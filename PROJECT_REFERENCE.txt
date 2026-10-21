@@ -19,6 +19,124 @@ HOW TO USE THIS FILE
  CHANGELOG (most recent first)
 ================================================================================
 
+## 2026-10-21 — "rce" INSIDE "SUBRESOURCE" (6.9.1)
+
+Five faults from a GraphQL engagement. The first is the worst thing in
+this changelog.
+
+1. ANY FINDING MENTIONING A "SOURCE" BECAME A CRITICAL — cb_issues.py
+
+   nuclei's missing-sri template — severity INFO, CWE-353, "Checks if
+   external script and stylesheet tags are missing the Subresource
+   Integrity attribute" — was published as:
+
+       OS command injection
+       CRITICAL (impact if real) · potential (evidence) · nuclei
+       Classification: CWE-78
+       Recommended remediation: Do not call a shell with user input.
+
+   for_nuclei already refuses to classify on a template's description,
+   from an earlier bug of exactly this shape. This one came in through
+   the template NAME, because the command_injection pattern read
+
+       command injection|rce\b|remote code execution|code execution
+
+   with a trailing word boundary and NO LEADING ONE. "Subresou(rce)"
+   matches. So does "sou(rce)" and "resou(rce)". Audited against a
+   corpus of benign tool wording, five phrases classified as CRITICAL
+   command injection:
+
+       Missing Subresource Integrity
+       Subresource integrity attribute absent on external script
+       Cross-origin resource sharing misconfiguration
+       Source map file exposed
+       Email addresses disclosed in page source
+
+   Fixed to \brce\b. Every other short alternative in _TEXT_ISSUES was
+   then checked empirically — each pattern run over a corpus, reporting
+   any match whose span is bounded by word characters — and rce was the
+   only one matching mid-word.
+
+   The evidence grader caught it, for what that is worth: the finding
+   carried "Classification / evidence mismatch … evidence associated
+   with csp, while the classification is 'command_injection'". That is
+   the net working as designed. It should never have had to.
+
+2. NIKTO TITLES WERE TRUNCATED SENTENCES — cb_issues.nikto_title()
+
+   "[002756] /.sh_history: …" names neither the problem nor the file.
+   Nikto's line is a sentence of explanation; clean_title() cut it at
+   118 characters. nikto_title() drops the "[002743]" id, reads the
+   path, and maps it: "Shell history file is readable
+   (/.bash_history)". Twenty-one path families are named; an unknown
+   path keeps Nikto's own first sentence, minus its boilerplate, with
+   the path appended. Returns "" on a line that is not in Nikto's path
+   form, so the caller falls back rather than being handed a guess.
+
+3. LUCKY 13 NAMED NO SUITES — new modules/cbc_suites.py
+
+   The finding's whole proof was testssl's sentence, "LUCKY13:
+   potentially vulnerable, uses obsolete TLS CBC ciphers". A report has
+   to say WHICH suites. testssl only writes per-suite detail into its
+   JSON when run with --show-each or the cipher-enumeration flags,
+   which the Coffee Break invocation does not use, so that detail was
+   never available to attach however the parser was written — the
+   library's own docstring has promised "the list of CBC ciphers it
+   printed becomes the proof underneath" since the issue was added.
+
+   So ask the server. One handshake per CBC suite, offering exactly
+   one, recording only what was NEGOTIATED. @SECLEVEL=0 is required or
+   OpenSSL 3 refuses to offer the SHA-1 and 3DES suites and the host
+   looks clean because the CLIENT declined. TLS 1.3 is capped out: it
+   has no CBC suites, and leaving it on lets a 1.3 handshake succeed
+   and report a false positive.
+
+   Verified against two local TLS servers: five suites found on a
+   CBC-offering one, nothing on an AEAD-only one, under a second each.
+
+4. COPYING A FINDING FLATTENED IT TO ONE LINE — widgets/plain_copy.py
+
+   QTextCursor.selectedText() does not return "\n". It returns U+2029
+   between blocks and U+2028 for a <br>, and most editors treat neither
+   as a line break. Findings are rendered with <br> throughout, so a
+   cipher list that reads one-per-line on screen pasted as one line.
+
+   widgets/console.py had solved this — for the console only, and only
+   for U+2029. The findings and Active Scan detail panes are the ones a
+   tester copies out of for a report, and both were plain QTextEdit.
+   PlainCopyTextEdit now holds the fix once, covers U+2028 as well,
+   converts &nbsp; back to a space, and offers only text/plain so a
+   paste cannot come out as <span style=…> markup.
+
+5. A HEADER REPORTED AS BOTH ABSENT AND MISCONFIGURED — coffee_break.py
+
+   "CSP allows clickjacking", "CSP does not restrict object-src or
+   base-uri", "CSP allows form hijacking" AND "Content-Security-Policy
+   is missing", on one target. probe_headers cannot produce that pair:
+   it reports csp_missing only when the header is absent and the
+   analyses only when it is present. So the "missing" one came from a
+   signature tool, and parsing the header is first-hand evidence that
+   it is there.
+
+   _PRESENCE_CONFLICTS suppresses the contradiction in BOTH
+   directions — the stages do not run in a fixed order, so a "missing"
+   finding can arrive before or after the header is parsed — and says
+   which it dropped and why. A genuinely missing header is untouched.
+
+   Also the trailing slash the report was noticed through:
+   https://example.bike and https://example.bike/ are now one location,
+   so two tools on the same page stop looking like coverage of two.
+
+NOT A FAULT, for the record: the /.bash_history finding in the same
+report shows "Where: https://example-web…" with no path, which is the
+pre-6.9.0 behaviour — 6.9.0's path pinning and catch-all detection
+handle both of those lines. That run predated the upload.
+
+All four suites pass: test_scanner 284, test_coffee_break 420,
+test_coffee_chain 13, test_gui_smoke 271 — 988 assertions — and
+verify_startup.py reports OK.
+
+
 ## 2026-10-21 — THE CONSOLE WAS THE BOTTLENECK (6.9.0)
 
 First release made against the real repository rather than a partial

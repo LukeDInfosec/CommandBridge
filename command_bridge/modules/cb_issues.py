@@ -1078,7 +1078,7 @@ _TEXT_ISSUES = (
     (r"source ?code disclos|source disclos", "source_code_disclosure"),
     (r"directory (listing|indexing)|index of /", "directory_listing"),
     (r"sql ?injection|sqli\b", "sqli"),
-    (r"command injection|rce\b|remote code execution|code execution",
+    (r"command injection|\brce\b|remote code execution|code execution",
      "command_injection"),
     (r"template injection|ssti", "ssti"),
     (r"deserial", "deserialization"),
@@ -1412,6 +1412,85 @@ def clean_title(text, limit=118):
         return text
     cut = text[:limit].rsplit(" ", 1)[0].rstrip(",;:-")
     return (cut or text[:limit]) + "…"
+
+
+#: Nikto's path-based findings, given titles a reader can act on. Nikto's
+#: own wording is a sentence of explanation, not a title — "[002743]
+#: /.bash_history: A user's home directory may be set to the web root, the
+#: shell history was retrieved. This should not be accessible via the web."
+#: truncated to a title column reads as "[002743] /.sh_history: …", which
+#: names neither the problem nor the file.
+NIKTO_PATH_TITLES = (
+    ((".bash_history", ".sh_history", ".zsh_history", ".history"),
+     "Shell history file is readable"),
+    ((".env",), "Environment file is readable"),
+    ((".git/", ".git/config", ".git/head"), "Git repository is exposed"),
+    ((".svn/", ".hg/"), "Version control directory is exposed"),
+    (("id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"),
+     "Private SSH key is readable"),
+    ((".ssh/authorized_keys",), "SSH authorized_keys is readable"),
+    ((".htpasswd",), "Password file is readable"),
+    ((".htaccess",), "Access control file is readable"),
+    ((".netrc", ".pgpass", ".my.cnf"),
+     "Credentials file is readable"),
+    (("wp-config", "web.config", "settings.py", "database.yml",
+      "configuration.php"), "Application configuration file is readable"),
+    ((".aws/credentials", ".docker/config.json", ".dockercfg"),
+     "Cloud or container credentials file is readable"),
+    ((".npmrc", ".pypirc"), "Package manager credentials file is readable"),
+    ((".sql", ".dump", ".sqlite"), "Database dump is readable"),
+    ((".bak", ".old", ".orig", ".save", ".swp", "~"),
+     "Backup or editor leftover file is readable"),
+    ((".pem", ".key", ".keystore", ".jks"),
+     "Private key or keystore is readable"),
+    (("phpinfo", "info.php"), "PHP configuration page is exposed"),
+    (("server-status", "server-info"),
+     "Server status page is exposed"),
+    (("crossdomain.xml", "clientaccesspolicy.xml"),
+     "Permissive cross-domain policy file"),
+    ((".ds_store",), "macOS directory metadata file is readable"),
+    (("web.xml",), "Java deployment descriptor is readable"),
+)
+
+#: Boilerplate Nikto appends to most of its lines. It belongs in the
+#: detail, never in a title.
+_NIKTO_BOILERPLATE = re.compile(
+    r"\s*(this should not be accessible via the web|"
+    r"this might be interesting|"
+    r"this may be a false positive|"
+    r"consider (?:removing|restricting) it)\.?\s*$", re.I)
+
+
+def nikto_title(line):
+    """A title for a Nikto finding that names the problem and the file.
+
+    Returns ``""`` when the line is not in Nikto's path form, so the
+    caller can fall back to its own handling rather than being handed a
+    guess.
+    """
+    text = re.sub(r"\s+", " ", str(line or "")).strip()
+    text = re.sub(r"^\[\d+\]\s*", "", text)          # drop "[002743] "
+    match = re.match(r"^(/[^\s:]{0,200}):\s*(.*)$", text)
+    if not match:
+        return ""
+    path, rest = match.group(1), match.group(2).strip()
+    lowered = path.lower()
+
+    for markers, title in NIKTO_PATH_TITLES:
+        if any(marker in lowered for marker in markers):
+            return f"{title} ({path})"
+
+    # Unknown path: use Nikto's own first sentence, minus the boilerplate,
+    # and say which path it is about. Better a tool's sentence with the
+    # path attached than a truncated one with neither.
+    rest = _NIKTO_BOILERPLATE.sub("", rest).strip()
+    first = re.split(r"(?<=[.!])\s+", rest)[0].strip().rstrip(".") \
+        if rest else ""
+    if not first:
+        return f"{path} is accessible"
+    if len(first) > 80:
+        first = first[:80].rsplit(" ", 1)[0].rstrip(",;:-") + "…"
+    return f"{first} ({path})"
 
 
 def is_fingerprint(template_id):

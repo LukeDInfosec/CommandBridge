@@ -82,6 +82,21 @@ SEV_ORDER = {name: index for index, name in enumerate(reversed(SEVERITIES))}
 SEV_TAG = {s: f"[{s}]" for s in SEVERITIES}
 
 
+def _same_location(first, second):
+    """Are these the same URL, ignoring a trailing slash on the root?
+
+    A finding reported at ``https://example.com`` and one reported at
+    ``https://example.com/`` are the same place. Treating them as two
+    produced an "also seen at" entry that was the same page again, and
+    made a pair of findings look like coverage of two locations.
+    """
+    def normal(value):
+        value = str(value or "").strip()
+        return value[:-1] if value.endswith("/") and value.count("/") == 3 \
+            else value
+    return bool(first) and normal(first) == normal(second)
+
+
 @dataclass
 class CBFinding:
     """One issue, in the form somebody writing it up actually needs."""
@@ -197,7 +212,14 @@ class CBFinding:
         a different observation — and, once the two were run together, there
         was no way to tell which line had come from where.
         """
-        if not where or where == self.where or where in self.instances:
+        # https://host and https://host/ are the same location. Without
+        # this, two tools reporting the same issue on the same page look
+        # like one finding "also seen at" a second URL that is the first
+        # URL with a slash on the end.
+        if _same_location(where, self.where) or \
+                any(_same_location(where, seen) for seen in self.instances):
+            return False
+        if not where:
             return False
         self.instances.append(where)
         if proof is not None:
@@ -1170,6 +1192,10 @@ class CoffeeBreakMixin:
                 QMessageBox.Icon.Warning)
             return
 
+        # Before anything is overwritten, say whether a previous run's
+        # findings are sitting on disk for this target.
+        self._cb_report_previous_run()
+
         self._cb_reset()
         self._cb_active = True
         self._cb_started_at = time.time()
@@ -1472,7 +1498,21 @@ class CoffeeBreakMixin:
             f"{int(elapsed % 60)}s — {len(self._cb_findings)} finding(s)"
             + (f": {summary}" if summary else "") + "\n")
         self.console.append_ansi("=" * 80 + "\n")
+        # The console batches writes now; make sure the summary is
+        # actually on screen rather than sitting in the buffer.
+        try:
+            self.console.flush()
+        except Exception:                                   # noqa: BLE001
+            pass
         self._cb_ui_call("_cb_ui_finished", "completed")
+        # Synchronous, not debounced: the run is over and there may be no
+        # further event loop turn in which a pending timer would fire.
+        self._cb_autosave()
+        if getattr(self, "_cb_findings", None):
+            md_path, json_path = self._cb_autosave_paths()
+            self.console.append_ansi(
+                f"[*] Findings saved to:\n      {md_path}\n"
+                f"      {json_path}\n")
         try:
             self.set_status_state("idle")
             self.update_status_bar("success", "Coffee Break")
@@ -1512,6 +1552,218 @@ class CoffeeBreakMixin:
             return {}
         return dict(header_injection.parse(text))
 
+    # ── not losing a run ─────────────────────────────────────────────────
+    #
+    # Reported after a run froze partway through a directory-fuzzing
+    # stage: the application had to be killed, and forty-five minutes of
+    # findings went with it, because the report was only ever written
+    # when somebody clicked Export and chose a filename. Findings lived
+    # in self._cb_findings and nowhere else.
+    #
+    # The freeze itself is fixed in widgets/console.py, but a crash, a
+    # closed lid or a power cut would have cost the same, so the run is
+    # now written to disk as it goes. The Markdown is the same text the
+    # Export button produces, so it is immediately usable in a report.
+
+    #: Rebuilding the whole report on every merged instance would be
+    #: wasteful during a fuzzing stage that produces hundreds of
+    #: sightings a second, so saves are debounced.
+    _CB_AUTOSAVE_MS = 2000
+
+    def _cb_autosave_paths(self):
+        safe = self.sanitize_target_for_filename(self.target or "target")
+        base = Path(self.output_dir)
+        return (base / f"{safe}_coffee_break_findings.md",
+                base / f"{safe}_coffee_break_findings.json")
+
+    def _cb_schedule_autosave(self):
+        timer = getattr(self, "_cb_autosave_timer", None)
+        if timer is None:
+            try:
+                from PyQt6.QtWidgets import QApplication
+                if QApplication.instance() is None:
+                    # No event loop to run a timer, so nothing would ever
+                    # fire it. Save now instead of warning and losing it.
+                    self._cb_autosave()
+                    return
+                timer = QTimer(self) if isinstance(self, QObject) else QTimer()
+                timer.setSingleShot(True)
+                timer.setInterval(self._CB_AUTOSAVE_MS)
+                timer.timeout.connect(self._cb_autosave)
+            except Exception:                               # noqa: BLE001
+                # No Qt event loop (a test harness, a headless run). Save
+                # straight away rather than not at all — correctness of
+                # the saved file matters more than the debounce.
+                self._cb_autosave()
+                return
+            self._cb_autosave_timer = timer
+        if not timer.isActive():
+            timer.start()
+
+    def _cb_autosave(self):
+        """Write the run to disk. Never raises into the scan.
+
+        Written to a temporary file and moved into place, so a kill
+        halfway through a write leaves the previous good copy rather
+        than a truncated one.
+        """
+        if not getattr(self, "_cb_findings", None):
+            return
+        md_path, json_path = self._cb_autosave_paths()
+        try:
+            report = self.coffee_break_report()
+        except Exception:                                   # noqa: BLE001
+            return
+        for path, payload in ((md_path, report),
+                              (json_path, self._cb_findings_json())):
+            if payload is None:
+                continue
+            try:
+                tmp = path.with_suffix(path.suffix + ".tmp")
+                tmp.write_text(payload, encoding="utf-8", errors="replace")
+                os.replace(tmp, path)
+            except Exception as exc:                        # noqa: BLE001
+                if not getattr(self, "_cb_autosave_warned", False):
+                    self._cb_autosave_warned = True
+                    try:
+                        self.console.append_ansi(
+                            f"    [!] could not autosave findings to "
+                            f"{path.name}: {exc}\n")
+                    except Exception:                       # noqa: BLE001
+                        pass
+
+    def _cb_findings_json(self):
+        """The findings as JSON — the machine-readable half of the save."""
+        rows = []
+        for finding in self._cb_findings:
+            try:
+                rows.append({
+                    "severity": finding.severity,
+                    "title": finding.title,
+                    "where": finding.where,
+                    "state": finding.state,
+                    "confidence": finding.confidence,
+                    "stage": finding.stage,
+                    "sources": list(finding.sources or []),
+                    "key": finding.key,
+                    "cwe": finding.cwe,
+                    "scanner_severity": finding.scanner_severity,
+                    "detail": finding.detail,
+                    "evidence": finding.evidence,
+                    "remediation": finding.remediation,
+                    "instances": list(finding.instances or []),
+                    "references": list(finding.references or []),
+                    "seen_at": finding.seen_at,
+                })
+            except Exception:                               # noqa: BLE001
+                continue
+        try:
+            return json.dumps({
+                "target": self.target,
+                "started_at": getattr(self, "_cb_started_at", None),
+                "saved_at": time.time(),
+                "complete": not getattr(self, "_cb_active", False),
+                "findings": rows,
+            }, indent=2, default=str)
+        except Exception:                                   # noqa: BLE001
+            return None
+
+    def _cb_report_previous_run(self):
+        """Say so, at startup, if a previous run's findings are on disk.
+
+        The findings table is not repopulated — that would mean rebuilding
+        every evidence object from JSON, and a half-restored evidence
+        chain is worse than none, because the whole point of this tool is
+        that a finding carries its proof. What it does instead is make
+        sure nobody re-runs a 45-minute scan without being told the
+        results are already saved.
+        """
+        try:
+            md_path, _ = self._cb_autosave_paths()
+            if not md_path.is_file() or md_path.stat().st_size < 40:
+                return
+            age = time.time() - md_path.stat().st_mtime
+            when = (f"{int(age // 3600)}h {int(age % 3600 // 60)}m ago"
+                    if age >= 3600 else f"{int(age // 60)}m ago")
+            self.console.append_ansi(
+                f"[i] Findings from an earlier Coffee Break run on this "
+                f"target were saved {when}:\n      {md_path}\n"
+                f"    Starting a new run overwrites that file — copy it "
+                f"first if you still need it.\n")
+        except Exception:                                   # noqa: BLE001
+            pass
+
+    #: A header cannot be both absent and misconfigured. The left-hand
+    #: key claims a header is MISSING; every key on the right is only ever
+    #: produced by PARSING that header's value, so it is first-hand
+    #: evidence that the header is there.
+    #:
+    #: Reported from an engagement: a target produced "CSP allows
+    #: clickjacking", "CSP does not restrict object-src or base-uri",
+    #: "CSP allows form hijacking" AND "Content-Security-Policy is
+    #: missing" — four findings, the last contradicting the first three.
+    #: probe_headers cannot do that on its own (it reports csp_missing
+    #: only when the header is absent), so the "missing" one comes from a
+    #: signature tool looking at a different response, or at the same one
+    #: through a cache. Whichever it is, first-hand parsing of the header
+    #: wins over a signature saying it is not there.
+    _PRESENCE_CONFLICTS = {
+        "csp_missing": ("csp_unsafe_script", "csp_clickjacking",
+                        "csp_form_hijack", "csp_wildcard_source",
+                        "csp_missing_object_base", "csp_report_only"),
+        "hsts_missing": ("hsts_short_max_age",),
+    }
+
+    def _cb_presence_conflict(self, finding):
+        """Does this finding contradict one we already have? ``(drop, why)``.
+
+        Works in both directions, because the order the stages run in is
+        not the order the evidence arrives in: a "missing" finding from
+        nuclei can land before the header probe has parsed the header, or
+        after it.
+        """
+        held = {existing.key for existing in self._cb_findings if existing.key}
+
+        # Incoming says the header is missing, but we have parsed it.
+        proofs = self._PRESENCE_CONFLICTS.get(finding.key)
+        if proofs and held.intersection(proofs):
+            witness = sorted(held.intersection(proofs))[0]
+            return True, (f"the header was read and analysed by the header "
+                          f"stage ({witness}), so it is present")
+
+        # Incoming is a parse of the header; drop any held "missing".
+        for missing_key, proofs in self._PRESENCE_CONFLICTS.items():
+            if finding.key in proofs and missing_key in held:
+                stale = [f for f in self._cb_findings if f.key == missing_key]
+                self._cb_drop_quietly(stale)
+                try:
+                    self.console.append_ansi(
+                        f"[i] dropped '{ISSUES[missing_key]['title']}' — the "
+                        f"header was found and parsed, so it is not "
+                        f"missing\n")
+                except Exception:                           # noqa: BLE001
+                    pass
+        return False, ""
+
+    def _cb_drop_quietly(self, findings):
+        """Remove findings from the list and from the table.
+
+        Prefers the UI's own _cb_drop, which also refreshes the filter,
+        the tally and the detail pane — removing the finding from
+        _cb_findings alone would leave its row on screen. Falls back to
+        the list when the UI half is not present (a headless run).
+        """
+        findings = [f for f in (findings or [])]
+        if not findings:
+            return
+        dropper = getattr(self, "_cb_drop", None)
+        if callable(dropper):
+            dropper(findings)
+            return
+        doomed = {id(f) for f in findings}
+        self._cb_findings = [f for f in self._cb_findings
+                             if id(f) not in doomed]
+
     def _cb_record(self, finding):
         """Keep a finding — or, if we already have this issue, another instance.
 
@@ -1522,6 +1774,17 @@ class CoffeeBreakMixin:
         """
         if finding.key and finding.key in self._cb_muted:
             return
+
+        if finding.key:
+            drop, why = self._cb_presence_conflict(finding)
+            if drop:
+                try:
+                    self.console.append_ansi(
+                        f"[i] not reported — '{finding.title}' contradicts "
+                        f"evidence already held: {why}\n")
+                except Exception:                           # noqa: BLE001
+                    pass
+                return
 
         for existing in self._cb_findings:
             #: Same issue = same library key, whichever tool found it. Nikto
@@ -1557,12 +1820,14 @@ class CoffeeBreakMixin:
                 existing.revalidate()
             if changed:
                 self._cb_ui_call("_cb_ui_refresh", existing)
+                self._cb_schedule_autosave()
             return
 
         if not finding.sources and finding.stage:
             finding.sources = [finding.stage]
         self._cb_findings.append(finding)
         self._cb_ui_call("_cb_ui_finding", finding)
+        self._cb_schedule_autosave()
         # The console line says the state as well as the severity, so a
         # CRITICAL that nothing has actually confirmed cannot be mistaken for
         # one that has.
@@ -1770,6 +2035,23 @@ class CoffeeBreakMixin:
             evidence = "\n".join(bucket["lines"][:14])
             if len(bucket["lines"]) > 14:
                 evidence += f"\n… and {len(bucket['lines']) - 14} more"
+
+            # A CBC finding whose whole proof is testssl's sentence
+            # ("LUCKY13: potentially vulnerable, uses obsolete TLS CBC
+            # ciphers") cannot be written up: the report has to name the
+            # suites. testssl only puts per-suite detail in its JSON when
+            # run with --show-each or the cipher-enumeration flags, which
+            # this invocation does not use, so that detail was never
+            # available to attach however the parser was written.
+            #
+            # So ask the server. One handshake per CBC suite, nothing
+            # sent after it, and only a suite that was NEGOTIATED is
+            # listed — see modules/cbc_suites.py.
+            if key in ("lucky13", "beast", "sweet32"):
+                listing = self._cb_cbc_evidence()
+                if listing:
+                    evidence = listing + "\n\n" + \
+                        "testssl's own line:\n" + evidence
             detail = ISSUES[key]["detail"]
             title = None
             if key == "obsolete_protocol":
@@ -1811,6 +2093,37 @@ class CoffeeBreakMixin:
             f"    {len(records)} TLS check(s) read; {produced} issue(s) worth "
             f"reporting\n")
         return produced
+
+    def _cb_cbc_evidence(self):
+        """The host's accepted CBC suites, one per line. Cached per run.
+
+        Returns "" when nothing could be enumerated — a TLS port that
+        cannot be reached is not evidence that there are no CBC suites,
+        so the finding keeps testssl's wording rather than gaining a
+        claim this did not establish.
+        """
+        cached = getattr(self, "_cb_cbc_listing", None)
+        if cached is not None:
+            return cached
+        from command_bridge.modules import cbc_suites
+        host = self.get_scanner_target()
+        parsed = urllib.parse.urlparse(self._cb_target_url())
+        port = parsed.port or (443 if parsed.scheme == "https" else 443)
+        listing = ""
+        try:
+            self.console.append_ansi(
+                f"    enumerating CBC cipher suites on {host}:{port} "
+                f"so the finding can name them\n")
+            suites = cbc_suites.offered(host, port, report=lambda line: None)
+            listing = cbc_suites.as_evidence(suites, f"{host}:{port}")
+            if suites:
+                self.console.append_ansi(
+                    f"    {len(suites)} CBC suite(s) accepted\n")
+        except Exception as exc:                        # noqa: BLE001
+            self.console.append_ansi(
+                f"    [i] could not enumerate CBC suites: {exc}\n")
+        self._cb_cbc_listing = listing
+        return listing
 
     def _cb_testssl_records(self, stage, text):
         """testssl's JSON if it wrote any, otherwise its console output.
@@ -1936,8 +2249,39 @@ class CoffeeBreakMixin:
             # Unrecognised, and not obviously an observation. Report it, but
             # at the severity its wording justifies rather than a flat Low.
             lowered = body.lower()
-            if any(word in lowered for word in
-                   ("remote code", "shell", "backdoor", "command execution")):
+            # A sensitive file that was RE-REQUESTED and came back with
+            # plausible contents is graded on that fact, not on the
+            # adjectives in Nikto's sentence. Tightening the keyword
+            # ladder below (correctly) stopped "the shell history was
+            # retrieved" matching the word "shell", and dropped a
+            # genuinely readable .bash_history to INFO — a credential
+            # disclosure rated beneath a missing header.
+            if alive is True and self._cb_sensitive_path(located):
+                severity = "HIGH"
+                self._cb_record(CBFinding(
+                    severity=severity,
+                    title=(cb_issues.nikto_title(body)
+                           or clean_title(body)),
+                    where=located,
+                    detail="Reported by Nikto, and re-requested by Command "
+                           "Bridge: the path answered and the response did "
+                           "not look like the application's own error or "
+                           "catch-all page.\n\n" + body +
+                           "\n\nThis is a sensitive path. Read the response "
+                           "yourself before reporting it — what matters is "
+                           "what the file contains.",
+                    evidence=body[:500], confidence="tentative",
+                    stage=stage["key"], sources=[stage["key"]]))
+                produced += 1
+                continue
+
+            # "shell" on its own caught "the shell history was retrieved"
+            # and graded a file-disclosure signature as HIGH alongside
+            # remote code execution. The phrases below mean shell ACCESS.
+            if any(phrase in lowered for phrase in
+                   ("remote code", "web shell", "reverse shell",
+                    "shell upload", "command execution", "backdoor",
+                    "command injection", "arbitrary code")):
                 severity = "HIGH"
             elif any(word in lowered for word in
                      ("osvdb", "cve-", "vulnerab", "exploit", "injection",
@@ -1951,8 +2295,18 @@ class CoffeeBreakMixin:
                 severity = "INFO"
 
             self._cb_record(CBFinding(
-                severity=severity, title=clean_title(body),
-                where=self._cb_target_url(),
+                severity=severity,
+                # Nikto's line is a sentence of explanation, not a title.
+                # Truncated into a title column it read "[002756]
+                # /.sh_history: …", which names neither the problem nor
+                # the file. nikto_title names both, and falls back to
+                # clean_title when the line is not in Nikto's path form.
+                title=cb_issues.nikto_title(body) or clean_title(body),
+                # `located`, not the bare target. This hardcoded the host,
+                # which meant an unrecognised finding about a specific path
+                # pointed the reader at the home page — and the path that
+                # was actually re-requested above never reached the report.
+                where=located,
                 detail="Reported by Nikto.\n\n" + body + "\n\nNikto is "
                        "signature-driven and does not verify what it matches; "
                        "confirm this by hand before reporting it.",
@@ -2029,6 +2383,35 @@ class CoffeeBreakMixin:
             return None, ""
         if response.status_code not in self._ALIVE:
             return False, f"HTTP {response.status_code}"
+
+        # ── the catch-all test ──────────────────────────────────────────
+        #
+        # The wording test below was the only soft-404 detection here, and
+        # it is not enough. Reported from an engagement: Nikto claimed
+        # /.bash_history had been retrieved; the host is a single-page
+        # application behind a cache that answers 200 with the app shell
+        # for EVERY path. The shell says nothing about 404 — it is a
+        # <title>, some script tags and an empty root div — so the page
+        # never admits it is not there and the finding sailed through as
+        # "Observed directly".
+        #
+        # Asking the page whether it exists is the wrong question. The
+        # right one is whether this response differs from one for a path
+        # that cannot possibly exist.
+        control = self._cb_catch_all_signature(url)
+        if control:
+            if self._cb_same_as_control(response, control):
+                return False, ("HTTP %d, but this host answers the same way "
+                               "for a path that cannot exist — it serves a "
+                               "catch-all, so the match proves nothing"
+                               % response.status_code)
+
+        # Does the body match what the signature claims was retrieved?
+        plausible, why = self._cb_file_contents_plausible(
+            url, response.text or "", response.headers.get("Content-Type"))
+        if not plausible:
+            return False, f"HTTP {response.status_code}, but {why}"
+
         body = (response.text or "")[:4000].lower()
         if response.status_code == 200 and any(
                 phrase in body for phrase in
@@ -2040,6 +2423,120 @@ class CoffeeBreakMixin:
             if len(body.strip()) < 3000 and "<form" not in body:
                 return False, f"HTTP 200 but the page says it is not there"
         return True, f"re-requested, HTTP {response.status_code}"
+
+    #: Content types that a file-disclosure finding cannot be true of. A
+    #: shell history, a private key or a .env served as text/html with a
+    #: <title> in it is the application's own page, not the file.
+    _NOT_A_FILE_MARKERS = ("<!doctype html", "<html", "<title", "<app-root",
+                           "<div id=\"root\"", "<div id='root'")
+
+    #: Paths whose mere readability is the finding. Matched against the
+    #: path that was actually verified, which is why this is evidence
+    #: rather than another keyword list: it only applies once the request
+    #: has been made and the response did not look like a catch-all.
+    _SENSITIVE_PATHS = (
+        ".bash_history", ".zsh_history", ".sh_history", ".env",
+        ".git/config", ".git/head", ".svn/entries", ".hg/",
+        "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", ".ssh/authorized_keys",
+        ".htpasswd", ".netrc", ".pgpass", ".my.cnf", ".npmrc", ".pypirc",
+        "wp-config.php", "web.config", "settings.py", "credentials",
+        ".aws/credentials", ".docker/config.json", "database.yml",
+        ".dockercfg", "secrets.yml", ".pem", ".key", ".keystore",
+        ".sql", ".sqlite", ".dump", ".bak", ".old", ".swp",
+    )
+
+    def _cb_sensitive_path(self, url):
+        """Is this a path whose readability is itself the problem?"""
+        try:
+            path = urllib.parse.urlparse(url or "").path.lower()
+        except Exception:                               # noqa: BLE001
+            return False
+        if not path or path == "/":
+            return False
+        return any(marker in path for marker in self._SENSITIVE_PATHS)
+
+    def _cb_catch_all_signature(self, url):
+        """How this host answers a path that cannot exist.
+
+        One extra request per host, cached, not per finding. Returns None
+        when the control request fails — an unanswerable question must
+        not become evidence either way.
+        """
+        parsed = urllib.parse.urlparse(url)
+        host_key = (parsed.scheme, parsed.netloc)
+        cache = getattr(self, "_cb_catch_all_cache", None)
+        if cache is None:
+            cache = self._cb_catch_all_cache = {}
+        if host_key in cache:
+            return cache[host_key]
+
+        probe = (f"{parsed.scheme}://{parsed.netloc}/"
+                 f"cb-does-not-exist-{int(time.time())}-zqx/nope.txt")
+        signature = None
+        try:
+            session = _session({"url": probe})
+            response = session.get(probe, timeout=10, allow_redirects=False)
+            signature = {
+                "status": response.status_code,
+                "type": (response.headers.get("Content-Type") or "")
+                        .split(";")[0].strip().lower(),
+                "length": len(response.content or b""),
+                "body": (response.text or "")[:2000],
+            }
+            if signature["status"] in (404, 410):
+                # A host that answers 404 properly has no catch-all, so
+                # there is nothing to compare against later.
+                signature = None
+        except Exception:                               # noqa: BLE001
+            signature = None
+        cache[host_key] = signature
+        return signature
+
+    @staticmethod
+    def _cb_same_as_control(response, control):
+        """Is this response indistinguishable from the catch-all's?"""
+        if response.status_code != control["status"]:
+            return False
+        kind = (response.headers.get("Content-Type") or "") \
+            .split(";")[0].strip().lower()
+        if kind != control["type"]:
+            return False
+        here, there = len(response.content or b""), control["length"]
+        if max(here, there) == 0:
+            return True
+        # A templated shell differs only by whatever the path put in it,
+        # so allow a few per cent rather than demanding equality.
+        if abs(here - there) / max(here, there) > 0.05:
+            return False
+        return True
+
+    def _cb_file_contents_plausible(self, url, body, content_type):
+        """Could this response really be the file the signature claims?
+
+        Nikto's wording for these is "the shell history was retrieved",
+        "the file was retrieved" — a claim about content, which can be
+        checked against the content. An HTML document is not a
+        .bash_history, a .env or a private key, whatever the status code.
+        """
+        path = urllib.parse.urlparse(url).path.lower()
+        looks_like_a_file = any(
+            path.endswith(ext) or part in path for ext, part in
+            ((".bash_history", ".bash_history"), (".env", ".env"),
+             (".git/config", ".git"), (".ssh/id_rsa", "id_rsa"),
+             (".htpasswd", ".htpasswd"), (".npmrc", ".npmrc"),
+             (".sql", ".sql"), (".bak", ".bak"), (".log", ".log"),
+             (".pem", ".pem"), (".key", ".key"), (".config", ".config")))
+        if not looks_like_a_file:
+            return True, ""
+        kind = (content_type or "").split(";")[0].strip().lower()
+        lowered = (body or "")[:3000].lower()
+        if kind.startswith("text/html") or any(
+                marker in lowered for marker in self._NOT_A_FILE_MARKERS):
+            return False, (f"the response is {kind or 'HTML'} containing an "
+                           f"HTML document, which is the application's own "
+                           f"page rather than the file the signature claims "
+                           f"was retrieved")
+        return True, ""
 
     def _cb_log_dropped(self, url, note, body):
         """Say what was dropped and why, rather than silently binning it."""
@@ -2060,12 +2557,32 @@ class CoffeeBreakMixin:
         """
         base = self._cb_target_url().rstrip("/")
         match = re.search(r"(/[A-Za-z0-9_\-./%]{1,120})", body or "")
-        if match and key in ("login_panel_exposed", "admin_exposed",
-                             "directory_listing", "backup_file",
-                             "vcs_exposed", "env_file_exposed",
-                             "info_page_exposed", "source_code_disclosure",
-                             "config_disclosed", "api_spec_exposed"):
-            return base + match.group(1)
+        if not match:
+            return self._cb_target_url()
+
+        # The fixed key list below misses the case this was reported
+        # for: Nikto said /.bash_history had been retrieved, that issue
+        # matches no library key, so the finding's location fell back to
+        # the bare host — and _cb_endpoint_alive declines to check a URL
+        # whose path is "/", so NO verification ran at all and a
+        # signature match was reported as observed.
+        #
+        # Deliberately NOT broadened to every line that mentions a
+        # slash. Nikto's inventory lines mention paths too ("/test.php:
+        # This might be interesting."), and pinning those to a path puts
+        # them through the aliveness gate, which drops them instead of
+        # collecting them as the low-value observations they are. What
+        # gets pinned is a recognised path-based issue, or a path whose
+        # readability is itself the finding.
+        candidate = match.group(1)
+        if key in ("login_panel_exposed", "admin_exposed",
+                   "directory_listing", "backup_file",
+                   "vcs_exposed", "env_file_exposed",
+                   "info_page_exposed", "source_code_disclosure",
+                   "config_disclosed", "api_spec_exposed"):
+            return base + candidate
+        if self._cb_sensitive_path(base + candidate):
+            return base + candidate
         return self._cb_target_url()
 
     @staticmethod

@@ -27,6 +27,7 @@ from PyQt6.QtWidgets import (
 
 from command_bridge.modules import cb_evidence
 from command_bridge.modules.coffee_break import SEVERITIES, SEV_ORDER
+from command_bridge.widgets.plain_copy import PlainCopyTextEdit
 
 #: One colour per severity. Taken from cb_evidence rather than written out
 #: again here — this file used to hold its own copy, and the copies drifted:
@@ -410,7 +411,12 @@ class CoffeeBreakTabMixin:
         self.cb_table.setMinimumWidth(260)
         splitter.addWidget(self.cb_table)
 
-        self.cb_detail = QTextEdit()
+        # PlainCopyTextEdit, not QTextEdit: selecting a finding
+        # and copying it out of a plain QTextEdit yields U+2029
+        # and U+2028 instead of newlines, so a cipher list that
+        # reads one-per-line on screen pastes into a report as a
+        # single line. See widgets/plain_copy.py.
+        self.cb_detail = PlainCopyTextEdit()
         self.cb_detail.setReadOnly(True)
         # Tall enough that a finding's evidence, PoC and fix are readable
         # without touching the divider — which is the whole reason the panes
