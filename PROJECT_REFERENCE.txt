@@ -19,6 +19,128 @@ HOW TO USE THIS FILE
  CHANGELOG (most recent first)
 ================================================================================
 
+## 2026-10-21 — THE CONSOLE WAS THE BOTTLENECK (6.9.0)
+
+First release made against the real repository rather than a partial
+working copy, which is how the test that shipped in 6.8.8 was caught:
+tests/test_gui_smoke.py imported STUBBED from
+command_bridge/modules/api_testing.py, a name that exists only in the
+PLACEHOLDER copy of that module. It passed in the tree whose wrongness
+caused four missing methods, and failed on import in a real checkout.
+Replaced with a block that calls verify_startup.py, which needs nothing
+from any module and reads whatever tree it stands in.
+
+Three faults reported from a live engagement.
+
+1. THE FREEZE — widgets/console.py
+
+   The application became unresponsive about forty-five minutes into a
+   Coffee Break run, during directory fuzzing: the status bar clock
+   stopped, tabs stopped responding, and it had to be killed.
+
+   EnhancedConsole is a QTextEdit and nothing ever removed anything
+   from its document. Every append also set the widget cursor and
+   scrolled to the bottom — three relayouts per line — and a QTextEdit
+   lays out its whole document, so the cost per line grew with the
+   document. Measured, before the fix:
+
+       lines      0- 6,000:  35.74s
+       lines  6,000-12,000: 113.30s
+       lines 12,000-18,000: 203.60s
+       lines 18,000-24,000: 239.23s
+
+   24,000 lines took 592 seconds of main-thread work, still
+   accelerating. A fuzzing stage emits far more than 24,000 lines. That
+   curve IS the report: fine for a while, then wedged.
+
+   Fixed by coalescing writes onto a 50 ms timer, inserting through a
+   document cursor instead of the widget's, and capping the document.
+   After: 200,000 lines in 4.72 seconds, flat at ~1.2s per 50,000, held
+   at 450,000 characters.
+
+   The cap is measured in CHARACTERS, and that is not a detail. Every
+   line goes through _apply_feroxbuster_colors, which returns HTML, so
+   lines are separated by <br> — a line separator WITHIN a Qt block,
+   not a block boundary. document().blockCount() reads 1 after a
+   hundred thousand lines. The first version of this cap was written
+   against blockCount and would never once have fired.
+
+2. FORTY-FIVE MINUTES OF FINDINGS DIED WITH IT — modules/coffee_break.py
+
+   Findings lived in self._cb_findings and nowhere else; the report was
+   written only when somebody clicked Export and chose a filename. The
+   freeze is fixed, but a crash or a closed lid would have cost the
+   same.
+
+   Now written as the run goes: <target>_coffee_break_findings.md (the
+   same text Export produces) and .json beside it, debounced 2s so a
+   fuzzing stage merging hundreds of sightings does not rebuild the
+   report each time, final save synchronous at the end, written to a
+   temp file and moved into place so a kill mid-write leaves the
+   previous good copy. start_coffee_break announces an earlier run's
+   file before overwriting it.
+
+   The findings TABLE is not repopulated on restart. That would mean
+   rebuilding every evidence object from JSON, and a half-restored
+   evidence chain is worse than none when the whole point of the tool
+   is that a finding carries its proof.
+
+3. NIKTO'S /.bash_history ON A CATCH-ALL HOST — modules/coffee_break.py
+
+   Reported with the operator's own curl analysis, which was right. The
+   target answers 200 with its single-page-app shell for every path. It
+   was reported as HIGH, "Observed directly".
+
+   Three compounding faults:
+
+   a) _cb_where_for returned a path-specific URL only for a fixed list
+      of library keys. .bash_history matches none, so the location fell
+      back to the bare host — and _cb_endpoint_alive declines to check
+      a URL whose path is "/", so NO verification ran at all.
+
+   b) Soft-404 detection asked whether the PAGE SAYS it is missing. An
+      app shell says nothing of the kind. The right question is whether
+      the response differs from one for a path that cannot exist:
+      _cb_catch_all_signature requests a random path once per host and
+      compares status, content type and length (5% tolerance).
+
+   c) No content check. "The shell history was retrieved" is a claim
+      about content. text/html containing <title> is the application's
+      page, not a shell history.
+
+   Also: "shell" matched "the shell history was retrieved" and graded
+   it alongside remote code execution. Tightened to phrases that mean
+   shell ACCESS — which dropped a genuinely readable .bash_history to
+   INFO, so severity for a sensitive path now comes from the verified
+   request instead of the adjectives in Nikto's sentence.
+
+   Deliberately NOT broadened to every line mentioning a slash: that
+   put Nikto's inventory lines ("/test.php: This might be
+   interesting.") through the aliveness gate and dropped them instead
+   of collecting them as observations. Three suite failures caught
+   that.
+
+   The test fixture had to change too: it answers 200 with one body for
+   every unknown path, so it IS a catch-all, and the Umbraco panel it
+   asserts was correctly suppressed. It now serves a login page that
+   differs from the generic one, as a real one does.
+
+4. THE STATUS BAR CLOCK STUCK AT 00:00 — ui/tabs_scan.py
+
+   During an Active Scan the bar read RUNNING with the time at 00:00
+   while the tab's own label counted up. The bar's clock is started by
+   run_command_template, which an Active Scan never calls: it is pure
+   Python in a worker thread, not an external command. Coffee Break's
+   tick already wrote update_status_elapsed; Active Scan's did not. It
+   now does, and hands the clock back on finish.
+
+5. GRAPHQL COP IS FORCED — ui/tabs_api.py (carried from 6.8.9)
+
+All four suites pass: test_scanner 284, test_coffee_break 386,
+test_coffee_chain 13, test_gui_smoke 271 — 954 assertions — and
+verify_startup.py reports OK on the real repository.
+
+
 ## 2026-10-16 — THE TOKEN WITH NO COLON IN IT (6.8.9)
 
 Reported mid-engagement, on a GraphQL API pentest. A bearer token was
