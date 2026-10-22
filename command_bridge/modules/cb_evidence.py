@@ -947,7 +947,7 @@ def summary_html(finding):
         html.append(_summary_row("Affected", _esc(str(where))))
     sources = [s for s in (getattr(finding, "sources", []) or []) if s]
     if sources:
-        html.append(_summary_row("Detected by", _esc(", ".join(sources))))
+        html.append(_summary_row("Detected By", _esc(", ".join(sources))))
     html.append("</table>")
 
     html.append("<p style='margin:0 0 4px 0'><b>What was found</b></p>")

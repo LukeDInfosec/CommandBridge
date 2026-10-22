@@ -6,6 +6,7 @@ exercise the real request path — redirect handling, header parsing, traversal
 payloads, bypass tricks — without touching anybody's infrastructure.
 """
 
+import datetime
 import json
 import re
 import sys
@@ -929,9 +930,15 @@ def main():
         check("a missing base-uri is caught",
               "csp_missing_object_base" in analyse_csp(
                   sound.replace("base-uri 'self'; ", "")))
-        check("a missing frame-ancestors is caught",
-              "csp_clickjacking" in analyse_csp(
-                  sound.replace("frame-ancestors 'none'; ", "")))
+        # frame-ancestors moved OUT of analyse_csp. A missing directive
+        # is only a finding once X-Frame-Options has also been looked
+        # at, so framing is assessed from the response as a whole —
+        # csp_analysis.assess_framing — and analyse_csp no longer
+        # returns a verdict on it. The framing cases are covered in
+        # their own section below.
+        check("analyse_csp no longer judges framing on its own",
+              any(k.startswith("csp_clickjack") for k in analyse_csp(
+                  sound.replace("frame-ancestors \'none\'; ", ""))), False)
         check("script-src falls back to default-src when absent",
               "csp_unsafe_script" in analyse_csp(
                   "default-src 'self' 'unsafe-inline'; object-src 'none'; "
@@ -1934,9 +1941,10 @@ back-end DBMS: MySQL >= 5.6
                                  "no CSP header seen", "nuclei"))
     titles = [f.title for f in csp._cb_findings]
     check("the three analyses of the policy are kept", len(titles), 3)
+    # By KEY, not by searching titles for "missing" — the framing
+    # finding's own title legitimately contains that word now.
     check("and 'CSP is missing' is not reported alongside them",
-          any("missing" in t and "object-src" not in t for t in titles),
-          False)
+          "csp_missing" in [f.key for f in csp._cb_findings], False)
     check("with the reason said out loud",
           any("contradicts" in line for line in csp.printed))
 
@@ -2359,6 +2367,283 @@ back-end DBMS: MySQL >= 5.6
           "RAW DETECTION" in full or "Raw detection" in full)
     check("and the remediation is still recorded on the finding",
           bool(b_real._cb_findings[0].remediation))
+
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  Explanations: why was this raised, and which evidence says so
+    # ═══════════════════════════════════════════════════════════════════
+    from command_bridge.modules import cipher_properties as cprops
+    from command_bridge.modules import csp_analysis as cspmod
+    from command_bridge.modules import explanations as expl
+
+    # The twelve suites from the report: five CBC, three static-RSA, and
+    # four AEAD including the TLS 1.3 ones. All twelve were being listed
+    # under one "weak cipher suites offered" heading.
+    OFFERED = [
+        ("TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA", 256),
+        ("TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384", 256),
+        ("TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256", 256),
+        ("TLS_RSA_WITH_AES_256_CBC_SHA", 256),
+        ("TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA", 128),
+        ("TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256", 128),
+        ("TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", 128),
+        ("TLS_RSA_WITH_AES_128_CBC_SHA", 128),
+        ("TLS_RSA_WITH_AES_128_GCM_SHA256", 128),
+        ("TLS_AES_256_GCM_SHA384", 256),
+        ("TLS_CHACHA20_POLY1305_SHA256", 256),
+        ("TLS_AES_128_GCM_SHA256", 128),
+    ]
+    SUITES = cprops.parse_all(OFFERED)
+
+    # ── 1. Lucky 13 keeps the suites and claims no exploit ──────────────
+    print("\n\033[1m1 — Lucky 13 names the suites, claims no exploit\033[0m")
+    l13 = expl.explain("lucky13", suites=SUITES, host="example.bike:443")
+    body = l13.text()
+    for suite, _ in OFFERED[:1] + [("TLS_RSA_WITH_AES_256_CBC_SHA", 0),
+                                   ("TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA", 0),
+                                   ("TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
+                                    0),
+                                   ("TLS_RSA_WITH_AES_128_CBC_SHA", 0)]:
+        check(f"{suite} is listed", suite in body)
+    check("the CBC construction is explained, not just named",
+          "MAC-then-encrypt" in body)
+    check("exploitability is explicitly not claimed",
+          "not attempted" in body and "unestablished" in body)
+    check("no claim that CBC is simply broken",
+          "no longer considered secure" in body.lower(), False)
+    check("the AEAD suites are shown as NOT part of the finding",
+          "not part of this finding" in body)
+    check("key sizes are given", "256-bit AES" in body)
+
+    # ── 2. Weak ciphers separate problematic from AEAD ──────────────────
+    print("\n\033[1m2 — weak ciphers: problematic vs AEAD\033[0m")
+    weak = expl.explain("weak_cipher", suites=SUITES,
+                        host="example.bike:443").text()
+    problem_half, _, other_half = weak.partition("Other suites observed")
+    check("the AEAD suites are not in the problematic half",
+          "TLS_AES_256_GCM_SHA384" in problem_half, False)
+    check("and they are in the other half",
+          "TLS_AES_256_GCM_SHA384" in other_half)
+    check("the CBC suites ARE in the problematic half",
+          "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA" in problem_half)
+    check("each group states its own reason",
+          "static RSA key exchange" in problem_half
+          and "CBC mode" in problem_half)
+    check("the count is of problematic suites, not all of them",
+          weak.startswith("6 of the 12"))
+    check("and a 128-bit key is explicitly not the reason",
+          "128-bit key is not itself a weakness" in weak)
+
+    # ── 3. static RSA distinguished from ECDHE ──────────────────────────
+    print("\n\033[1m3 — static RSA is not ECDHE\033[0m")
+    static = cprops.with_weakness(SUITES, cprops.STATIC_RSA)
+    check("three static-RSA suites are identified", len(static), 3)
+    check("ECDHE suites are not among them",
+          any("ECDHE" in s.name for s in static), False)
+    for suite in SUITES:
+        if suite.key_exchange == "ECDHE":
+            check(f"{suite.name[:42]} has forward secrecy",
+                  suite.forward_secrecy)
+    check("TLS_RSA_WITH_AES_128_GCM_SHA256 is flagged for key exchange "
+          "only, not its cipher",
+          cprops.parse("TLS_RSA_WITH_AES_128_GCM_SHA256").weaknesses,
+          (cprops.STATIC_RSA,))
+    rsa_text = expl.explain("robot", suites=SUITES,
+                            host="example.bike:443").text()
+    check("the explanation says why it matters",
+          "forward secrecy" in rsa_text)
+    check("and shows the ECDHE suites for comparison",
+          "WITH forward secrecy" in rsa_text)
+
+    # ── 4. TLS 1.3 suites are not weak ──────────────────────────────────
+    print("\n\033[1m4 — TLS 1.3 suites are not weak\033[0m")
+    for name in ("TLS_AES_256_GCM_SHA384", "TLS_AES_128_GCM_SHA256",
+                 "TLS_CHACHA20_POLY1305_SHA256"):
+        suite = cprops.parse(name)
+        check(f"{name} parses as TLS 1.3", suite.tls13)
+        check("  as AEAD", suite.aead)
+        check("  with forward secrecy", suite.forward_secrecy)
+        check("  and no weaknesses", suite.weaknesses, ())
+    check("AES-128 alone is not a weakness",
+          cprops.parse("TLS_AES_128_GCM_SHA256").weaknesses, ())
+    check("an unrecognised suite name claims nothing",
+          cprops.parse("TLS_SOMETHING_INVENTED").weaknesses, ())
+    check("and is marked unparsed rather than judged",
+          cprops.parse("TLS_SOMETHING_INVENTED").parsed, False)
+
+    # ── 5. Certificate expiry uses the scan date ────────────────────────
+    print("\n\033[1m5 — certificate expiry against the scan date\033[0m")
+    scan_day = datetime.datetime(2026, 10, 22)
+    gone = expl.explain("cert_expired", not_after="2026-09-12",
+                        scanned_at=scan_day, not_before="2025-09-12",
+                        host="example.bike")
+    check("an expired certificate says how long ago",
+          "40 day(s) before this scan" in gone.text())
+    check("and shows both dates",
+          "2026-09-12" in gone.text() and "2026-10-22" in gone.text())
+    soon = expl.explain("cert_expiring", not_after="2026-11-03",
+                        scanned_at=scan_day, host="example.bike")
+    check("one near expiry is a deadline, not a vulnerability",
+          "Not a vulnerability" in soon.text())
+    check("a certificate valid for months is no finding at all",
+          expl.explain("cert_expired", not_after="2027-05-10",
+                       scanned_at=scan_day), None)
+    check("an unparseable date draws no conclusion",
+          "No conclusion" in expl.explain(
+              "cert_expired", not_after="not a date",
+              scanned_at=scan_day).text())
+
+    # ── 6-13. Cross-Site Framing ────────────────────────────────────────
+    print("\n\033[1m6-13 — Cross-Site Framing, from parsed directives\033[0m")
+    LONG_CSP = ("base-uri 'self'; connect-src 'self' https://api.example.com "
+                "https://sentry.io; default-src 'self'; font-src 'self' "
+                "https://fonts.gstatic.com; img-src 'self' data:")
+
+    def framing(**headers):
+        return cspmod.assess_framing(headers=headers)
+
+    # 6 — missing frame-ancestors, no alternative protection
+    policy = framing(**{"Content-Security-Policy": LONG_CSP})
+    check("6. a missing frame-ancestors with no XFO is a finding",
+          policy.vulnerable)
+    said = expl.explain("cross_site_framing", policy=policy,
+                        url="https://example.bike/").text()
+    check("   the explanation names the missing directive",
+          "no frame-ancestors directive" in said)
+    check("   and says X-Frame-Options was absent",
+          "No X-Frame-Options header was returned" in said)
+    check("   and says default-src is not a fallback",
+          "not a fallback for frame-ancestors" in said)
+    check("   the actual header is preserved",
+          "connect-src 'self' https://api.example.com" in said)
+    check("   and it does not claim a successful exploit",
+          "was not tested" in said)
+
+    # 7 — frame-ancestors 'none'
+    policy = framing(**{"Content-Security-Policy":
+                        "default-src 'self'; frame-ancestors 'none'"})
+    check("7. frame-ancestors 'none' is not a finding", policy.vulnerable,
+          False)
+    check("   and is read as 'none'", policy.verdict, cspmod.NONE)
+
+    # 8 — frame-ancestors 'self'
+    policy = framing(**{"Content-Security-Policy": "frame-ancestors 'self'"})
+    check("8. frame-ancestors 'self' is not a finding", policy.vulnerable,
+          False)
+    check("   and is read as same-origin only", policy.verdict,
+          cspmod.SELF_ONLY)
+
+    # 9 — a specific permitted origin
+    policy = framing(**{"Content-Security-Policy":
+                        "frame-ancestors 'self' https://partner.example.com"})
+    check("9. an allow-list is not reported as missing protection",
+          policy.vulnerable, False)
+    check("   it is reported as an allow-list", policy.verdict,
+          cspmod.SPECIFIC_ORIGINS)
+    check("   and the permitted origin is named",
+          "https://partner.example.com" in policy.permitted_origins)
+    check("   with the judgement left to the reader",
+          "whether they are trusted" in expl.explain(
+              "cross_site_framing", policy=policy).text())
+
+    # 10 — default-src without frame-ancestors
+    policy = framing(**{"Content-Security-Policy": "default-src 'self'"})
+    check("10. default-src alone does not protect against framing",
+          policy.vulnerable)
+    check("    and the explanation says exactly that",
+          "not a fallback for frame-ancestors" in expl.explain(
+              "cross_site_framing", policy=policy).text())
+
+    # 11 — frame-src without frame-ancestors
+    policy = framing(**{"Content-Security-Policy": "frame-src 'self'"})
+    check("11. frame-src is not frame-ancestors", policy.vulnerable)
+    check("    and the difference is explained",
+          "not who may embed this page" in expl.explain(
+              "cross_site_framing", policy=policy).text())
+
+    # 12 — X-Frame-Options present / absent / obsolete
+    check("12a. XFO DENY with no CSP is not a finding",
+          framing(**{"X-Frame-Options": "DENY"}).vulnerable, False)
+    check("12b. XFO SAMEORIGIN covers a CSP with no frame-ancestors",
+          framing(**{"Content-Security-Policy": LONG_CSP,
+                     "X-Frame-Options": "SAMEORIGIN"}).vulnerable, False)
+    obsolete = framing(**{"Content-Security-Policy": LONG_CSP,
+                          "X-Frame-Options": "ALLOW-FROM https://x.test"})
+    check("12c. XFO ALLOW-FROM is not protection", obsolete.vulnerable)
+    check("     and is reported as obsolete",
+          any("obsolete" in note for note in obsolete.notes))
+    check("12d. nothing is claimed about XFO when nothing was inspected",
+          cspmod.assess_framing(csp=LONG_CSP, inspected=False).vulnerable,
+          False)
+    check("     and the explanation says so",
+          "No response was examined" in expl.explain(
+              "cross_site_framing",
+              policy=cspmod.assess_framing(csp=LONG_CSP,
+                                           inspected=False)).text())
+
+    # 13 — unrelated third-party origins
+    policy = framing(**{"Content-Security-Policy":
+                        "connect-src * https://third.party.test; "
+                        "frame-ancestors 'none'"})
+    check("13. an unrestricted connect-src is not Cross-Site Framing",
+          policy.vulnerable, False)
+    check("    a long header with third-party origins is not either",
+          framing(**{"Content-Security-Policy":
+                     LONG_CSP + "; frame-ancestors 'self'"}).vulnerable,
+          False)
+
+    # wildcard frame-ancestors IS a finding, and a different one
+    wild = framing(**{"Content-Security-Policy": "frame-ancestors *"})
+    check("a wildcard frame-ancestors is a finding", wild.vulnerable)
+    check("reported as permissive rather than missing",
+          "rather than a missing protection" in expl.explain(
+              "cross_site_framing", policy=wild).text())
+
+    check("the canonical name is ours",
+          cb_issues.ISSUES["cross_site_framing"]["title"],
+          "Cross-Site Framing")
+    check("and the word clickjacking is not the finding's name",
+          "clickjack" in
+          cb_issues.ISSUES["cross_site_framing"]["title"].lower(), False)
+
+    # ── 14. Missing SRI is not command injection ────────────────────────
+    print("\n\033[1m14 — missing SRI explains SRI\033[0m")
+    sri = expl.explain("sri_missing",
+                       scripts=["https://cdn.example.test/a.js"],
+                       url="https://example.bike/").text()
+    check("the explanation is about integrity verification",
+          "integrity" in sri)
+    check("it names the external resource",
+          "https://cdn.example.test/a.js" in sri)
+    check("it says what the browser cannot do",
+          "cannot tell whether" in sri)
+    check("and mentions no shell or command execution",
+          any(word in sri.lower()
+              for word in ("shell", "command injection")), False)
+
+    # ── 15. Raw evidence retained behind the concise view ──────────────
+    print("\n\033[1m15 — concise view, raw evidence retained\033[0m")
+    srv_real, base_real = _serve(_RealFiles)
+    keeper = Engine(base_real)
+    keeper._cb_parse_nikto({"key": "nikto"}, NIKTO_HISTORY)
+    kept_finding = keeper._cb_findings[0]
+    concise = cb_evidence.summary_html(kept_finding)
+    for field_name in ("Risk rating", "Confirmation", "Affected",
+                       "Detected By", "What was found"):
+        check(f"the summary has {field_name}", field_name in concise)
+    check("the explanation is in the summary",
+          "credentials passed on the command line" in concise)
+    check("so is the specific evidence", "HTTP 200" in concise)
+    check("remediation is NOT in the summary",
+          "Remove the file from the web root" in concise, False)
+    technical = cb_evidence.detail_html(kept_finding)
+    check("the raw Nikto line is still in the technical view",
+          "002743" in technical)
+    check("and the remediation is still on the finding",
+          "Remove the file from the web root" in kept_finding.remediation)
+    check("the explanation is kept as structure too",
+          bool(getattr(kept_finding, "explanation", None)))
+    srv_real.shutdown()
 
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0

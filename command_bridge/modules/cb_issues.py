@@ -366,8 +366,32 @@ ISSUES = {
         "Remove unsafe-inline and unsafe-eval; use a per-response nonce or "
         "hash, and name explicit script origins.",
         "CWE-693"),
+    # ONE finding for framing, named as the organisation names it.
+    #
+    # There were two — "CSP allows clickjacking" and "X-Frame-Options
+    # missing" — which are the same weakness reached from two headers,
+    # and a host with neither header got both findings. The framing
+    # policy is now assessed once from the parsed directives and both
+    # headers together (modules/csp_analysis.py), and reported here.
+    #
+    # "Clickjacking" names one way of abusing framing: overlaying a
+    # decoy on the framed page. The finding is about the framing, which
+    # is what was observed.
+    "cross_site_framing": _issue(
+        "MEDIUM", "Cross-Site Framing",
+        "Nothing in the response restricts which origins may embed the "
+        "page: there is no CSP frame-ancestors directive and no effective "
+        "X-Frame-Options. A page another site can embed can be overlaid or "
+        "framed invisibly, so a user's click or keystroke lands somewhere "
+        "they did not intend.",
+        "Add frame-ancestors 'self' (or an explicit allow-list) to the "
+        "Content-Security-Policy, and send X-Frame-Options: DENY for older "
+        "browsers.",
+        "CWE-1021"),
     "csp_clickjacking": _issue(
-        "LOW", "CSP allows clickjacking",
+        # Kept so saved scans and muted-issue files that reference the
+        # old key still resolve. New findings use cross_site_framing.
+        "LOW", "Cross-Site Framing (CSP frame-ancestors missing)",
         "The policy has no frame-ancestors directive, so the page can be "
         "framed by any origin.",
         "Add frame-ancestors 'self' (or an explicit allow-list).",
@@ -397,7 +421,7 @@ ISSUES = {
         # the absence of framing protection is directly exploitable — it is
         # the whole precondition for clickjacking. The header is named in
         # the title so the finding is searchable by it in a report.
-        "MEDIUM", "X-Frame-Options missing \u2014 no framing protection",
+        "MEDIUM", "Cross-Site Framing (no X-Frame-Options)",
         "The page can be embedded in a frame on another origin, which is what "
         "clickjacking needs. Neither X-Frame-Options nor a CSP "
         "frame-ancestors directive is set, so any site can frame this one "

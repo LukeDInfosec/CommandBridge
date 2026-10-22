@@ -87,6 +87,13 @@ class Detector:
     #: What class of problem this is, in the application's own terms.
     vuln_class: str = "misconfiguration"
 
+    #: The PRODUCT, where the detector identifies one. Separate from
+    #: ``name``, which is the finding's title: an explanation that says
+    #: "<title> is reachable at <path>" reads as "JAMon administrative
+    #: interface is reachable is reachable at …" when the two are the
+    #: same string.
+    component: str = ""
+
     #: Severity if the finding is established. NOT the severity it is
     #: reported at when it is not — see ceiling.
     severity_if_confirmed: str = "MEDIUM"
@@ -249,6 +256,11 @@ NIKTO = {
     ),
     "jamon_admin": Detector(
         name="JAMon administrative interface is reachable",
+        # The product name only. Saying "not a JavaScript package" here
+        # puts the words into the finding, which is the opposite of the
+        # point — the finding should simply be accurate about what JAMon
+        # is. The distinction is recorded in notes, below.
+        component="JAMon (Java Application Monitor)",
         issue_key="component_admin_exposed",
         vuln_class="component identification",
         severity_if_confirmed="MEDIUM",

@@ -47,6 +47,7 @@ from PyQt6.QtWidgets import QMessageBox
 from command_bridge.constants import BASE_DIR
 from command_bridge.modules import cb_control, cb_evidence, cb_issues
 from command_bridge.modules import detector_registry, risk, verification
+from command_bridge.modules import cipher_properties, csp_analysis, explanations
 from command_bridge.modules.cb_control import RunGate, Stopped
 from command_bridge.modules.cb_evidence import Evidence
 from command_bridge.modules.cb_issues import ISSUES, clean_title
@@ -81,6 +82,25 @@ SEV_ORDER = {name: index for index, name in enumerate(reversed(SEVERITIES))}
 #: Deliberately the same words as the console's own highlighter, so a finding
 #: printed to the console is coloured without any extra work.
 SEV_TAG = {s: f"[{s}]" for s in SEVERITIES}
+
+
+def _bytes_in(lines):
+    """The body size out of a verifier evidence line, or 0."""
+    for line in lines or []:
+        match = re.search(r"(\d+)\s+bytes", str(line))
+        if match:
+            return int(match.group(1))
+    return 0
+
+
+def _version_in(lines):
+    """The version a verifier read, or ""."""
+    for line in lines or []:
+        match = re.search(r"version\s+([0-9]+(?:\.[0-9]+){0,3})\b",
+                          str(line), re.I)
+        if match:
+            return match.group(1)
+    return ""
 
 
 def _state_for(status):
@@ -297,7 +317,10 @@ class _CBWorker(QObject):
 SECURITY_HEADERS = {
     "content-security-policy": "csp_missing",
     "strict-transport-security": "hsts_missing",
-    "x-frame-options": "xfo_missing",
+    # x-frame-options is deliberately NOT here. Framing is assessed from
+    # both headers together — see the framing block in probe_headers —
+    # rather than reported as one more missing header, which produced two
+    # findings for one weakness on any host that had neither.
     "x-content-type-options": "nosniff_missing",
     "referrer-policy": "referrer_policy",
     "permissions-policy": "permissions_policy",
@@ -347,8 +370,10 @@ def analyse_csp(policy):
 
     if "object-src" not in directives or "base-uri" not in directives:
         found.append("csp_missing_object_base")
-    if "frame-ancestors" not in directives:
-        found.append("csp_clickjacking")
+    # frame-ancestors is NOT judged here any more. A missing directive
+    # is only a finding once X-Frame-Options has also been looked at,
+    # and that needs the response — see the framing block in
+    # probe_headers, which assesses both together.
     if "form-action" not in directives:
         found.append("csp_form_hijack")
     return found
@@ -555,6 +580,28 @@ def probe_headers(context, report):
             findings.append(_finding_from(
                 key, response.url,
                 f"Content-Security-Policy: {policy[:500]}", "headers"))
+
+    # ── framing, assessed once from everything that governs it ──────────
+    #
+    # frame-ancestors, X-Frame-Options and the Report-Only policy
+    # together. default-src is not a fallback for frame-ancestors and
+    # frame-src is a different directive, so a policy can be long,
+    # strict-looking and still place no restriction on framing — which
+    # is why this is parsed rather than pattern-matched.
+    framing = csp_analysis.assess_framing(headers=headers)
+    if framing.vulnerable:
+        explanation = explanations.explain(
+            "cross_site_framing", policy=framing, url=response.url)
+        finding = _finding_from(
+            "cross_site_framing", response.url,
+            explanation.text() if explanation else seen_headers, "headers")
+        finding.summary = explanation.text() if explanation else ""
+        finding.status_label = "Confirmed"
+        finding.impact_if_real = "MEDIUM"
+        if explanation:
+            finding.explanation = explanation.as_dict()
+        finding.framing = framing.as_dict()
+        findings.append(finding)
     if headers.get("content-security-policy-report-only") and not policy:
         findings.append(_finding_from(
             "csp_report_only", response.url,
@@ -1832,6 +1879,43 @@ class CoffeeBreakMixin:
             return False
         return bool(candidate) and candidate == target_host
 
+    def _cb_explain_detection(self, detection, outcome, issue_key):
+        """The explanation rule for a verified detection, or None.
+
+        Each rule is handed only what was actually established — the
+        status code, the content type, the body size, the version that
+        was read — so a rule cannot describe evidence that does not
+        exist.
+        """
+        verification = outcome.as_dict()
+        confirmed = outcome.status == detector_registry.CONFIRMED
+        catch_all = "catch-all" in (outcome.reason or "")
+        detector = detection.detector
+
+        if detection.detector_name == "shell_history":
+            return explanations.explain(
+                "shell_history_exposed",
+                path=detection.path or detection.url,
+                http_status=verification.get("http_status") or 0,
+                content_type=verification.get("content_type") or "",
+                body_bytes=_bytes_in(outcome.evidence),
+                confirmed=confirmed, catch_all=catch_all)
+
+        if issue_key in ("component_admin_exposed",
+                         "component_known_vulnerable"):
+            return explanations.explain(
+                issue_key, name=detector.component or detector.name,
+                version=_version_in(outcome.evidence),
+                path=detection.path or detection.url,
+                cves=detector.cves,
+                reachable=outcome.status != detector_registry.INCONCLUSIVE)
+
+        if issue_key == "sri_missing":
+            return explanations.explain(
+                "sri_missing", scripts=detection.extracted,
+                url=detection.url)
+        return None
+
     def _cb_record_detection(self, detection, stage, raw="",
                              scanner_severity="", template_tags=(),
                              template_author=""):
@@ -1867,6 +1951,14 @@ class CoffeeBreakMixin:
         title = library.get("title") or detector.name
         if detector.name and outcome.status != detector_registry.CONFIRMED:
             title = detector.name
+
+        # The explanation rule for this class, built from the structured
+        # evidence the verifier gathered. See modules/explanations.py:
+        # the point is that every sentence is selected by a value that
+        # was read, so a finding says why it was raised rather than
+        # describing its vulnerability class in the abstract.
+        explanation = self._cb_explain_detection(detection, outcome,
+                                                 issue_key)
 
         evidence_lines = list(outcome.evidence)
         if detection.extracted:
@@ -1910,7 +2002,10 @@ class CoffeeBreakMixin:
         )
         # The four fields the Findings section shows, settled here rather
         # than reconstructed by the renderer.
-        finding.summary = outcome.summary
+        finding.summary = (explanation.text() if explanation
+                           else outcome.summary)
+        if explanation:
+            finding.explanation = explanation.as_dict()
         finding.status_label = risk.status_label(outcome.status)
         finding.impact_if_real = impact
         finding.verification = outcome.as_dict()
@@ -2203,11 +2298,18 @@ class CoffeeBreakMixin:
             # So ask the server. One handshake per CBC suite, nothing
             # sent after it, and only a suite that was NEGOTIATED is
             # listed — see modules/cbc_suites.py.
-            # Structured evidence first, the scanner's own line after it.
-            # Every TLS finding the SSL/TLS Analysis has data for, not
-            # only the CBC ones.
-            listing = self._cb_tls_evidence(key)
-            if listing:
+            # An explanation first — what this check found, which
+            # property makes it a weakness, the exact suites, and what
+            # the evidence does not establish — then the structured
+            # listing, then the scanner's own line. See
+            # modules/explanations.py.
+            explanation = self._cb_explain_tls(key)
+            listing = "" if explanation else self._cb_tls_evidence(key)
+            if explanation:
+                evidence = (explanation.text()
+                            + "\n\nAs reported by the scanner:\n"
+                            + evidence)
+            elif listing:
                 evidence = (listing + "\n\nAs reported by the scanner:\n"
                             + evidence)
             detail = ISSUES[key]["detail"]
@@ -2259,23 +2361,35 @@ class CoffeeBreakMixin:
             # The suites are preserved either way, which is the point:
             # the status changes, the evidence does not.
             listing_present = bool(listing)
+            if explanation:
+                # The rule already states the limitation in its own
+                # terms; repeating the generic one underneath reads as
+                # two different qualifications of the same thing.
+                finding.explanation = explanation.as_dict()
             if key in self._TLS_PRECONDITION_ONLY:
                 finding.status_label = "Potential"
                 finding.state = cb_evidence.POTENTIAL
                 finding.confidence = "tentative"
                 finding.impact_if_real = bucket["severity"]
-                finding.summary = (
-                    (listing + "\n\n") if listing_present else ""
-                ) + (
-                    f"The configuration this attack needs is present and "
-                    f"confirmed. The attack itself was not attempted — no "
-                    f"timing measurements were taken — so whether this host "
-                    f"is exploitable is unestablished."
-                )
+                # The rule already states the limitation in its own
+                # terms, so the generic sentence below is only used when
+                # there is no rule for this check. Appending both put
+                # two near-identical qualifications under one finding.
+                if explanation:
+                    finding.summary = explanation.text()
+                else:
+                    finding.summary = (
+                        ((listing + "\n\n") if listing_present else "")
+                        + "The configuration this attack needs is present "
+                          "and confirmed. The attack itself was not "
+                          "attempted — no timing measurements were taken — "
+                          "so whether this host is exploitable is "
+                          "unestablished.")
             else:
                 finding.status_label = "Confirmed"
                 finding.impact_if_real = bucket["severity"]
-                finding.summary = listing or evidence
+                finding.summary = (explanation.text() if explanation
+                                   else (listing or evidence))
 
             self._cb_record(finding)
             produced += 1
@@ -2461,6 +2575,55 @@ class CoffeeBreakMixin:
                 },
             },
         }
+
+    def _cb_tls_suites(self):
+        """Every accepted suite, parsed into its properties.
+
+        One list for the whole run, from the structured SSL/TLS Analysis
+        results. The per-check findings then select from it by the
+        property each check is about — which is how a Lucky 13 finding
+        lists CBC suites rather than every suite the scan returned.
+        """
+        data = self._cb_tls_structured()
+        if not data:
+            return []
+        rows, seen = [], set()
+        for suites in (data.get("protocols") or {}).values():
+            for suite in suites:
+                name = suite.get("name") if isinstance(suite, dict) else suite
+                if name and name not in seen:
+                    seen.add(name)
+                    rows.append(suite)
+        if not rows:
+            # The handshake fallback records suites only under the
+            # vulnerability it enumerated them for.
+            for entry in (data.get("vulnerabilities") or {}).values():
+                for suite in entry.get("suites") or []:
+                    name = suite.get("name")
+                    if name and name not in seen:
+                        seen.add(name)
+                        rows.append(suite)
+        return cipher_properties.parse_all(rows)
+
+    def _cb_explain_tls(self, key):
+        """The explanation rule for one TLS check, or None.
+
+        Driven by the suites the check's own property selects. Nothing is
+        derived from searching every suite name for a substring.
+        """
+        suites = self._cb_tls_suites()
+        host, port = self._cb_tls_host_port()
+        where = f"{host}:{port}"
+        data = self._cb_tls_structured()
+
+        if key == "obsolete_protocol":
+            versions = sorted((data.get("deprecated_protocols") or {}).keys())
+            return explanations.explain(
+                key, versions=versions, host=where,
+                suites_by_version=data.get("protocols") or {})
+        if not suites:
+            return None
+        return explanations.explain(key, suites=suites, host=where)
 
     def _cb_tls_evidence(self, key):
         """Structured evidence for one TLS finding, or "".
