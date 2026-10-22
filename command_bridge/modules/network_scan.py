@@ -27,8 +27,14 @@ class NetworkScanMixin:
              "nmap -sV -sC -p- -T4 {TARGET_HOST} -oN {SAFE_TARGET}_nmap_full.txt"),
             ("UDP Scan", "net_nmap_udp",
              "nmap -sU --top-ports 200 -T4 {TARGET_HOST} -oN {SAFE_TARGET}_nmap_udp.txt"),
+            # --json writes the same results as structure beside the text
+            # report, so Coffee Break can populate its TLS findings from
+            # this scan rather than running a second one. The printed
+            # output is unchanged.
             ("SSL/TLS Analysis", "net_sslyze",
-             "python3 {CB_DIR}/command_bridge/modules/ssl_cipher_check.py {TARGET_HOST} 2>&1 | tee {SAFE_TARGET}_ssl_ciphers.txt"),
+             "python3 {CB_DIR}/command_bridge/modules/ssl_cipher_check.py "
+             "{TARGET_HOST} --json {SAFE_TARGET}_ssl_ciphers.json 2>&1 "
+             "| tee {SAFE_TARGET}_ssl_ciphers.txt"),
             ("Nikto Web Scan", "net_nikto",
              "nikto -h '{TARGET}' -o {SAFE_TARGET}_nikto.txt 2>&1"),
             ("Nuclei Scan", "net_nuclei",

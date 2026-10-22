@@ -46,6 +46,7 @@ from PyQt6.QtWidgets import QMessageBox
 
 from command_bridge.constants import BASE_DIR
 from command_bridge.modules import cb_control, cb_evidence, cb_issues
+from command_bridge.modules import detector_registry, risk, verification
 from command_bridge.modules.cb_control import RunGate, Stopped
 from command_bridge.modules.cb_evidence import Evidence
 from command_bridge.modules.cb_issues import ISSUES, clean_title
@@ -80,6 +81,22 @@ SEV_ORDER = {name: index for index, name in enumerate(reversed(SEVERITIES))}
 #: Deliberately the same words as the console's own highlighter, so a finding
 #: printed to the console is coloured without any extra work.
 SEV_TAG = {s: f"[{s}]" for s in SEVERITIES}
+
+
+def _state_for(status):
+    """A registry status → the finding-state vocabulary already in use.
+
+    Two scales exist for good reasons: cb_evidence.STATES describes how
+    far a finding has travelled, and the registry's statuses describe
+    what a reader should do about it. Mapping rather than replacing keeps
+    the existing table, colouring and report grouping working.
+    """
+    return {
+        detector_registry.CONFIRMED: cb_evidence.VALIDATED,
+        detector_registry.POTENTIAL: cb_evidence.POTENTIAL,
+        detector_registry.INCONCLUSIVE: cb_evidence.INCONCLUSIVE,
+        detector_registry.INFORMATIONAL: cb_evidence.DETECTED,
+    }.get(str(status or "").upper(), cb_evidence.DETECTED)
 
 
 def _same_location(first, second):
@@ -1764,6 +1781,145 @@ class CoffeeBreakMixin:
         self._cb_findings = [f for f in self._cb_findings
                              if id(f) not in doomed]
 
+    # ── the validation pipeline ──────────────────────────────────────────
+    #
+    # A detector hit goes through the same six stages whichever scanner
+    # raised it, and each stage is allowed to know only what the one
+    # before it established:
+    #
+    #   1 raw detection     the scanner's line, kept verbatim
+    #   2 normalisation     detector_registry.classify_* → Detection
+    #   3 classification    the registry entry's own semantics
+    #   4 evidence          what the detector did and did not show
+    #   5 verification      verification.Verifier, when safe
+    #   6 final rating      risk.assess — impact capped by confirmation
+    #
+    # Reporting is stage 7 and lives in cb_evidence.summary_html.
+
+    def _cb_verifier(self):
+        """The verifier for this run, built once.
+
+        Uses the scan's own session factory, so verification requests
+        carry the operator's custom headers and proxy setting and are
+        subject to the same timeouts as everything else.
+        """
+        existing = getattr(self, "_cb_verifier_instance", None)
+        if existing is not None:
+            return existing
+
+        def session_for(url):
+            return _session({"url": url, "headers": self._cb_extra_headers()})
+
+        verifier = verification.Verifier(
+            session_for,
+            report=lambda line: self.console.append_ansi(f"      {line}\n"),
+            in_scope=self._cb_in_scope)
+        self._cb_verifier_instance = verifier
+        return verifier
+
+    def _cb_in_scope(self, url):
+        """Is this URL part of what we were asked to scan?
+
+        Verification only ever re-requests a path a scanner already
+        reported on the target, so this is a guard against a malformed
+        path escaping to another host rather than a scope engine.
+        """
+        try:
+            target_host = urllib.parse.urlparse(
+                self._cb_target_url()).netloc.lower()
+            candidate = urllib.parse.urlparse(url).netloc.lower()
+        except Exception:                                   # noqa: BLE001
+            return False
+        return bool(candidate) and candidate == target_host
+
+    def _cb_record_detection(self, detection, stage, raw="",
+                             scanner_severity="", template_tags=(),
+                             template_author=""):
+        """Stages 4-6, then record. Returns 1 if reported, else 0."""
+        detector = detection.detector
+        detection.scanner_severity = (scanner_severity
+                                      or detection.scanner_severity)
+
+        outcome = self._cb_verifier().run(detection)
+        detection.status = outcome.status
+
+        issue_key = detector.issue_key
+        library = cb_issues.ISSUES.get(issue_key, {}) if issue_key else {}
+        impact_severity = library.get("severity") or \
+            detector.severity_if_confirmed
+
+        reported, impact, note = risk.assess(
+            impact_severity, outcome.status,
+            vuln_class=issue_key or detector.vuln_class,
+            scanner_severity=detection.scanner_severity,
+            verified=outcome.verified)
+
+        # A confirmed file exposure is a different issue from the
+        # signature that led to it, and the library has an entry for it.
+        if outcome.status == detector_registry.CONFIRMED and \
+                detection.detector_name == "shell_history":
+            issue_key = "shell_history_exposed"
+            library = cb_issues.ISSUES[issue_key]
+            reported, impact, note = risk.assess(
+                library["severity"], outcome.status,
+                vuln_class=issue_key, verified=True)
+
+        title = library.get("title") or detector.name
+        if detector.name and outcome.status != detector_registry.CONFIRMED:
+            title = detector.name
+
+        evidence_lines = list(outcome.evidence)
+        if detection.extracted:
+            evidence_lines.append(
+                "extracted by the scanner: "
+                + ", ".join(str(x) for x in detection.extracted)[:300])
+        if note:
+            evidence_lines.append(note)
+
+        proof = Evidence(
+            target=self.target,
+            url=detection.url or self._cb_target_url(),
+            detector=detection.scanner,
+            template_id=detection.detector_id,
+            template_name=detector.name,
+            template_severity=detection.scanner_severity,
+            template_tags=list(template_tags or []),
+            template_author=template_author,
+            extracted=list(detection.extracted),
+            raw=raw or detection.raw,
+            observed=outcome.summary,
+        )
+
+        finding = CBFinding(
+            severity=reported,
+            title=title,
+            where=detection.url or self._cb_target_url(),
+            detail=library.get("detail", "") or detector.notes,
+            evidence="\n".join(evidence_lines) or outcome.summary,
+            remediation=library.get("remediation", ""),
+            stage=stage.get("key", detection.scanner),
+            sources=[stage.get("key", detection.scanner)],
+            confidence=("firm" if outcome.status ==
+                        detector_registry.CONFIRMED else "tentative"),
+            cwe=detector.cwe or library.get("cwe", ""),
+            references=list(detector.cves) + list(
+                library.get("references", [])),
+            key=issue_key,
+            proof=proof,
+            scanner_severity=detection.scanner_severity,
+        )
+        # The four fields the Findings section shows, settled here rather
+        # than reconstructed by the renderer.
+        finding.summary = outcome.summary
+        finding.status_label = risk.status_label(outcome.status)
+        finding.impact_if_real = impact
+        finding.verification = outcome.as_dict()
+        finding.detection = detection.as_dict()
+        finding.state = _state_for(outcome.status)
+
+        self._cb_record(finding)
+        return 1 if reported != "INFO" else 0
+
     def _cb_record(self, finding):
         """Keep a finding — or, if we already have this issue, another instance.
 
@@ -2047,11 +2203,13 @@ class CoffeeBreakMixin:
             # So ask the server. One handshake per CBC suite, nothing
             # sent after it, and only a suite that was NEGOTIATED is
             # listed — see modules/cbc_suites.py.
-            if key in ("lucky13", "beast", "sweet32"):
-                listing = self._cb_cbc_evidence()
-                if listing:
-                    evidence = listing + "\n\n" + \
-                        "testssl's own line:\n" + evidence
+            # Structured evidence first, the scanner's own line after it.
+            # Every TLS finding the SSL/TLS Analysis has data for, not
+            # only the CBC ones.
+            listing = self._cb_tls_evidence(key)
+            if listing:
+                evidence = (listing + "\n\nAs reported by the scanner:\n"
+                            + evidence)
             detail = ISSUES[key]["detail"]
             title = None
             if key == "obsolete_protocol":
@@ -2087,6 +2245,38 @@ class CoffeeBreakMixin:
             for cve in bucket["cves"]:
                 if cve not in finding.references:
                     finding.references.append(cve)
+
+            # What is confirmed and what is not, kept apart.
+            #
+            # Lucky 13, BEAST, Sweet32 and ROBOT are all named ATTACKS
+            # whose precondition is a cipher or protocol being offered.
+            # The precondition is what has been established — the suites
+            # above are the evidence for it — and the attack itself has
+            # not been attempted: no timing measurements were taken and
+            # no padding oracle was exercised. Reporting these as
+            # "Confirmed" claims the second from evidence for the first.
+            #
+            # The suites are preserved either way, which is the point:
+            # the status changes, the evidence does not.
+            listing_present = bool(listing)
+            if key in self._TLS_PRECONDITION_ONLY:
+                finding.status_label = "Potential"
+                finding.state = cb_evidence.POTENTIAL
+                finding.confidence = "tentative"
+                finding.impact_if_real = bucket["severity"]
+                finding.summary = (
+                    (listing + "\n\n") if listing_present else ""
+                ) + (
+                    f"The configuration this attack needs is present and "
+                    f"confirmed. The attack itself was not attempted — no "
+                    f"timing measurements were taken — so whether this host "
+                    f"is exploitable is unestablished."
+                )
+            else:
+                finding.status_label = "Confirmed"
+                finding.impact_if_real = bucket["severity"]
+                finding.summary = listing or evidence
+
             self._cb_record(finding)
             produced += 1
         self.console.append_ansi(
@@ -2094,36 +2284,244 @@ class CoffeeBreakMixin:
             f"reporting\n")
         return produced
 
-    def _cb_cbc_evidence(self):
-        """The host's accepted CBC suites, one per line. Cached per run.
+    # ── TLS evidence: reuse the SSL/TLS Analysis, do not re-scan ─────────
+    #
+    # The suites, their key sizes and the protocol versions were already
+    # being discovered by modules/ssl_cipher_check.py — the standalone
+    # SSL/TLS Analysis button — and then printed to a terminal and
+    # discarded. That is why a Lucky 13 finding on the Findings screen
+    # could only ever carry testssl's one-line sentence: the structured
+    # data existed in the application and never reached the finding.
+    #
+    # So that module now writes its results as JSON as well as text, and
+    # this reads them. In order of preference:
+    #
+    #   1. the JSON artefact from an SSL/TLS Analysis already run for
+    #      this target — no second scan, which is the point
+    #   2. that module run once, in-process, if sslyze is importable
+    #   3. a direct handshake enumeration (modules/cbc_suites.py), which
+    #      needs no sslyze but only knows about CBC suites
+    #
+    # Everything is cached per run and keyed by host and port, so
+    # repeated scans cannot mix one target's ciphers into another's
+    # finding.
 
-        Returns "" when nothing could be enumerated — a TLS port that
-        cannot be reached is not evidence that there are no CBC suites,
-        so the finding keeps testssl's wording rather than gaining a
-        claim this did not establish.
-        """
-        cached = getattr(self, "_cb_cbc_listing", None)
-        if cached is not None:
-            return cached
-        from command_bridge.modules import cbc_suites
-        host = self.get_scanner_target()
+    #: registry of library key → the vulnerability name ssl_cipher_check
+    #: uses, so every TLS finding gets its own structured evidence rather
+    #: than only Lucky 13.
+    #: Findings named after an ATTACK whose precondition is a cipher or
+    #: protocol being offered. The precondition is confirmed; the attack
+    #: is not, and the two must not be reported as one.
+    _TLS_PRECONDITION_ONLY = frozenset({
+        "lucky13", "beast", "sweet32", "robot", "crime", "breach",
+        "logjam", "freak", "drown", "poodle",
+    })
+
+    _TLS_EVIDENCE_FOR = {
+        "lucky13": "Lucky13",
+        "sweet32": "Sweet32",
+        "rc4": "RC4",
+        "robot": "ROBOT (static RSA)",
+        "freak": "EXPORT / FREAK",
+        "null_cipher": "NULL encryption",
+        "anonymous_cipher": "Anonymous (no server auth)",
+        "weak_cipher": "",            # handled as "every weak suite"
+    }
+
+    def _cb_tls_host_port(self):
         parsed = urllib.parse.urlparse(self._cb_target_url())
-        port = parsed.port or (443 if parsed.scheme == "https" else 443)
-        listing = ""
+        return (self.get_scanner_target(), parsed.port or 443)
+
+    def _cb_tls_structured(self):
+        """The SSL/TLS Analysis results as structure, or {}.
+
+        Cached, and the cache key includes the host and port so a second
+        target in the same session cannot inherit the first's ciphers.
+        """
+        host, port = self._cb_tls_host_port()
+        cache = getattr(self, "_cb_tls_cache", None)
+        if cache is None:
+            cache = self._cb_tls_cache = {}
+        if (host, port) in cache:
+            return cache[(host, port)]
+
+        data = self._cb_tls_from_artefact(host, port) or \
+            self._cb_tls_from_sslyze(host, port) or \
+            self._cb_tls_from_handshakes(host, port)
+        cache[(host, port)] = data or {}
+        return cache[(host, port)]
+
+    def _cb_tls_from_artefact(self, host, port):
+        """An SSL/TLS Analysis already run for this target."""
+        safe = self.sanitize_target_for_filename(self.target)
+        path = Path(self.output_dir) / f"{safe}_ssl_ciphers.json"
+        try:
+            if not path.is_file():
+                return {}
+            data = json.loads(path.read_text(errors="replace"))
+        except Exception as exc:                            # noqa: BLE001
+            self.console.append_ansi(
+                f"    [i] could not read {path.name}: {exc}\n")
+            return {}
+        if not isinstance(data, dict) or not data.get("protocols"):
+            return {}
+        # Belt and braces against mixing targets: the file says which
+        # host it was produced for, and a mismatch is not usable evidence
+        # however convenient it would be.
+        if str(data.get("host", "")).lower() not in ("", host.lower()):
+            self.console.append_ansi(
+                f"    [i] {path.name} was produced for "
+                f"{data.get('host')}, not {host} — not using it\n")
+            return {}
+        self.console.append_ansi(
+            f"    reusing the SSL/TLS Analysis results for {host}:{port} "
+            f"({data.get('suite_count', 0)} cipher suites)\n")
+        return data
+
+    def _cb_tls_from_sslyze(self, host, port):
+        """Run the standalone module's own scan once, in-process.
+
+        Only while a Coffee Break run is actually in progress. Parsing a
+        saved report is not a reason to open connections to a host: the
+        parser is called when re-reading artefacts, from tests, and from
+        the report writer, and a full cipher enumeration fired from any
+        of those is exactly the unnecessary duplicate scan this reuse
+        was meant to avoid. Outside a live run the cheaper fallbacks
+        apply, or the finding keeps the scanner's own line.
+        """
+        if not getattr(self, "_cb_active", False):
+            return {}
+        try:
+            from command_bridge.modules import ssl_cipher_check as scc
+        except Exception:                                   # noqa: BLE001
+            return {}
+        try:
+            import sslyze                                   # noqa: F401
+        except Exception:                                   # noqa: BLE001
+            return {}
         try:
             self.console.append_ansi(
-                f"    enumerating CBC cipher suites on {host}:{port} "
-                f"so the finding can name them\n")
-            suites = cbc_suites.offered(host, port, report=lambda line: None)
-            listing = cbc_suites.as_evidence(suites, f"{host}:{port}")
-            if suites:
-                self.console.append_ansi(
-                    f"    {len(suites)} CBC suite(s) accepted\n")
-        except Exception as exc:                        # noqa: BLE001
+                f"    running the SSL/TLS cipher analysis for "
+                f"{host}:{port}\n")
+            result = scc.scan_full(host, port)
+            if result is None:
+                return {}
+            accepted = scc.get_accepted_ciphers(result)
+            flat = scc.all_ciphers_flat(accepted)
+            data = scc.structured_result(host, port, accepted, flat)
+            # Leave the artefact behind so the next stage, and the
+            # standalone button, do not repeat the work.
+            safe = self.sanitize_target_for_filename(self.target)
+            scc.write_structured(
+                str(Path(self.output_dir) / f"{safe}_ssl_ciphers.json"),
+                host, port, accepted, flat)
+            return data
+        except Exception as exc:                            # noqa: BLE001
             self.console.append_ansi(
-                f"    [i] could not enumerate CBC suites: {exc}\n")
-        self._cb_cbc_listing = listing
-        return listing
+                f"    [i] the cipher analysis did not complete: {exc}\n")
+            return {}
+
+    def _cb_tls_from_handshakes(self, host, port):
+        """Last resort: ask the server directly, one CBC suite at a time.
+
+        Gated the same way and for the same reason — it opens one
+        connection per suite, which is not something a parser should do
+        when nobody asked for a scan.
+
+        Needs no sslyze. Only knows about CBC suites, so it populates
+        Lucky 13 and nothing else — which is better than a finding with
+        no evidence in it, and is reported as the narrower source it is.
+        """
+        if not getattr(self, "_cb_active", False):
+            return {}
+        try:
+            from command_bridge.modules import cbc_suites
+            suites = cbc_suites.offered(host, port)
+        except Exception:                                   # noqa: BLE001
+            return {}
+        if not suites:
+            return {}
+        self.console.append_ansi(
+            f"    sslyze is not available — enumerated {len(suites)} CBC "
+            f"suite(s) by handshake instead\n")
+        return {
+            "tool": "cbc_suites",
+            "host": host,
+            "port": port,
+            "protocols": {},
+            "deprecated_protocols": {},
+            "suite_count": len(suites),
+            "vulnerabilities": {
+                "Lucky13": {
+                    "name": "Lucky13",
+                    "description": "Timing side-channel on CBC-mode HMAC "
+                                   "padding — CVE-2013-0169",
+                    "suites": [{"name": name, "bits": bits}
+                               for name, bits, _ in suites],
+                },
+            },
+        }
+
+    def _cb_tls_evidence(self, key):
+        """Structured evidence for one TLS finding, or "".
+
+        Returns the suite names and key sizes, one per line, exactly as
+        the SSL/TLS Analysis reports them — which is what a report needs
+        and what a generic description cannot provide.
+        """
+        data = self._cb_tls_structured()
+        if not data:
+            return ""
+        host, port = self._cb_tls_host_port()
+        name = self._TLS_EVIDENCE_FOR.get(key)
+
+        if key == "obsolete_protocol":
+            rows = data.get("deprecated_protocols") or {}
+            if not rows:
+                return ""
+            lines = [f"Deprecated protocol versions accepted by "
+                     f"{host}:{port}:"]
+            for version, detail in sorted(rows.items()):
+                lines.append(f"  {version}  —  {detail.get('reason', '')}")
+                suites = (data.get("protocols") or {}).get(version) or []
+                for suite in suites[:8]:
+                    lines.append(f"      {suite['name']}  "
+                                 f"{suite.get('bits') or ''}".rstrip())
+            return "\n".join(lines)
+
+        if name:
+            entry = (data.get("vulnerabilities") or {}).get(name)
+            if not entry or not entry.get("suites"):
+                return ""
+            suites = entry["suites"]
+            width = max(len(s["name"]) for s in suites)
+            lines = [f"{len(suites)} cipher suite(s) accepted by "
+                     f"{host}:{port} match this:"]
+            for suite in suites:
+                bits = suite.get("bits")
+                lines.append(f"  {suite['name'].ljust(width)}"
+                             + (f"  {bits}" if bits else ""))
+            return "\n".join(lines)
+
+        if key == "weak_cipher":
+            protocols = data.get("protocols") or {}
+            if not protocols:
+                return ""
+            lines = [f"Cipher suites accepted by {host}:{port}:"]
+            for version in ("SSL 2.0", "SSL 3.0", "TLS 1.0", "TLS 1.1",
+                            "TLS 1.2", "TLS 1.3"):
+                suites = protocols.get(version) or []
+                if not suites:
+                    continue
+                lines.append(f"  {version}")
+                for suite in suites[:12]:
+                    bits = suite.get("bits")
+                    lines.append(f"      {suite['name']}"
+                                 + (f"  {bits}" if bits else ""))
+                if len(suites) > 12:
+                    lines.append(f"      … and {len(suites) - 12} more")
+            return "\n".join(lines)
+        return ""
 
     def _cb_testssl_records(self, stage, text):
         """testssl's JSON if it wrote any, otherwise its console output.
@@ -2203,6 +2601,23 @@ class CoffeeBreakMixin:
 
             if cb_issues.is_statement(body):
                 continue                      # the scan talking about itself
+
+            # Same order as nuclei, same reason. Nikto's plugin id and
+            # the path it names identify the check; its sentence is an
+            # explanation written for a human. "[007303] /JAMonAdmin.jsp:
+            # … Versions 2.7 and earlier contain XSS vulnerabilities" was
+            # matching the reflected-XSS pattern, so an admin interface
+            # became a HIGH CWE-79 with no parameter, payload or
+            # reflection anywhere in it.
+            detection = detector_registry.classify_nikto(
+                body, url=self._cb_target_url())
+            if detection is not None:
+                if detection.path:
+                    detection.url = self._cb_target_url().rstrip("/") + \
+                        detection.path
+                produced += self._cb_record_detection(
+                    detection, stage, raw=clean)
+                continue
 
             key, issue = cb_issues.for_text(body)
             if not key:
@@ -2642,7 +3057,45 @@ class CoffeeBreakMixin:
             # description is metadata about the class of issue, written for a
             # human — feeding it in here is what turned weak-csp-detect into
             # a CRITICAL CWE-78.
+            tags = [str(x) for x in (info.get("tags") or [])] \
+                if isinstance(info.get("tags"), list) else []
+
+            # The detector registry decides first, because it keys on the
+            # template's IDENTITY — the one thing nuclei reports that is
+            # actually about what was tested. modules/detector_registry.py
+            # carries the history; missing-sri has an entry there because
+            # its NAME contains "Subresou(rce)" and it was being published
+            # as a CRITICAL OS command injection.
+            detection = detector_registry.classify_nuclei(
+                template, name, tags=tags, severity=severity,
+                url=matched,
+                extracted=[str(x) for x in
+                           (row.get("extracted-results") or [])])
+            if detection is not None:
+                produced += self._cb_record_detection(
+                        detection, stage, raw=line[:1200],
+                    scanner_severity=severity,
+                    template_tags=tags,
+                    template_author=", ".join(info.get("author") or [])
+                    if isinstance(info.get("author"), list)
+                    else str(info.get("author") or ""))
+                continue
+
             key, issue = cb_issues.for_nuclei(template, name)
+
+            # A template that does not test for an exploit cannot carry an
+            # exploit class, whatever its wording matched. The backstop
+            # for templates the registry does not name.
+            if key and key in risk.NEEDS_DEMONSTRATION and \
+                    not detector_registry.exploit_class_admissible(
+                        tags, severity):
+                self.console.append_ansi(
+                    f"    [i] '{name}' matched the wording for "
+                    f"{cb_issues.ISSUES.get(key, {}).get('title', key)}, "
+                    f"but template '{template}' (severity {severity}, tags "
+                    f"{', '.join(tags) or 'none'}) does not test for one — "
+                    f"keeping nuclei's own description instead\n")
+                key, issue = None, None
 
             if not key and cb_issues.is_fingerprint(template):
                 entry = f"{name} — {matched}"

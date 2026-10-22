@@ -539,8 +539,21 @@ class ActiveScanTabMixin:
             "Paste straight into Burp Repeater.")
         self.as_burp_btn.setEnabled(False)
         self.as_burp_btn.clicked.connect(self._as_copy_burp)
-        right_box.addWidget(self.as_burp_btn,
-                            alignment=Qt.AlignmentFlag.AlignLeft)
+
+        self.as_technical_btn = QPushButton("Technical detail")
+        self.as_technical_btn.setObjectName("secondaryButton")
+        self.as_technical_btn.setToolTip(
+            "Show the full evidence chain, raw detection, proof of concept "
+            "and false-positive indicators. The summary above is "
+            "deliberately short; nothing is discarded by hiding this.")
+        self.as_technical_btn.clicked.connect(self._as_toggle_technical)
+
+        as_detail_buttons = QHBoxLayout()
+        as_detail_buttons.setSpacing(8)
+        as_detail_buttons.addWidget(self.as_technical_btn)
+        as_detail_buttons.addWidget(self.as_burp_btn)
+        as_detail_buttons.addStretch()
+        right_box.addLayout(as_detail_buttons)
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
@@ -1094,12 +1107,34 @@ class ActiveScanTabMixin:
         # produced it — state, rationale, observed evidence, PoC, Burp
         # request, false-positive indicators, raw detection and all.
         shared = self._as_shared(finding)
-        self.as_detail.setHtml(cb_evidence.detail_html(shared))
+        # Concise by default here too — same four fields, same toggle
+        # semantics as the Coffee Break tab. The Active Scan's findings
+        # arrive with real evidence far more often, so most of them show
+        # as Confirmed rather than Potential; the renderer does not need
+        # to know which screen it is drawing for.
+        self._as_detail_finding = shared
+        if getattr(self, "_as_show_technical", False):
+            self.as_detail.setHtml(cb_evidence.detail_html(shared))
+        else:
+            self.as_detail.setHtml(cb_evidence.summary_html(shared))
         self._as_burp = cb_evidence.burp_request_for(shared)
         self.as_burp_btn.setEnabled(bool(self._as_burp))
         self.as_burp_btn.setText(
             "Copy Burp Request" if self._as_burp
             else "No request captured for this finding")
+
+    def _as_toggle_technical(self):
+        self._as_show_technical = not getattr(self, "_as_show_technical",
+                                              False)
+        self.as_technical_btn.setText(
+            "Hide technical detail" if self._as_show_technical
+            else "Technical detail")
+        finding = getattr(self, "_as_detail_finding", None)
+        if finding is not None:
+            self.as_detail.setHtml(
+                cb_evidence.detail_html(finding)
+                if self._as_show_technical
+                else cb_evidence.summary_html(finding))
 
     def _as_copy_burp(self):
         if not getattr(self, "_as_burp", ""):

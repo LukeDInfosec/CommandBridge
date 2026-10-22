@@ -902,6 +902,143 @@ def _esc(text):
             .replace(">", "&gt;"))
 
 
+def summary_html(finding):
+    """The Findings section: four fields, nothing else.
+
+    Finding Name, Risk Rating, Confirmation Status, What was found.
+
+    The pane this replaces carried the generic description of the issue
+    class, a reproduction recipe, an impact narrative, a
+    "what could explain this without the vulnerability" list and a
+    remediation paragraph — for every finding, whether or not any of it
+    was supported by what had actually been observed. On a finding whose
+    classification was wrong, all of it was wrong together, and the
+    volume made the one line that mattered ("no injection point was
+    identified") easy to miss.
+
+    None of that evidence is discarded: detail_html still renders it in
+    full behind the Technical detail toggle, and _cb_as_text still
+    copies it. This function only decides what is shown first.
+    """
+    severity = getattr(finding, "severity", "INFO")
+    colour = SEV_COLOURS.get(severity, "#8b9bb4")
+    status = (getattr(finding, "status_label", "")
+              or _status_label_from_state(getattr(finding, "state", "")))
+    impact = getattr(finding, "impact_if_real", "")
+    summary = (getattr(finding, "summary", "")
+               or _observation_from_evidence(finding)
+               or finding.evidence or "")
+
+    rating = {"INFO": "Informational"}.get(severity, severity.capitalize())
+    if impact and impact != severity:
+        rating += (f" <span style='color:#8b9bb4;font-weight:normal'>"
+                   f"({impact.capitalize()} if confirmed)</span>")
+
+    html = [
+        f"<h3 style='margin:0 0 10px 0;color:{colour}'>{_esc(finding.title)}"
+        f"</h3>",
+        "<table cellspacing='0' cellpadding='0' "
+        "style='margin:0 0 12px 0'>",
+        _summary_row("Risk rating", rating, raw=True),
+        _summary_row("Confirmation", _esc(status)),
+    ]
+    where = getattr(finding, "where", "")
+    if where:
+        html.append(_summary_row("Affected", _esc(str(where))))
+    sources = [s for s in (getattr(finding, "sources", []) or []) if s]
+    if sources:
+        html.append(_summary_row("Detected by", _esc(", ".join(sources))))
+    html.append("</table>")
+
+    html.append("<p style='margin:0 0 4px 0'><b>What was found</b></p>")
+    html.append(
+        "<div style='white-space:pre-wrap;font-family:monospace;"
+        "font-size:12px;background:#11161d;padding:10px;border-radius:6px;"
+        f"border:1px solid #27333f'>{_esc(str(summary).strip())}</div>")
+
+    instances = [i for i in (getattr(finding, "instances", []) or []) if i]
+    if instances:
+        html.append(
+            f"<p style='margin:10px 0 0 0;color:#8b9bb4'>Also seen at "
+            f"{len(instances)} other location(s).</p>")
+    return "".join(html)
+
+
+def _observation_from_evidence(finding):
+    """"What was found", composed from the evidence chain.
+
+    Findings that come through the validation pipeline carry a summary
+    written by their verifier. The Active Scan's do not — it exploits
+    things itself and records what it did in an Evidence object — so the
+    observation is assembled from that: where the input went in, what
+    was sent, and what came back that proves it.
+
+    This is why the concise view is not simply a truncation. A one-line
+    "reported by nuclei at <url>" tells a reader nothing; the parameter
+    and the payload are the finding.
+    """
+    proof = getattr(finding, "proof", None)
+    if proof is None:
+        return ""
+    parts = []
+    if getattr(proof, "observed", ""):
+        parts.append(str(proof.observed).strip())
+
+    point = getattr(proof, "parameter", "") or getattr(proof, "point", "")
+    if point:
+        parts.append(f"Injection point: {point}")
+    payload = getattr(proof, "payload", "")
+    if payload:
+        parts.append(f"Payload: {payload}")
+
+    if getattr(proof, "has_differential", None) and proof.has_differential():
+        parts.append("The true and false cases produced different "
+                     "responses, which is what distinguishes this from a "
+                     "page that merely echoes input.")
+    if getattr(proof, "has_timing", None) and proof.has_timing():
+        parts.append("Timing measurements were taken and are in the "
+                     "technical detail.")
+    if getattr(proof, "has_oob", None) and proof.has_oob():
+        parts.append("An out-of-band interaction was observed.")
+
+    status = getattr(proof, "status_code", "")
+    if status:
+        parts.append(f"Response: HTTP {status}")
+
+    # The request that demonstrated it. For a confirmed injection this
+    # IS the observation — a summary of a differential SQLi that does not
+    # show the request that produced the difference has left out the
+    # evidence and kept the claim.
+    request = str(getattr(proof, "request", "") or "").strip()
+    if request:
+        first = request.splitlines()[0][:200]
+        parts.append(f"Request: {first}")
+    return "\n".join(p for p in parts if p)
+
+
+def _summary_row(label, value, raw=False):
+    return (f"<tr><td style='padding:1px 14px 1px 0;color:#8b9bb4'>{label}"
+            f"</td><td style='padding:1px 0'>"
+            f"{value if raw else value}</td></tr>")
+
+
+def _status_label_from_state(state):
+    """A finding that predates the validation pipeline still has a state.
+
+    Backward compatibility: scan results saved before the pipeline
+    existed carry only ``state``, so the Findings section derives the
+    status from it rather than showing an empty cell.
+    """
+    return {
+        CONFIRMED: "Confirmed",
+        VALIDATED: "Confirmed",
+        POTENTIAL: "Potential",
+        INCONCLUSIVE: "Inconclusive",
+        DETECTED: "Potential",
+        FALSE_POSITIVE: "False positive",
+    }.get(str(state or "").upper(), "Inconclusive")
+
+
 def detail_html(finding):
     """One finding, rendered for a detail pane.
 

@@ -431,6 +431,14 @@ class CoffeeBreakTabMixin:
         right_box.setContentsMargins(0, 0, 0, 0)
         right_box.setSpacing(6)
         right_box.addWidget(self.cb_detail)
+        self.cb_technical_btn = QPushButton("Technical detail")
+        self.cb_technical_btn.setObjectName("secondaryButton")
+        self.cb_technical_btn.setToolTip(
+            "Show the full evidence chain, raw scanner output, proof of "
+            "concept, false-positive indicators and remediation for this "
+            "finding. The summary above is deliberately short; nothing is "
+            "discarded by hiding this.")
+        self.cb_technical_btn.clicked.connect(self._cb_toggle_technical)
         self.cb_burp_btn = QPushButton("Copy Burp Request")
         self.cb_burp_btn.setObjectName("secondaryButton")
         self.cb_burp_btn.setToolTip(
@@ -439,8 +447,12 @@ class CoffeeBreakTabMixin:
             "Paste straight into Burp Repeater.")
         self.cb_burp_btn.setEnabled(False)
         self.cb_burp_btn.clicked.connect(self._cb_copy_burp)
-        right_box.addWidget(self.cb_burp_btn,
-                            alignment=Qt.AlignmentFlag.AlignLeft)
+        detail_buttons = QHBoxLayout()
+        detail_buttons.setSpacing(8)
+        detail_buttons.addWidget(self.cb_technical_btn)
+        detail_buttons.addWidget(self.cb_burp_btn)
+        detail_buttons.addStretch()
+        right_box.addLayout(detail_buttons)
         splitter.addWidget(right)
         # The list is a fixed-ish index; the evidence takes the rest.
         splitter.setStretchFactor(0, 0)
@@ -708,14 +720,40 @@ class CoffeeBreakTabMixin:
                 break
         if finding is None:
             return
-        # The Active Scan tab renders its findings with this same
-        # function. Two screens, one description of what a finding is.
-        self.cb_detail.setHtml(cb_evidence.detail_html(finding))
+        # The Active Scan tab renders its findings with these same
+        # functions. Two screens, one description of what a finding is.
+        #
+        # Concise by default: name, rating, status, what was found. The
+        # full technical rendering — raw scanner output, evidence chain,
+        # PoC, false-positive indicators, remediation — is one click
+        # away and is still what "Copy this finding" produces, so
+        # nothing is lost from the record by not showing it first.
+        self._cb_detail_finding = finding
+        self._cb_render_detail()
         self._cb_burp = cb_evidence.burp_request_for(finding)
         self.cb_burp_btn.setEnabled(bool(self._cb_burp))
         self.cb_burp_btn.setText(
             "Copy Burp Request" if self._cb_burp
             else "No request captured for this finding")
+
+    def _cb_render_detail(self):
+        """Draw the selected finding at the current level of detail."""
+        finding = getattr(self, "_cb_detail_finding", None)
+        if finding is None:
+            self.cb_detail.clear()
+            return
+        if getattr(self, "_cb_show_technical", False):
+            self.cb_detail.setHtml(cb_evidence.detail_html(finding))
+        else:
+            self.cb_detail.setHtml(cb_evidence.summary_html(finding))
+
+    def _cb_toggle_technical(self):
+        self._cb_show_technical = not getattr(self, "_cb_show_technical",
+                                              False)
+        self.cb_technical_btn.setText(
+            "Hide technical detail" if self._cb_show_technical
+            else "Technical detail")
+        self._cb_render_detail()
 
     def _cb_copy_burp(self):
         if not getattr(self, "_cb_burp", ""):

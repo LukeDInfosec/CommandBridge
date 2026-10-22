@@ -15,6 +15,9 @@ Comprehensive SSL/TLS assessment using sslyze covering:
 Usage:  python3 ssl_cipher_check.py <host>[:<port>]
 """
 
+import json
+import os
+import time
 import re
 import sys
 import ssl
@@ -217,11 +220,27 @@ def check_http_security(host, port):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <host>[:<port>]")
+    # --json <path> writes the same results as structured data as well
+    # as printing them. Added so Coffee Break can REUSE this scan instead
+    # of running its own: the cipher suites, their key sizes and the
+    # protocol versions were already being discovered here and then
+    # thrown away at the edge of a terminal, which is why a Lucky 13
+    # finding on the Findings screen could only ever carry testssl's
+    # one-line sentence. The text output is unchanged.
+    argv = [a for a in sys.argv[1:]]
+    json_path = ""
+    if "--json" in argv:
+        index = argv.index("--json")
+        if index + 1 < len(argv):
+            json_path = argv[index + 1]
+            del argv[index:index + 2]
+        else:
+            del argv[index]
+    if not argv:
+        print(f"Usage: {sys.argv[0]} <host>[:<port>] [--json <file>]")
         sys.exit(1)
 
-    target = sys.argv[1].strip()
+    target = argv[0].strip()
     target = re.sub(r"^https?://", "", target, flags=re.I).split("/")[0]
 
     if ":" in target and not target.startswith("["):
@@ -601,6 +620,64 @@ def main():
     else:
         print(f"{BOLD}{GREEN}  No SSL/TLS vulnerabilities detected{RESET}")
     print(f"{BOLD}{'═' * 62}{RESET}\n")
+
+    if json_path:
+        write_structured(json_path, host, port, accepted, flat)
+
+
+def structured_result(host, port, accepted, flat):
+    """The scan as data: versions, suites with key sizes, vuln matches.
+
+    Deliberately built from the SAME `accepted` / `flat` the printed
+    report is built from, so the two cannot disagree. Every vulnerability
+    entry records which suites matched it, because the suite list is the
+    evidence a report needs and a name like "Lucky13" on its own is not.
+    """
+    vulns = {}
+    for name, description, pattern in VULNS:
+        matches = sorted(
+            ((cipher, flat[cipher]) for cipher in flat
+             if pattern.search(cipher)),
+            key=lambda row: (-(row[1] or 0), row[0]))
+        if matches:
+            vulns[name] = {
+                "name": name,
+                "description": description,
+                "suites": [{"name": cipher, "bits": bits}
+                           for cipher, bits in matches],
+            }
+    deprecated = {}
+    for version in ("SSL 2.0", "SSL 3.0", "TLS 1.0", "TLS 1.1"):
+        if version in accepted:
+            severity, reason = DEPRECATED_VERSIONS[version]
+            deprecated[version] = {"severity": severity, "reason": reason}
+    return {
+        "tool": "ssl_cipher_check",
+        "host": host,
+        "port": port,
+        "scanned_at": time.time(),
+        "protocols": {
+            version: [{"name": cipher, "bits": bits}
+                      for cipher, bits in sorted(
+                          ciphers, key=lambda r: (-(r[1] or 0), r[0]))]
+            for version, ciphers in accepted.items()
+        },
+        "deprecated_protocols": deprecated,
+        "vulnerabilities": vulns,
+        "suite_count": len(flat),
+    }
+
+
+def write_structured(path, host, port, accepted, flat):
+    try:
+        payload = structured_result(host, port, accepted, flat)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+        os.replace(tmp, path)
+        print(f"  {DIM}[i] structured results written to {path}{RESET}")
+    except Exception as exc:                                # noqa: BLE001
+        print(f"  {YELLOW}[?]{RESET}  could not write {path}: {exc}")
 
 
 if __name__ == "__main__":

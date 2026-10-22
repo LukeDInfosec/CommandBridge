@@ -43,6 +43,56 @@ def _issue(severity, title, detail, remediation, cwe="", references=()):
 
 
 ISSUES = {
+    # ── component identification, kept apart from exploitation ───────────
+    #
+    # A component fingerprint, a known-vulnerable component and a
+    # confirmed exploitable vulnerability are three findings. Collapsing
+    # them is how Nikto's JAMon line — which identifies an admin
+    # interface and mentions that old versions had XSS — was published as
+    # a HIGH reflected XSS with no parameter, payload or reflection.
+    "component_admin_exposed": _issue(
+        "MEDIUM", "Administrative interface is reachable",
+        "An administrative or monitoring interface answers on this host. "
+        "That is the finding: the interface is reachable. Whether any "
+        "historical vulnerability in the product applies depends on its "
+        "version, which is reported separately when it can be read.",
+        "Restrict the interface to trusted networks or require "
+        "authentication in front of it.",
+        "CWE-284"),
+    "component_known_vulnerable": _issue(
+        "MEDIUM", "Component version with known vulnerabilities",
+        "The component's version was established and falls in a range with "
+        "published vulnerabilities. The CVE is context about the product, "
+        "not a demonstration against this host — exploitability still "
+        "depends on configuration and exposure.",
+        "Update the component to a supported version.",
+        "CWE-1395"),
+    "sri_missing": _issue(
+        "LOW", "Subresource Integrity missing on external script",
+        "The page loads a script or stylesheet from another origin with no "
+        "integrity attribute, so the browser cannot tell whether the file "
+        "it received is the file the author intended. If that origin is "
+        "ever compromised, the script runs with this page's privileges.",
+        "Add an integrity attribute with the expected hash, plus "
+        "crossorigin, to external script and link tags.",
+        "CWE-353",
+        ("https://developer.mozilla.org/en-US/docs/Web/Security/"
+         "Subresource_Integrity",)),
+    "shell_history_exposed": _issue(
+        "HIGH", "Exposed shell history file",
+        "A shell history file is readable over HTTP and its contents were "
+        "returned. Command history routinely holds credentials passed on "
+        "the command line, internal hostnames and database connection "
+        "strings.",
+        "Remove the file from the web root and stop serving dotfiles.",
+        "CWE-200"),
+    "private_key_exposed": _issue(
+        "CRITICAL", "Exposed private key",
+        "A private key file is readable over HTTP and its contents were "
+        "returned. Whatever the key authenticates can be impersonated.",
+        "Remove the key from the web root and rotate it — treat it as "
+        "compromised.",
+        "CWE-522"),
     # ── TLS: the named attacks ───────────────────────────────────────────
     "lucky13": _issue(
         "LOW", "Lucky 13 (CBC ciphers supported)",

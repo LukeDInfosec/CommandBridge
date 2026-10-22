@@ -19,6 +19,182 @@ HOW TO USE THIS FILE
  CHANGELOG (most recent first)
 ================================================================================
 
+## 2026-10-22 — EVIDENCE-DRIVEN VALIDATION PIPELINE (6.9.2)
+
+A detector's IDENTITY now decides what a finding is. Its prose does not.
+Every classification bug in this changelog is the same bug — a check's
+meaning inferred from a sentence written about it — and fixing them one
+regex at a time has not stopped it recurring.
+
+NEW: modules/detector_registry.py, modules/verification.py, modules/risk.py
+
+1. THE REGISTRY — modules/detector_registry.py
+
+   Keyed on what a scanner reports about the check it RAN: nuclei's
+   template id, Nikto's plugin id and path, testssl's check id. An entry
+   records the canonical name, the vulnerability class, CWE, CVEs as
+   CONTEXT, what evidence would confirm it, which safe verification
+   procedure settles it, and the best status its own output can justify.
+
+   Three things an entry keeps apart, because conflating them produced
+   every report below:
+
+       WHAT THE DETECTOR FOUND    a component, a header, a path, a cipher
+       WHAT THAT WOULD MEAN       the class, if established
+       WHETHER IT IS ESTABLISHED  the evidence in hand
+
+   Unknown detectors return None and the existing handling applies, so
+   the registry constrains what it knows and leaves the rest alone.
+
+   Backstop for templates it does not name: exploit_class_admissible().
+   An INFO or LOW template with no exploit tag has not tested for an
+   exploit, so a keyword match can no longer give it an exploit class.
+
+2. VERIFICATION — modules/verification.py
+
+   Findings that ended "confirm this by hand" now get checked. GET only,
+   of a path a scanner already reported, plus one control request per
+   host to a path that cannot exist. Nothing written, no OS command, no
+   payload, no out-of-band callback.
+
+   PER CLASS, deliberately. A GET proves a file came back; it proves
+   nothing about command injection, SQLi or XSS, and a generic request
+   presented as confirmation of those would be this module's own disease.
+   A detector either names a procedure that settles its question or it
+   names none and the finding stays unconfirmed.
+
+       file_contents     did the file actually come back?
+       component_version is it reachable, and what version is it?
+       header_absent     is the header really not there?
+
+3. RISK — modules/risk.py
+
+   Severity is impact; confirmation is confidence. The reported rating is
+   the impact CAPPED by the confirmation, with the impact kept beside it
+   so the ceiling is visible rather than hidden. A class that only exists
+   once demonstrated drops an extra step when nothing demonstrated it.
+
+       CRITICAL class, INCONCLUSIVE  →  INFO
+       CRITICAL class, POTENTIAL     →  LOW
+       CRITICAL class, CONFIRMED     →  CRITICAL
+
+   Scanner severity is metadata throughout and never the answer.
+
+4. THE FOUR REPORTED CASES
+
+   missing-sri (nuclei, INFO, CWE-353) was published as CRITICAL OS
+   command injection CWE-78 with "input reaches a shell" underneath it.
+   Now: "Subresource Integrity missing on external script",
+   Informational, CWE-353, the extracted script URL as the observation,
+   nuclei's INFO kept as metadata.
+
+   /.bash_history and /.sh_history were raw Nikto sentences truncated
+   into the title column and rated HIGH on a signature. Now verified:
+   where the contents come back it is "Exposed shell history file",
+   Confirmed, HIGH; on a host that answers 200 with an app shell for
+   every path it is "Shell history file is readable", Inconclusive, LOW,
+   with HIGH recorded as the impact if real and the catch-all named as
+   the reason. RETAINED, not discarded — see the behaviour change below.
+
+   JAMonAdmin.jsp was HIGH reflected XSS CWE-79 because Nikto's sentence
+   mentions "XSS vulnerabilities". It has no parameter, no payload and no
+   reflection. Now "JAMon administrative interface is reachable", a
+   component finding, CWE-284, CVE-2013-6235 as context, and the version
+   read from the response where possible so whether the CVE applies is
+   answered rather than assumed. JAMon is a Java component; it is not
+   described as a JavaScript package.
+
+   Lucky 13 carried testssl's one-line sentence. ssl_cipher_check.py —
+   the standalone SSL/TLS Analysis — already discovered the suites and
+   their key sizes and printed them to a terminal. It now also writes
+   them as JSON (--json), and Coffee Break REUSES that artefact:
+
+       5 cipher suite(s) accepted by <host>:443 match this:
+         TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA     256
+         TLS_RSA_WITH_AES_256_CBC_SHA           256
+         TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA     128
+         TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256  128
+         TLS_RSA_WITH_AES_128_CBC_SHA           128
+
+   Dynamic, never hardcoded. The same mechanism serves ROBOT, RC4,
+   Sweet32, FREAK, deprecated protocols and the weak-cipher finding.
+   The artefact records which host it was produced for and a mismatch is
+   refused, so repeated scans cannot mix one target's ciphers into
+   another's finding. A live scan only runs while a Coffee Break run is
+   in progress — a parser must not open connections because somebody
+   re-read a report.
+
+5. PRECONDITION IS NOT DEMONSTRATION
+
+   Lucky 13, BEAST, Sweet32, ROBOT, POODLE and the rest are named
+   ATTACKS whose precondition is a cipher or protocol being offered. The
+   precondition is confirmed; the attack was not attempted, no timing was
+   measured. These now report as Potential and say so. The suites are
+   preserved either way: the status changes, the evidence does not.
+
+6. THE FINDINGS SECTION — cb_evidence.summary_html()
+
+   Four fields: Finding Name, Risk Rating, Confirmation Status, What was
+   found. The generic class description, reproduction recipe, impact
+   narrative, "what could explain this without the vulnerability" list
+   and remediation paragraph are gone from the first view — on a finding
+   whose classification was wrong, all of it was wrong together, and the
+   volume buried the one line that mattered ("no injection point was
+   identified").
+
+   Nothing is discarded. detail_html() renders it all behind a new
+   Technical detail toggle on both findings screens, "Copy this finding"
+   still produces the full record, and the remediation stays on the
+   finding object. For an Active Scan finding, "What was found" is
+   composed from the evidence chain — injection point, payload, the
+   request that demonstrated it — because a summary of a differential
+   SQLi that omits the request has kept the claim and dropped the proof.
+
+BEHAVIOUR CHANGE: 6.9.0 DROPPED a stale Nikto signature outright. It is
+now retained and marked Inconclusive. Discarding every unconfirmed
+detection loses the difference between "checked, not there" and "never
+looked", and a tester deciding what to probe by hand needs the lead.
+What must not happen is the old failure — it reaching a report as a
+confirmed high-risk exposure.
+
+RECLASSIFIED, and two existing tests updated to match: nuclei's
+weak-csp-detect EXTRACTS the policy, so the header is present and
+permissive, not absent. It was keyed csp_missing by keyword matching,
+contradicting the policy string the same finding carried as evidence.
+Now csp_unsafe_script.
+
+REGRESSION TESTS A-G, in tests/test_coffee_break.py, each built from a
+report that was actually published. Verified against local HTTP servers
+that reproduce both a host where the files genuinely are and a
+single-page app that answers 200 for every path, and against a local TLS
+server offering CBC suites.
+
+All four suites pass: test_scanner 284, test_coffee_break 510,
+test_coffee_chain 13, test_gui_smoke 271 — 1,078 assertions — and
+verify_startup.py reports OK. The standalone SSL/TLS Analysis was
+re-verified end to end with sslyze installed: its text report is
+unchanged and the five suites appear in the Findings section from the
+artefact it writes.
+
+LIMITATIONS, stated rather than discovered later:
+
+  * Verification covers file exposure, component reachability/version
+    and header absence. Injection classes have no safe automated check
+    and are deliberately left to the Active Scan, which exploits them
+    properly; registry entries for them name no procedure and their
+    findings stay unconfirmed.
+  * Component version detection reads the response body and the common
+    version headers. A product that does not advertise its version
+    yields "reachable, version unestablished" rather than a guess.
+  * The registry names 10 Nikto checks and 3 nuclei templates. It is a
+    table meant to grow; everything not in it keeps the previous
+    behaviour, now with the exploit-class backstop in front of it.
+  * Lucky 13's suite list needs either an SSL/TLS Analysis artefact or
+    sslyze installed. Without both, the handshake fallback covers CBC
+    suites only, and without a live run the finding keeps the scanner's
+    own line.
+
+
 ## 2026-10-21 — "rce" INSIDE "SUBRESOURCE" (6.9.1)
 
 Five faults from a GraphQL engagement. The first is the worst thing in
