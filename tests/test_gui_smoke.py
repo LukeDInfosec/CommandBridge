@@ -1143,6 +1143,21 @@ def main():
           "[4 findings]" in tls_parent.text(1))
     check("   with the group's name",
           "TLS/SSL — Several Issues Detected" in tls_parent.text(1))
+    # The name has to be in a column Qt will actually PAINT. The first
+    # version spanned column 0 across the row and wrote the title into
+    # column 1, so the parent drew as a black bar with a chevron and no
+    # name on it — and every assertion above still passed, because they
+    # read the data rather than what the widget shows.
+    for item in parents():
+        check("   the parent row is not first-column-spanned",
+              item.isFirstColumnSpanned(), False)
+        painted = [item.text(column) for column in range(5)
+                   if not window.cb_table.isColumnHidden(column)]
+        check("   and its name is in a painted column",
+              any("Several Issues Detected" in text for text in painted))
+        check("   column 0 carries the worst severity present",
+              item.text(0) in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"))
+
     check("2. the CSP parent holds three", csp_parent.childCount(), 3)
     check("5. the critical injection is a top-level row of its own",
           any(item.data(0, Qt.ItemDataRole.UserRole + 1) is not None

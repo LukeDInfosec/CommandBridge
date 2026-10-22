@@ -19,6 +19,22 @@ HOW TO USE THIS FILE
  CHANGELOG (most recent first)
 ================================================================================
 
+## 2026-10-22 — THE PARENT ROW HAD NO NAME (6.9.6)
+
+6.9.5's group rows drew as a black bar with a chevron and nothing on
+it. The cause was one line: setFirstColumnSpanned(True). Spanning
+paints the row from column 0 alone, and the title was written to
+column 1 — so Qt had the name and never showed it.
+
+The parent now uses the same columns as its children: worst severity
+in column 0, title and count in column 1, distribution in column 2.
+
+Worth noting WHY the tests missed it. Every grouping assertion read
+item.text(1) — the data. The widget was asked what it held, never
+what it would show. The new assertions check that the name sits in a
+column that is actually painted and that the row is not spanned, and
+they fail when the old line is put back.
+
 ## 2026-10-22 — GROUPED FINDINGS (6.9.5)
 
 A clean scan of one host still produces four TLS findings, three CSP

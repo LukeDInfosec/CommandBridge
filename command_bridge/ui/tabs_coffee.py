@@ -770,9 +770,22 @@ class CoffeeBreakTabMixin:
     def _cb_dress_group(self, item, group):
         """A parent row: title, count, and the distribution underneath."""
         item.setData(0, Qt.ItemDataRole.UserRole + 2, group.key)
-        item.setFirstColumnSpanned(True)
+        # NOT first-column-spanned. Spanning draws the row from column 0
+        # alone, so a title written to column 1 is simply never painted —
+        # which is exactly what it did: a black row with a chevron and no
+        # name on it. The parent uses the same columns as its children.
+        item.setFirstColumnSpanned(False)
         item.setText(1, f"{group.title}   [{group.count} findings]")
-        item.setText(0, "")
+        # Column 0 carries the worst severity present, as a child row
+        # does, so the columns line up. It is an indicator, not a verdict:
+        # the distribution sits in column 2 and says what is really there.
+        item.setText(0, group.worst_severity)
+        item.setTextAlignment(0, Qt.AlignmentFlag.AlignCenter)
+        severity_font = QtGui.QFont(item.font(0))
+        severity_font.setBold(True)
+        item.setFont(0, severity_font)
+        item.setForeground(0, QtGui.QColor(
+            SEV_COLOURS.get(group.worst_severity, "#8b9bb4")))
 
         bold = QtGui.QFont(item.font(1))
         bold.setBold(True)
@@ -782,6 +795,8 @@ class CoffeeBreakTabMixin:
         # that every child is as bad as the worst one.
         item.setForeground(1, QtGui.QColor(
             SEV_COLOURS.get(group.worst_severity, "#8b9bb4")))
+        item.setToolTip(0, f"Worst severity among {group.count} findings — "
+                           f"see the distribution beside it")
         item.setToolTip(1, group.summary())
         item.setText(2, group.summary())
         # Qt reads the item's text to a screen reader; the summary says
