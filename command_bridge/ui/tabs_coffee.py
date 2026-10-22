@@ -21,11 +21,14 @@ from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame,
     QScrollArea, QProgressBar, QTableWidget, QTableWidgetItem, QSplitter,
+    QTreeWidget, QTreeWidgetItem,
     QTextEdit, QHeaderView, QAbstractItemView, QComboBox, QFileDialog,
     QMessageBox, QSizePolicy, QMenu, QApplication, QCheckBox, QGridLayout,
+    QLineEdit,
 )
 
 from command_bridge.modules import cb_evidence
+from command_bridge.modules import finding_groups
 from command_bridge.modules.coffee_break import SEVERITIES, SEV_ORDER
 from command_bridge.widgets.plain_copy import PlainCopyTextEdit
 
@@ -59,6 +62,30 @@ class _SeverityItem(QTableWidgetItem):
     def __lt__(self, other):
         mine = self.data(Qt.ItemDataRole.UserRole)
         theirs = other.data(Qt.ItemDataRole.UserRole)
+        if mine is None or theirs is None:
+            return super().__lt__(other)
+        return mine < theirs
+
+
+class _SeverityTreeItem(QTreeWidgetItem):
+    """A tree row that sorts by severity rather than alphabetically.
+
+    The same reason _SeverityItem exists for the table, and the same bug
+    if it is left out: Qt sorts on the display string, so a descending
+    sort puts MEDIUM above CRITICAL — precisely upside down for a list
+    whose job is to show the worst thing first. Caught by the existing
+    "the worst finding sorts to the top" assertion when the widget
+    changed, which is what that assertion is for.
+
+    Group rows carry the rank of the worst severity they contain, so a
+    parent sorts among the findings it is comparable to rather than
+    always to the top or always to the bottom.
+    """
+
+    def __lt__(self, other):
+        column = self.treeWidget().sortColumn() if self.treeWidget() else 0
+        mine = self.data(column, Qt.ItemDataRole.UserRole)
+        theirs = other.data(column, Qt.ItemDataRole.UserRole)
         if mine is None or theirs is None:
             return super().__lt__(other)
         return mine < theirs
@@ -345,6 +372,21 @@ class CoffeeBreakTabMixin:
         self.cb_filter.setCurrentIndex(self.cb_filter.findData("LOW"))
         self.cb_filter.currentIndexChanged.connect(self._cb_apply_filter)
         controls.addWidget(self.cb_filter)
+
+        # A search box, added with the grouping. Collapsed groups make a
+        # finding harder to spot by eye, so there has to be a way to go
+        # straight to one by name — and a group whose child matches is
+        # opened automatically, otherwise searching would hide the very
+        # row it found.
+        self.cb_search = QLineEdit()
+        self.cb_search.setPlaceholderText("Search findings…")
+        self.cb_search.setClearButtonEnabled(True)
+        self.cb_search.setMaximumWidth(260)
+        self.cb_search.setToolTip(
+            "Matches a finding's name, location, scanner or issue key. "
+            "Groups open automatically to show a match.")
+        self.cb_search.textChanged.connect(self._cb_apply_filter)
+        controls.addWidget(self.cb_search)
         controls.addStretch()
         self.cb_count_label = QLabel("")
         self.cb_count_label.setStyleSheet("color: palette(mid); font-size: 12px;")
@@ -358,16 +400,40 @@ class CoffeeBreakTabMixin:
         # whole card.
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        self.cb_table = QTableWidget(0, 5)
-        self.cb_table.setHorizontalHeaderLabels(
+        # A QTreeWidget, not a QTableWidget, so that related findings can
+        # sit under one expandable parent row. Qt's own disclosure widget:
+        # the chevron, the keyboard handling (Left/Right collapse and
+        # expand, Space and Enter activate) and the expanded/collapsed
+        # state a screen reader reports all come with it, so no new
+        # component and no new library.
+        #
+        # Columns, selection behaviour and the hidden columns are exactly
+        # as the table had them — a child row is still one finding, and
+        # the detail pane, filter, right-click menu and delete all still
+        # work off the same five fields.
+        self.cb_table = QTreeWidget()
+        self.cb_table.setColumnCount(5)
+        self.cb_table.setHeaderLabels(
             ["Severity", "Finding", "Where", "Stage", "Confidence"])
-        self.cb_table.verticalHeader().setVisible(False)
         self.cb_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows)
         self.cb_table.setSelectionMode(
             QAbstractItemView.SelectionMode.SingleSelection)
         self.cb_table.setEditTriggers(
             QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.cb_table.setUniformRowHeights(False)
+        self.cb_table.setExpandsOnDoubleClick(False)
+        self.cb_table.setAnimated(False)
+        self.cb_table.setIndentation(18)
+        self.cb_table.setAllColumnsShowFocus(True)
+        #: group key → whether the operator has opened it. Groups start
+        #: collapsed; a choice made during a scan is remembered for the
+        #: rest of that scan, which is as long as it is useful. Nothing
+        #: is written to disk for a transient view state.
+        self._cb_expanded = {}
+        self.cb_table.itemClicked.connect(self._cb_item_clicked)
+        self.cb_table.itemExpanded.connect(self._cb_remember_expanded)
+        self.cb_table.itemCollapsed.connect(self._cb_remember_expanded)
         # Alternating row colours come from the palette, and on several of
         # the darker themes the alternate row washed the text out until it
         # could not be read. Severity already gives the eye a column to
@@ -375,7 +441,7 @@ class CoffeeBreakTabMixin:
         self.cb_table.setAlternatingRowColors(False)
         self.cb_table.setSortingEnabled(True)
         self.cb_table.sortByColumn(0, Qt.SortOrder.DescendingOrder)
-        header = self.cb_table.horizontalHeader()
+        header = self.cb_table.header()
         # A fixed, generous severity column. Sized to contents it hugged the
         # word so tightly that the text sat against the cell border; given room
         # and centred, the column reads as a column.
@@ -473,10 +539,12 @@ class CoffeeBreakTabMixin:
         self.cb_progress.setFormat("starting…")
         self.cb_tally.setText("")
         self.cb_count_label.setText("")
-        self.cb_table.setRowCount(0)
+        self.cb_table.clear()
         self.cb_detail.clear()
         self._cb_rows = []
         self._cb_ui_finding_list = []
+        # A new scan starts with every group shut again.
+        self._cb_expanded = {}
 
         self._cb_clear_stage_box()
         self._cb_stage_rows = {}
@@ -603,98 +671,241 @@ class CoffeeBreakTabMixin:
         else:
             self.cb_progress.setFormat("stopped")
 
-    # ── table plumbing ───────────────────────────────────────────────────
+    # ── the tree ─────────────────────────────────────────────────────────
+    #
+    # The whole tree is rebuilt from _cb_ui_finding_list whenever it
+    # changes, rather than rows being inserted one at a time. Grouping
+    # depends on the whole set — a category becomes a parent only once it
+    # has two members — so an incremental insert would have to promote a
+    # loose row into a group mid-scan and keep the two paths in step.
+    # A findings list is tens of items; rebuilding it is not worth the
+    # second code path.
+
     def _cb_add_row(self, finding):
+        """A finding arrived. It is already in the list; redraw."""
+        self._cb_rebuild_tree()
+
+    def _cb_matches_filter(self, finding):
+        """Both filters: the severity floor and the search text."""
         wanted = self.cb_filter.currentData()
-        if wanted and SEV_ORDER.get(finding.severity, 0) < SEV_ORDER.get(wanted, 0):
-            self._cb_rows.append((None, finding))
-            self._cb_update_count()
-            return
+        if wanted and SEV_ORDER.get(finding.severity, 0) < \
+                SEV_ORDER.get(wanted, 0):
+            return False
+        return self._cb_matches_search(finding)
 
+    def _cb_matches_search(self, finding):
+        """Does the search text match this finding?
+
+        Across the fields a tester would search by — the name, the
+        affected location, the scanner and the issue key — so searching
+        "csp" finds the CSP findings and searching "testssl" finds that
+        scanner's. Case-insensitive, substring.
+        """
+        text = ""
+        box = getattr(self, "cb_search", None)
+        if box is not None:
+            text = box.text().strip().lower()
+        if not text:
+            return True
+        haystack = " ".join(str(part or "").lower() for part in (
+            finding.title, getattr(finding, "where", ""),
+            getattr(finding, "stage", ""), getattr(finding, "key", ""),
+            getattr(finding, "severity", ""),
+            getattr(finding, "status_label", ""),
+        ))
+        return text in haystack
+
+    def _cb_rebuild_tree(self):
+        """Draw every finding, grouped, honouring the current filter.
+
+        Child rows keep their index into _cb_ui_finding_list, so the
+        detail pane, the right-click menu and delete all resolve to the
+        same finding object they did before grouping existed.
+        """
+        selected = self._cb_selected_finding()
         self.cb_table.setSortingEnabled(False)
-        row = self.cb_table.rowCount()
-        self.cb_table.insertRow(row)
+        self.cb_table.clear()
+        self._cb_rows = []
 
-        severity = _SeverityItem(finding.severity)
-        # Sort by how much it matters, not alphabetically: CRITICAL before LOW.
-        severity.setData(Qt.ItemDataRole.UserRole,
-                         SEV_ORDER.get(finding.severity, 0))
-        severity.setForeground(QtGui.QColor(
-            SEV_COLOURS.get(finding.severity, "#8b9bb4")))
-        font = severity.font()
-        font.setBold(True)
-        severity.setFont(font)
-        severity.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        findings = list(self._cb_ui_finding_list)
+        index_of = {id(f): i for i, f in enumerate(findings)}
+        visible = [f for f in findings if self._cb_matches_filter(f)]
+        groups, loose = finding_groups.organise(visible)
 
-        title = QTableWidgetItem(finding.title)
-        # The column can be narrower than the title on a small window, so the
-        # full text is always one hover away.
-        state = getattr(finding, "state", "")
-        title.setToolTip(f"[{state}] {finding.title}" if state
-                         else finding.title)
-        # A CRITICAL nobody has validated must not look, at a glance down the
-        # list, like one that has been. Italics carry that without a column
-        # and without depending on a colour that some theme will wash out.
-        validation = getattr(finding, "validation", None)
-        if validation is not None and validation.needs_manual_validation:
-            unsettled = QtGui.QFont(title.font())
-            unsettled.setItalic(True)
-            title.setFont(unsettled)
-        where = QTableWidgetItem(_where_text(finding))
-        where.setToolTip("\n".join(finding.locations()[:40]))
-        confidence = QTableWidgetItem(finding.confidence)
-        confidence.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        to_select = None
+        for group in groups:
+            parent = _SeverityTreeItem(self.cb_table)
+            self._cb_dress_group(parent, group)
+            for finding in group.findings:
+                child = _SeverityTreeItem(parent)
+                self._cb_dress_finding(child, finding,
+                                       index_of.get(id(finding)))
+                if finding is selected:
+                    to_select = child
+            # Collapsed unless the operator opened this group earlier in
+            # the scan — or unless a search is running, in which case
+            # every surviving child is a match and hiding it behind a
+            # closed group would defeat the search.
+            searching = bool(getattr(self, "cb_search", None)
+                             and self.cb_search.text().strip())
+            parent.setExpanded(searching
+                               or bool(self._cb_expanded.get(group.key)))
 
-        cells = [severity, title, where,
-                 QTableWidgetItem(finding.stage), confidence]
-        for column, item in enumerate(cells):
-            item.setData(Qt.ItemDataRole.UserRole + 1, len(self._cb_rows))
-            self.cb_table.setItem(row, column, item)
+        for finding in loose:
+            row = _SeverityTreeItem(self.cb_table)
+            self._cb_dress_finding(row, finding, index_of.get(id(finding)))
+            if finding is selected:
+                to_select = row
+
         self.cb_table.setSortingEnabled(True)
-        self._cb_rows.append((row, finding))
+        if to_select is not None:
+            # Keep the operator's place across a redraw, and make sure
+            # the group it lives in is open enough to see it.
+            parent = to_select.parent()
+            if parent is not None:
+                parent.setExpanded(True)
+            self.cb_table.setCurrentItem(to_select)
         self._cb_update_count()
 
-    def _cb_ui_refresh(self, finding):
-        """Another instance of a finding already on the table."""
-        index = next((i for i, f in enumerate(self._cb_ui_finding_list)
-                      if f is finding), None)
-        if index is None:
+    def _cb_dress_group(self, item, group):
+        """A parent row: title, count, and the distribution underneath."""
+        item.setData(0, Qt.ItemDataRole.UserRole + 2, group.key)
+        item.setFirstColumnSpanned(True)
+        item.setText(1, f"{group.title}   [{group.count} findings]")
+        item.setText(0, "")
+
+        bold = QtGui.QFont(item.font(1))
+        bold.setBold(True)
+        item.setFont(1, bold)
+        # The indicator shows the worst severity present; the SUMMARY
+        # beside it shows the distribution, so a parent never implies
+        # that every child is as bad as the worst one.
+        item.setForeground(1, QtGui.QColor(
+            SEV_COLOURS.get(group.worst_severity, "#8b9bb4")))
+        item.setToolTip(1, group.summary())
+        item.setText(2, group.summary())
+        # Qt reads the item's text to a screen reader; the summary says
+        # the counts, and the expanded state comes from the widget.
+        item.setData(1, Qt.ItemDataRole.AccessibleTextRole,
+                     group.accessible_name())
+        item.setData(1, Qt.ItemDataRole.AccessibleDescriptionRole,
+                     "Group of related findings. Press Right to expand, "
+                     "Left to collapse.")
+        # Sorts among the findings it is comparable to: the rank of the
+        # worst severity it contains. -1 here (its first form) parked
+        # every group at one end of the list regardless of content.
+        item.setData(0, Qt.ItemDataRole.UserRole,
+                     SEV_ORDER.get(group.worst_severity, 0))
+
+    def _cb_dress_finding(self, item, finding, index):
+        """A child row: exactly what the table row used to be."""
+        item.setData(0, Qt.ItemDataRole.UserRole + 1, index)
+        item.setText(0, finding.severity)
+        item.setData(0, Qt.ItemDataRole.UserRole,
+                     SEV_ORDER.get(finding.severity, 0))
+        item.setForeground(0, QtGui.QColor(
+            SEV_COLOURS.get(finding.severity, "#8b9bb4")))
+        severity_font = QtGui.QFont(item.font(0))
+        severity_font.setBold(True)
+        item.setFont(0, severity_font)
+        item.setTextAlignment(0, Qt.AlignmentFlag.AlignCenter)
+
+        item.setText(1, finding.title)
+        state = getattr(finding, "state", "")
+        item.setToolTip(1, f"[{state}] {finding.title}" if state
+                        else finding.title)
+        # A CRITICAL nobody has validated must not look, at a glance down
+        # the list, like one that has been.
+        validation = getattr(finding, "validation", None)
+        if validation is not None and validation.needs_manual_validation:
+            unsettled = QtGui.QFont(item.font(1))
+            unsettled.setItalic(True)
+            item.setFont(1, unsettled)
+
+        item.setText(2, _where_text(finding))
+        item.setToolTip(2, "\n".join(finding.locations()[:40]))
+        item.setText(3, finding.stage)
+        item.setText(4, finding.confidence)
+        item.setTextAlignment(4, Qt.AlignmentFlag.AlignCenter)
+        status = getattr(finding, "status_label", "")
+        item.setData(1, Qt.ItemDataRole.AccessibleTextRole,
+                     f"{finding.severity}, {finding.title}"
+                     + (f", {status}" if status else ""))
+        self._cb_rows.append((item, finding))
+
+    def _cb_item_clicked(self, item, column):
+        """Clicking a group header toggles it. A child is left alone.
+
+        Required explicitly: clicking an individual finding must not
+        toggle its parent. A child click selects the child and nothing
+        else, which is what the detail pane reacts to.
+        """
+        if item is None or item.parent() is not None:
             return
-        for row in range(self.cb_table.rowCount()):
-            item = self.cb_table.item(row, 0)
-            if item is None:
-                continue
-            if item.data(Qt.ItemDataRole.UserRole + 1) != index:
-                continue
-            cell = self.cb_table.item(row, 2)
-            if cell is not None:
-                cell.setText(_where_text(finding))
-                cell.setToolTip("\n".join(finding.locations()[:40]))
-            break
+        if item.data(0, Qt.ItemDataRole.UserRole + 2) is None:
+            return                      # a loose finding at the top level
+        item.setExpanded(not item.isExpanded())
+
+    def _cb_remember_expanded(self, item):
+        key = item.data(0, Qt.ItemDataRole.UserRole + 2) if item else None
+        if key is not None:
+            self._cb_expanded[key] = item.isExpanded()
+
+    def _cb_selected_finding(self):
+        """The finding the operator has selected, or None for a group."""
+        items = self.cb_table.selectedItems()
+        if not items:
+            return None
+        return self._cb_finding_for_item(items[0])
+
+    def _cb_finding_for_item(self, item):
+        if item is None:
+            return None
+        index = item.data(0, Qt.ItemDataRole.UserRole + 1)
+        findings = getattr(self, "_cb_ui_finding_list", [])
+        if index is None or not isinstance(index, int) or \
+                index >= len(findings):
+            return None
+        return findings[index]
+
+    def _cb_ui_refresh(self, finding):
+        """Another instance of a finding already on the tree."""
+        for item, candidate in self._cb_rows:
+            if candidate is finding:
+                item.setText(2, _where_text(finding))
+                item.setToolTip(2, "\n".join(finding.locations()[:40]))
+                break
         self._cb_show_detail()
 
     def _cb_apply_filter(self):
-        findings = list(self._cb_ui_finding_list)
-        self.cb_table.setRowCount(0)
-        self._cb_rows = []
-        for finding in findings:
-            self._cb_add_row(finding)
-        self._cb_update_count()
+        self._cb_rebuild_tree()
 
     def _cb_update_count(self):
-        shown = self.cb_table.rowCount()
+        """Counts over FINDINGS, never over rows.
+
+        A parent row is not a finding, so counting rows would report one
+        more than there are for every group on screen.
+        """
+        shown = len(self._cb_rows)
         total = len(self._cb_ui_finding_list)
         instances = sum(getattr(f, "count", 1)
                         for f in self._cb_ui_finding_list)
         extra = ""
         if instances > total:
             extra = f" · {instances} location(s)"
+        groups = sum(1 for item, _ in self._cb_rows
+                     if item.parent() is not None)
+        grouped = f" · {groups} in groups" if groups else ""
+        searching = bool(getattr(self, "cb_search", None)
+                         and self.cb_search.text().strip())
+        reason = "the search" if searching else "the filter"
         if shown != total:
             self.cb_count_label.setText(
-                f"{shown} of {total} shown — {total - shown} hidden by the "
-                f"filter{extra}")
+                f"{shown} of {total} shown — {total - shown} hidden by "
+                f"{reason}{extra}{grouped}")
         else:
-            self.cb_count_label.setText(f"{total} finding(s){extra}")
+            self.cb_count_label.setText(
+                f"{total} finding(s){extra}{grouped}")
 
     def _cb_update_tally(self):
         counts = {}
@@ -709,25 +920,30 @@ class CoffeeBreakTabMixin:
         self.cb_tally.setText(" &nbsp;·&nbsp; ".join(parts))
 
     def _cb_show_detail(self):
+        """Draw whatever is selected: a finding, or a group's summary."""
         items = self.cb_table.selectedItems()
         if not items:
             return
-        index = items[0].data(Qt.ItemDataRole.UserRole + 1)
-        finding = None
-        for stored_index, (row, candidate) in enumerate(self._cb_rows):
-            if stored_index == index:
-                finding = candidate
-                break
+        item = items[0]
+        finding = self._cb_finding_for_item(item)
         if finding is None:
+            # A group header. Show what the group contains rather than
+            # clearing the pane, so selecting a parent is informative
+            # instead of looking broken.
+            key = item.data(0, Qt.ItemDataRole.UserRole + 2)
+            self._cb_detail_finding = None
+            self.cb_detail.setHtml(self._cb_group_html(key))
+            self._cb_burp = ""
+            self.cb_burp_btn.setEnabled(False)
+            self.cb_burp_btn.setText("No request captured for this finding")
             return
         # The Active Scan tab renders its findings with these same
         # functions. Two screens, one description of what a finding is.
         #
         # Concise by default: name, rating, status, what was found. The
-        # full technical rendering — raw scanner output, evidence chain,
-        # PoC, false-positive indicators, remediation — is one click
-        # away and is still what "Copy this finding" produces, so
-        # nothing is lost from the record by not showing it first.
+        # full technical rendering is one click away and is still what
+        # "Copy this finding" produces, so nothing is lost from the
+        # record by not showing it first.
         self._cb_detail_finding = finding
         self._cb_render_detail()
         self._cb_burp = cb_evidence.burp_request_for(finding)
@@ -735,6 +951,39 @@ class CoffeeBreakTabMixin:
         self.cb_burp_btn.setText(
             "Copy Burp Request" if self._cb_burp
             else "No request captured for this finding")
+
+    def _cb_group_html(self, key):
+        """A group header's detail pane: the distribution, and the list.
+
+        Deliberately a summary of its CHILDREN and nothing more. A parent
+        has no evidence of its own, and inventing a description for it
+        would be exactly the generic prose the findings pane was cut
+        down to remove.
+        """
+        groups, _ = finding_groups.organise(
+            [f for f in self._cb_ui_finding_list
+             if self._cb_matches_filter(f)])
+        group = next((g for g in groups if g.key == key), None)
+        if group is None:
+            return ""
+        rows = []
+        for finding in group.findings:
+            colour = SEV_COLOURS.get(finding.severity, "#8b9bb4")
+            status = getattr(finding, "status_label", "") or ""
+            rows.append(
+                f"<tr><td style='padding:2px 12px 2px 0;color:{colour};"
+                f"white-space:nowrap'>{finding.severity}</td>"
+                f"<td style='padding:2px 12px 2px 0'>{finding.title}</td>"
+                f"<td style='padding:2px 0;color:#8b9bb4;"
+                f"white-space:nowrap'>{status}</td></tr>")
+        return (
+            f"<h3 style='margin:0 0 6px 0'>{group.category.title}</h3>"
+            f"<p style='margin:0 0 12px 0;color:#8b9bb4'>"
+            f"{group.summary()}</p>"
+            f"<table cellspacing='0' cellpadding='0'>{''.join(rows)}</table>"
+            f"<p style='margin:12px 0 0 0;color:#8b9bb4'>Select a finding "
+            f"above for its evidence. Each one keeps its own rating, status "
+            f"and raw scanner output.</p>")
 
     def _cb_render_detail(self):
         """Draw the selected finding at the current level of detail."""
@@ -764,32 +1013,32 @@ class CoffeeBreakTabMixin:
             2000, lambda: self.cb_burp_btn.setText("Copy Burp Request"))
 
     # ── right-click ──────────────────────────────────────────────────────
-    def _cb_finding_at(self, row):
-        item = self.cb_table.item(row, 0)
-        if item is None:
-            return None
-        index = item.data(Qt.ItemDataRole.UserRole + 1)
-        findings = getattr(self, "_cb_ui_finding_list", [])
-        if index is None or index >= len(findings):
-            return None
-        return findings[index]
+    def _cb_finding_at(self, item_or_row):
+        """The finding for a tree item.
 
-    def _cb_row_at(self, position):
-        """Which row was right-clicked.
+        Takes an item now rather than a row index. The row index it used
+        to take has no meaning in a tree, where row 3 of the viewport
+        may be a group header or a child of a different group.
+        """
+        if isinstance(item_or_row, QTreeWidgetItem):
+            return self._cb_finding_for_item(item_or_row)
+        return None
 
-        customContextMenuRequested hands back a position in the widget's own
-        coordinates, while rowAt() expects the viewport's — and the two differ
-        by the height of the horizontal header. That is about 25 pixels, which
-        was enough to return the wrong row near the top of the table and -1 on
-        the first row, so the menu never appeared at all. Map it properly,
-        then fall back to whatever is selected.
+    def _cb_item_at(self, position):
+        """Which item was right-clicked.
+
+        customContextMenuRequested gives a position in the widget's own
+        coordinates while itemAt() expects the viewport's, and the two
+        differ by the height of the header — enough to return the wrong
+        item near the top and nothing at all on the first row.
         """
         table = self.cb_table
-        for candidate in (table.viewport().mapFrom(table, position), position):
-            index = table.indexAt(candidate)
-            if index.isValid():
-                return index.row()
-        return table.currentRow()
+        for candidate in (table.viewport().mapFrom(table, position),
+                          position):
+            item = table.itemAt(candidate)
+            if item is not None:
+                return item
+        return table.currentItem()
 
     def _cb_menu(self, position):
         """Delete a finding, delete its whole type, or mute it for good.
@@ -799,14 +1048,16 @@ class CoffeeBreakTabMixin:
         every scan after it, which is the difference between a fix and a
         chore you repeat.
         """
-        row = self._cb_row_at(position)
-        finding = self._cb_finding_at(row)
+        item = self._cb_item_at(position)
+        finding = self._cb_finding_at(item)
         if finding is None:
+            # A group header has nothing to delete or mute — its
+            # children do, individually.
             return
-        # Right-clicking a row selects it, so the detail pane below matches
-        # what the menu is about to act on.
-        if row != self.cb_table.currentRow():
-            self.cb_table.selectRow(row)
+        # Right-clicking a row selects it, so the detail pane below
+        # matches what the menu is about to act on.
+        if item is not self.cb_table.currentItem():
+            self.cb_table.setCurrentItem(item)
 
         menu = QMenu(self)
         title = finding.title
@@ -850,7 +1101,7 @@ class CoffeeBreakTabMixin:
             self.flash_status("report copied")
 
     def _cb_delete_selected(self):
-        finding = self._cb_finding_at(self.cb_table.currentRow())
+        finding = self._cb_finding_at(self.cb_table.currentItem())
         if finding is not None:
             self._cb_drop([finding])
 

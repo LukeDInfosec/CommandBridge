@@ -1,7 +1,7 @@
 ================================================================================
  COMMAND BRIDGE v4 — PROJECT REFERENCE & CHANGELOG
  (Reference doc for Claude / future sessions. Keep this updated after changes.)
- Last updated: 2026-10-08
+ Last updated: 2026-10-22
 ================================================================================
 
 HOW TO USE THIS FILE
@@ -18,6 +18,173 @@ HOW TO USE THIS FILE
 ================================================================================
  CHANGELOG (most recent first)
 ================================================================================
+
+## 2026-10-22 — GROUPED FINDINGS (6.9.5)
+
+A clean scan of one host still produces four TLS findings, three CSP
+findings and a handful of missing headers. All real, all separately
+evidenced — and all of them between the pentester and the one row
+that matters.
+
+So the Findings list is now a QTreeWidget. Related findings sit under
+a collapsed parent row:
+
+    TLS/SSL — Several Issues Detected          [4 findings]
+      4 findings · 2 Medium · 1 Low · 1 Informational · 2 Confirmed
+
+Expand it and every child is there unchanged: its own canonical name,
+rating, status, affected resource, detected-by, explanation, evidence.
+
+PRESENTATION ONLY. modules/finding_groups.py returns references to the
+findings it was handed, never copies, and never writes to one. Every
+finding lands in exactly one group, so a total is still a total —
+total_shown() asserts it. A parent reports a DISTRIBUTION, never a
+single rating: "CRITICAL" over three informational observations is a
+lie in the direction people act on, and "INFORMATIONAL" over a
+confirmed exposure is a lie in the direction people ignore. A group of
+informational observations says so outright ("no vulnerability
+claimed").
+
+Grouping is by ISSUE KEY, then key prefix, then stage — never title
+text. Two findings that share a word are not thereby related; that is
+the mistake 6.9.4 was built to stop, and it is not being reintroduced
+in the view layer. CSP is matched before the general header category
+because assignment is first-match, so a CSP finding is never counted
+under both.
+
+A category below its minimum (2) is not a group. One TLS finding is a
+TLS finding, not a parent row costing a click to say nothing.
+
+Also: a search box, which auto-expands groups holding a match, so a
+collapsed parent never hides a finding you are looking for.
+
+NEW: modules/finding_groups.py
+CHANGED: ui/tabs_coffee.py (QTableWidget → QTreeWidget)
+
+## 2026-10-22 — THE DECISION ENGINE (6.9.4)
+
+A template tagged "xss" that reads a header was reported as reflected
+XSS. It defeated both guards built in 6.9.2: the registry had no entry
+for it, and the tag backstop passed it BECAUSE of the tag.
+
+    template:  xss-deprecated-header
+    extracted: 1; mode=block
+    reported:  Cross-site scripting (reflected), HIGH
+
+That is the fourth instance of one fault, each fixed where it was found
+— in the nuclei parser, then the Nikto parser, then the tag backstop:
+
+    weak-csp-detect       a CSP header    → CRITICAL command injection
+    missing-sri           a script URL    → CRITICAL command injection
+    JAMonAdmin.jsp        a Java page     → HIGH reflected XSS
+    xss-deprecated-header "1; mode=block" → reflected XSS
+
+NEW: modules/classification.py, reclassify_report.py
+
+1. THE RULE, STATED ONCE
+
+   A nuclei tag says what SUBJECT a template is about. It does not say
+   the template tested for an exploit. nuclei tags
+   xss-deprecated-header "xss" because the header has XSS in its name;
+   the template reads a header.
+
+   So the engine does not turn on names, tags or severities. It turns on
+   what was OBSERVED:
+
+       A class that requires a demonstrated behaviour cannot be carried
+       by an observation that is only a header value, a cipher suite, a
+       path, or a component banner.
+
+   "1; mode=block" is a header value. No arrangement of template
+   metadata makes it evidence of script execution. The rule needs no
+   entry per detector and is checked for every finding from every
+   scanner — which is the difference between this and the three patches
+   before it. Verified against an INVENTED detector with no registry
+   entry, a CRITICAL injection class and a header observation: reported
+   as a Security header observation at Informational, with the
+   rejection and its reason recorded.
+
+2. EIGHT STAGES, ONE PATH — modules/classification.py
+
+   identify the detector · identify the observation · check the class
+   against the observation · verify cheaply and safely · determine
+   confirmation · assess risk · explain · decide what to display.
+
+   No LLM in any of it. Every decision is a function of structured
+   evidence, so the same input gives the same answer twice and each
+   stage is testable on its own.
+
+   Stage 2 reads the observation kind from the detector where it
+   declares one and infers it otherwise, which is what covers unknown
+   detectors: a detection whose only content is one short header-shaped
+   string is a header observation whatever its template is called.
+
+   Stage 8 SUPPRESSES NOTHING. A rejected class becomes the observation
+   it really is, with its evidence; an observation with nothing behind
+   it becomes context rather than a row claiming a vulnerability. New
+   library keys exist so a finding can say what was seen without
+   borrowing a vulnerability class to say it in:
+   security_header_observation, content_observation, path_observation.
+   They carry no remediation and no CWE on purpose — nothing is claimed,
+   so there is nothing to fix or classify — and that exemption is
+   declared in cb_issues.OBSERVATION_KEYS rather than hidden in a test.
+
+3. xss-deprecated-header, AS SPECIFIED
+
+   Deprecated X-XSS-Protection header · Informational · Confirmed
+   (the header was re-read from the response, not taken from the
+   scanner's extracted string) · "The response sets the legacy
+   X-XSS-Protection header to '1; mode=block'. Chrome removed the XSS
+   auditor in 2019 and no current browser acts on this header… It is not
+   evidence of a cross-site scripting vulnerability — no input, payload
+   or reflection is involved in this check."
+
+   nuclei's INFO is kept as metadata and the template id stays in the
+   technical view. A new verification procedure, header_value, reads the
+   header back: one GET, and the finding then rests on a header this
+   application has seen.
+
+4. MEASURING THE CHANGE — reclassify_report.py
+
+   Replays saved Coffee Break findings JSON through the engine and
+   reports how many would now be reported differently. READ-ONLY; it
+   writes nothing, so no historical evidence is altered or deleted.
+
+   On a fixture holding the four reported misclassifications plus
+   genuine findings: 3 reclassified, 1 downgraded, 3 retained —
+   including a confirmed command injection kept at CRITICAL, which is
+   the case that must not be suppressed.
+
+   What it cannot do is stated in the script: a saved finding holds no
+   live response, so verification cannot be re-run from it. Those are
+   reported as "not assessable from the record" rather than guessed at.
+
+All four suites pass: test_scanner 284, test_coffee_break 662,
+test_coffee_chain 13, test_gui_smoke 271 — 1,230 assertions — and
+verify_startup.py reports OK. verify_startup.py caught a method the
+engine referenced before it was written, which is what it is for.
+
+Two of my own new assertions were wrong rather than the code: the
+summary says "legacy" where the title says "Deprecated", and the word
+"payload" appears in the sentence DENYING there is one. Both now check
+what they meant to.
+
+LIMITATIONS:
+
+  * Stage 4 reuses the verifier's procedures: file contents, component
+    version, header absence and now header value. Injection classes
+    still have no safe automated check and are left to the Active Scan.
+  * The observation inference is cautious: an ambiguous detection is
+    treated as able to support more rather than less, so an unknown
+    detector with genuinely odd evidence may keep its class. Stage 3
+    then relies on the class's own requirements.
+  * reclassify_report.py assesses what is decidable from saved
+    evidence — class consistency and rating. A verdict that rested on a
+    live check is reported as unassessable.
+  * Registry entries now number 5 nuclei templates and 10 Nikto checks.
+    The general rule applies to everything else; the entries only add
+    better names and verification procedures.
+
 
 ## 2026-10-22 — EXPLANATION RULES (6.9.3)
 

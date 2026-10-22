@@ -409,11 +409,22 @@ def main():
               [])
         check("every entry explains itself",
               [k for k, i in library.items() if len(i["detail"]) < 40], [])
-        check("every entry says how to fix it",
-              [k for k, i in library.items() if len(i["remediation"]) < 15], [])
-        check("every entry carries a classification",
+        # Observation keys are exempt from both, and the exemption is
+        # declared in the library itself (cb_issues.OBSERVATION_KEYS).
+        # They exist so a finding can say what was SEEN without
+        # borrowing a vulnerability class; there is nothing to fix and
+        # nothing to classify because no weakness is claimed.
+        observations = cb_issues.OBSERVATION_KEYS
+        check("every issue entry says how to fix it",
               [k for k, i in library.items()
-               if not str(i["cwe"]).startswith("CWE-")], [])
+               if k not in observations and len(i["remediation"]) < 15], [])
+        check("every issue entry carries a classification",
+              [k for k, i in library.items()
+               if k not in observations
+               and not str(i["cwe"]).startswith("CWE-")], [])
+        check("and the observation keys really are observations",
+              [k for k in observations
+               if library[k]["severity"] != "INFO"], [])
         check("no two entries share a title",
               len({i["title"] for i in library.values()}), len(library))
 
@@ -2644,6 +2655,385 @@ back-end DBMS: MySQL >= 5.6
     check("the explanation is kept as structure too",
           bool(getattr(kept_finding, "explanation", None)))
     srv_real.shutdown()
+
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  The decision engine: classified by what was detected
+    # ═══════════════════════════════════════════════════════════════════
+    #
+    # The rule under test is one sentence: a class that needs a
+    # demonstrated behaviour cannot be carried by an observation that is
+    # only a header value, a cipher, a path or a banner. It is checked
+    # for every finding from every scanner, so it needs no entry per
+    # detector — which is what the four reported misclassifications
+    # each needed before.
+    from command_bridge.modules import classification as engine
+    from command_bridge.modules import verification as vfy
+
+    print("\n\033[1mStage 3 — can the observation support the class?\033[0m")
+    for key, kind, allowed in (
+            ("command_injection", engine.HEADER_VALUE, False),
+            ("command_injection", engine.PATH_EXISTS, False),
+            ("command_injection", engine.COMPONENT, False),
+            ("command_injection", engine.CIPHER_CONFIG, False),
+            ("command_injection", engine.DEMONSTRATED, True),
+            ("xss_reflected", engine.HEADER_VALUE, False),
+            ("xss_reflected", engine.EXTRACTED_URL, False),
+            ("xss_reflected", engine.PARAMETER_ECHO, True),
+            ("xss_reflected", engine.DEMONSTRATED, True),
+            ("sqli", engine.PATH_EXISTS, False),
+            ("sqli", engine.DEMONSTRATED, True),
+            ("traversal", engine.RESPONSE_BODY, True),
+            # Non-behavioural classes are unaffected: a header finding
+            # from a header observation is exactly right.
+            ("csp_missing", engine.HEADER_VALUE, True),
+            ("weak_cipher", engine.CIPHER_CONFIG, True),
+            ("sri_missing", engine.EXTRACTED_URL, True)):
+        ok, _ = engine.consistent(key, engine.Observation(kind=kind))
+        check(f"{key} from {kind}", ok, allowed)
+
+    print("\n\033[1mA — an XSS template that only reads a header\033[0m")
+    XSS_HEADER_ROW = {
+        "template-id": "xss-deprecated-header",
+        "matched-at": "https://example.bike/",
+        "info": {"name": "X-XSS-Protection Header - Deprecated",
+                 "severity": "info",
+                 "tags": ["xss", "misconfig", "headers"],
+                 "description": "The X-XSS-Protection header is deprecated."},
+        "extracted-results": ["1; mode=block"],
+        "request": "GET / HTTP/1.1",
+    }
+
+    class _XssHeader(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"<html><body>ok</body></html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("X-XSS-Protection", "1; mode=block")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    hdr_srv, hdr_base = _serve(_XssHeader)
+    hdr = Engine(hdr_base)
+    row = dict(XSS_HEADER_ROW, **{"matched-at": hdr_base + "/"})
+    hdr._cb_parse_nuclei({"key": "nuclei"}, json.dumps(row))
+    check("one finding is produced", len(hdr._cb_findings), 1)
+    deprecated = hdr._cb_findings[0]
+    check("named as the header it is about",
+          deprecated.title, "Deprecated X-XSS-Protection header")
+    check("not as cross-site scripting",
+          "scripting" in deprecated.title.lower(), False)
+    check("the issue key is the header observation",
+          deprecated.key, "xss_protection_deprecated")
+    check("rated Informational", deprecated.severity, "INFO")
+    check("confirmed, because the header was read back",
+          getattr(deprecated, "status_label", ""), "Confirmed")
+    summary = getattr(deprecated, "summary", "")
+    check("the value is preserved", "1; mode=block" in summary)
+    check("the affected URL is preserved",
+          hdr_base in deprecated.where)
+    check("it says the header is legacy",
+          "legacy" in summary.lower() or "deprecated" in summary.lower())
+    check("the title says deprecated", "Deprecated" in deprecated.title)
+    check("and says explicitly that it is not XSS evidence",
+          "not evidence of a cross-site scripting" in summary.lower())
+    # The word "payload" DOES appear — in the sentence denying there is
+    # one ("no input, payload or reflection is involved in this check").
+    # What must not happen is the header's value being presented AS a
+    # payload, which is what the misclassification did.
+    check("the header value is not presented as a payload",
+          "payload: 1; mode=block" in summary.lower(), False)
+    check("nor as an injected string",
+          "injected" in summary.lower(), False)
+    check("nuclei's own severity is kept",
+          deprecated.scanner_severity, "INFO")
+    check("the raw template id survives in the technical view",
+          "xss-deprecated-header" in cb_evidence.detail_html(deprecated))
+    hdr_srv.shutdown()
+
+    print("\n\033[1mThe rule generalises to detectors with no entry\033[0m")
+    invented = dreg.Detection(
+        detector=dreg.Detector(
+            name="Some Injection Check", issue_key="command_injection",
+            vuln_class="injection", severity_if_confirmed="CRITICAL",
+            severity_unconfirmed="INFO", observation=engine.HEADER_VALUE,
+            header="X-Powered-By", observation_is_self_evident=True),
+        detector_name="invented", scanner="nuclei",
+        detector_id="never-seen-before", scanner_severity="CRITICAL",
+        url="https://example.bike/", extracted=("PHP/8.1",))
+    outcome = vfy.Outcome(status=dreg.CONFIRMED, summary="header read",
+                          evidence=["X-Powered-By: PHP/8.1"], verified=True,
+                          http_status=200)
+    verdict = engine.decide(invented, outcome,
+                            issue_library=cb_issues.ISSUES, verified=True)
+    check("a CRITICAL injection class on a header observation is rejected",
+          verdict.issue_key, "security_header_observation")
+    check("and rated Informational, not CRITICAL", verdict.severity, "INFO")
+    check("the rejection is recorded with its reason",
+          "cannot establish command_injection" in verdict.mismatch)
+    check("the scanner's own severity is still kept",
+          verdict.scanner_severity, "CRITICAL")
+    check("the observation itself is confirmed — it was read",
+          verdict.status_label, "Confirmed")
+
+    print("\n\033[1mA genuine high-impact finding is NOT suppressed\033[0m")
+    genuine = dreg.Detection(
+        detector=dreg.Detector(
+            name="OS command injection", issue_key="command_injection",
+            vuln_class="injection", severity_if_confirmed="CRITICAL",
+            observation=engine.DEMONSTRATED),
+        detector_name="real", scanner="active-scan", detector_id="cmdi",
+        url="https://example.bike/ping?host=1")
+    proved = vfy.Outcome(status=dreg.CONFIRMED,
+                         summary="uid=33(www-data) returned",
+                         evidence=["uid=33(www-data) in the response"],
+                         verified=True)
+    kept = engine.decide(genuine, proved, issue_library=cb_issues.ISSUES,
+                         verified=True)
+    check("it keeps its class", kept.issue_key, "command_injection")
+    check("at CRITICAL", kept.severity, "CRITICAL")
+    check("Confirmed", kept.status_label, "Confirmed")
+    check("with no mismatch recorded", kept.mismatch, "")
+    check("and it is displayed, not filed as context", kept.display, "report")
+
+    print("\n\033[1mAn informational result is not promoted\033[0m")
+    for impact, status, wanted in (("CRITICAL", dreg.INFORMATIONAL, "INFO"),
+                                   ("HIGH", dreg.INFORMATIONAL, "INFO"),
+                                   ("CRITICAL", dreg.INCONCLUSIVE, "INFO")):
+        got, _, _ = riskmod.assess(impact, status,
+                                   vuln_class="command_injection")
+        check(f"{impact} + {status} → {wanted}", got, wanted)
+    check("a missing security header does not become High",
+          riskmod.assess(cb_issues.ISSUES["hsts_missing"]["severity"],
+                         dreg.CONFIRMED, vuln_class="hsts_missing")[0]
+          in ("INFO", "LOW", "MEDIUM"))
+
+    print("\n\033[1mReflection: harmless versus unsafe\033[0m")
+    harmless = expl.explain("xss_reflected", parameter="q",
+                            payload="cbtest123", reflected=False,
+                            url="https://example.bike/search")
+    check("no recorded reflection means no XSS claim",
+          "does not establish XSS" in harmless.text())
+    reflected = expl.explain("xss_reflected", parameter="q",
+                             payload="<cb>test</cb>", reflected=True,
+                             context="HTML body")
+    check("reflection alone is described as reflection",
+          "reflected into the response" in reflected.text())
+    check("and execution is explicitly not claimed",
+          "not demonstrated" in reflected.text())
+    executed = expl.explain("xss_reflected", parameter="q",
+                            payload="<script>alert(document.domain)</script>",
+                            reflected=True, executed=True,
+                            context="HTML body")
+    check("only a browser-confirmed case claims execution",
+          "executed by a browser" in executed.text())
+    check("and it carries no 'not demonstrated' caveat",
+          "not demonstrated" in executed.text(), False)
+
+    print("\n\033[1mSQL injection needs more than a 500\033[0m")
+    thin = expl.explain("sqli", parameter="id", payload="1'")
+    check("no differential or DB error means no claim",
+          "does not establish injection" in thin.text())
+    check("and it says a generic error is not enough",
+          "generic server error is not enough" in thin.text())
+    solid = expl.explain("sqli", parameter="id", payload="1 AND 1=1",
+                         differential=True)
+    check("a differential does establish it",
+          "reaches a SQL query" in solid.text())
+    check("while saying what was not done",
+          "Data was not extracted" in solid.text())
+
+    print("\n\033[1mCommand injection needs observed execution\033[0m")
+    no_proof = expl.explain("command_injection", parameter="host",
+                            payload="127.0.0.1;id")
+    check("a template match alone claims nothing",
+          "Nothing here shows input reaching a shell" in no_proof.text())
+    with_proof = expl.explain("command_injection", parameter="host",
+                              payload="127.0.0.1;id",
+                              command_output="uid=33(www-data)")
+    check("observed output does establish it",
+          "reaches a shell" in with_proof.text())
+
+    print("\n\033[1mHistorical findings can be re-measured\033[0m")
+    import importlib.util as _ilu
+    report_script = Path(__file__).resolve().parent.parent \
+        / "reclassify_report.py"
+    check("the measurement tool is present", report_script.is_file())
+    if report_script.is_file():
+        spec = _ilu.spec_from_file_location("_reclassify", report_script)
+        module = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        saved = [
+            {"key": "command_injection", "severity": "CRITICAL",
+             "state": "DETECTED", "where": "https://x/",
+             "evidence": "nuclei template 'missing-sri' matched. "
+                         "Extracted: https://cdn.test/a.js"},
+            {"key": "xss_reflected", "severity": "HIGH",
+             "state": "DETECTED", "where": "https://x/",
+             "evidence": "X-XSS-Protection header: 1; mode=block"},
+            {"key": "command_injection", "severity": "CRITICAL",
+             "state": "CONFIRMED", "where": "https://x/ping?host=1",
+             "evidence": "parameter: host\\npayload: 1;id\\n"
+                         "uid=33(www-data) in the response"},
+        ]
+        verdicts = [module.assess(row)[0] for row in saved]
+        check("the two misclassifications are reclassified",
+              verdicts[:2], ["reclassified", "reclassified"])
+        check("the genuine confirmed injection is retained",
+              verdicts[2], "retained")
+        check("and the tool reads findings without writing them",
+              "writes nothing" in report_script.read_text())
+
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  Grouped findings — presentation only
+    # ═══════════════════════════════════════════════════════════════════
+    #
+    # The rule the whole feature rests on: grouping changes what is
+    # DRAWN and nothing else. Every assertion below either checks the
+    # arrangement or checks that a child is untouched by it.
+    print("\n\033[1mFinding groups\033[0m")
+    from command_bridge.modules import finding_groups as groups_mod
+
+    def made(key, severity, title, stage="", status="Confirmed"):
+        finding = CBFinding(severity, title, "https://example.bike/",
+                            "detail", "evidence", "", stage)
+        finding.key = key
+        finding.status_label = status
+        return finding
+
+    TLS = [made("lucky13", "LOW", "Lucky 13 (CBC ciphers supported)",
+                "testssl", "Potential"),
+           made("weak_cipher", "MEDIUM", "Weak cipher suites offered",
+                "testssl"),
+           made("obsolete_protocol", "MEDIUM", "Obsolete TLS protocol",
+                "testssl"),
+           made("cert_expiring", "INFO", "Certificate nearing expiry",
+                "testssl")]
+    CSP = [made("cross_site_framing", "MEDIUM", "Cross-Site Framing",
+                "headers"),
+           made("csp_unsafe_script", "MEDIUM", "CSP allows untrusted script",
+                "headers"),
+           made("csp_form_hijack", "LOW", "CSP allows form hijacking",
+                "headers", "Potential")]
+    HEADERS = [made("nosniff_missing", "LOW", "X-Content-Type-Options "
+                                              "missing", "headers"),
+               made("referrer_policy", "LOW", "Referrer-Policy not set",
+                    "headers"),
+               made("xss_protection_deprecated", "INFO",
+                    "Deprecated X-XSS-Protection header", "nuclei")]
+    ALONE = [made("command_injection", "CRITICAL", "OS command injection",
+                  "active-scan"),
+             made("shell_history_exposed", "HIGH",
+                  "Exposed shell history file", "nikto")]
+
+    everything = TLS + CSP + HEADERS + ALONE
+    grouped, loose = groups_mod.organise(everything)
+    by_key = {g.key: g for g in grouped}
+
+    # 1-3. the three groups form
+    check("1. four TLS findings form one group",
+          by_key["tls"].count, 4)
+    check("   and it is titled for a reader",
+          by_key["tls"].title, "TLS/SSL — Several Issues Detected")
+    check("2. three CSP findings form one group", by_key["csp"].count, 3)
+    check("   titled for CSP", by_key["csp"].title,
+          "Content-Security-Policy — Several Issues Detected")
+    check("3. the header findings group too", by_key["headers"].count, 3)
+    check("   titled for headers", by_key["headers"].title,
+          "HTTP Security Headers — Several Issues Detected")
+
+    # 4. CSP is not also under HTTP Security Headers
+    csp_ids = {id(f) for f in by_key["csp"].findings}
+    header_ids = {id(f) for f in by_key["headers"].findings}
+    check("4. no finding is in both CSP and HTTP Security Headers",
+          csp_ids & header_ids, set())
+    check("   the CSP keys are the CSP ones",
+          sorted(f.key for f in by_key["csp"].findings),
+          ["cross_site_framing", "csp_form_hijack", "csp_unsafe_script"])
+
+    # 5. unrelated findings stay separate
+    check("5. unrelated findings are not grouped", len(loose), 2)
+    check("   the critical injection keeps its own row",
+          any(f.key == "command_injection" for f in loose))
+    check("   and so does the file exposure",
+          any(f.key == "shell_history_exposed" for f in loose))
+
+    # counts, once each
+    check("every finding is placed exactly once",
+          groups_mod.total_shown(grouped, loose), len(everything))
+    placed = [f for g in grouped for f in g.findings] + loose
+    check("and none is placed twice",
+          len({id(f) for f in placed}), len(everything))
+
+    # 8. children keep everything that was theirs
+    tls_lucky = next(f for f in by_key["tls"].findings
+                     if f.key == "lucky13")
+    original = next(f for f in TLS if f.key == "lucky13")
+    check("8. a grouped child is the same object, not a copy",
+          tls_lucky is original)
+    check("   it keeps its severity", tls_lucky.severity, "LOW")
+    check("   its confirmation status",
+          getattr(tls_lucky, "status_label", ""), "Potential")
+    check("   its scanner attribution", tls_lucky.stage, "testssl")
+    check("   and its evidence", tls_lucky.evidence, "evidence")
+
+    # 9. parent summaries are computed from the children
+    tls_summary = by_key["tls"].summary()
+    check("9. the summary counts the findings",
+          tls_summary.startswith("4 findings"))
+    check("   and the severities present",
+          "2 Medium" in tls_summary and "1 Low" in tls_summary
+          and "1 Informational" in tls_summary)
+    check("   and the confirmation statuses",
+          "3 Confirmed" in tls_summary and "1 Potential" in tls_summary)
+    check("   a severity that is absent is not mentioned",
+          "Critical" in tls_summary, False)
+    check("   the worst severity present is reported as such",
+          by_key["tls"].worst_severity, "MEDIUM")
+    check("   and the group is not labelled by its worst child alone",
+          tls_summary.strip().startswith("Medium"), False)
+
+    # 12. an informational-only group claims nothing
+    info_only = groups_mod.organise([
+        made("xss_protection_deprecated", "INFO", "Deprecated header",
+             "nuclei"),
+        made("referrer_policy", "INFO", "Referrer-Policy not set",
+             "headers")])[0][0]
+    check("12. a group of observations says so",
+          "no vulnerability claimed" in info_only.summary())
+    check("    and reports itself as informational only",
+          info_only.informational_only)
+    check("    while a group with a real finding does not",
+          by_key["tls"].informational_only, False)
+
+    # 13. a single finding is not forced into a group
+    single_groups, single_loose = groups_mod.organise(
+        [made("lucky13", "LOW", "Lucky 13", "testssl")])
+    check("13. one TLS finding is not a group of one",
+          (len(single_groups), len(single_loose)), (0, 1))
+
+    # 11. separate targets never share a group instance
+    first = groups_mod.organise(TLS)[0][0]
+    other_target = [made(f.key, f.severity, f.title, f.stage) for f in TLS]
+    for finding in other_target:
+        finding.where = "https://other.example/"
+    second = groups_mod.organise(other_target)[0][0]
+    check("11. each target's group holds only its own findings",
+          {id(f) for f in first.findings} & {id(f) for f in second.findings},
+          set())
+    check("    and its own locations",
+          {f.where for f in second.findings}, {"https://other.example/"})
+
+    check("a category with no members produces no group",
+          any(g.key == "injection" for g in grouped), False)
+    check("adding a category needs no UI change — the UI reads this list",
+          all(hasattr(c, "title") and hasattr(c, "order")
+              for c in groups_mod.CATEGORIES))
 
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0

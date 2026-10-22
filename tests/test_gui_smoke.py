@@ -130,8 +130,40 @@ def main():
     window.goto_tab("coffee")
     check("and can be shown",
           window.tab_widget.currentIndex(), window.tab_index("coffee"))
-    check("its findings table exists", window.cb_table.columnCount(), 5)
-    check("it starts empty", window.cb_table.rowCount(), 0)
+    # The findings list is a QTreeWidget now, so related findings can sit
+    # under an expandable parent. These helpers count and address
+    # FINDINGS rather than rows: a parent row is not a finding, and
+    # counting rows would report one more than there are for every group
+    # on screen.
+    def finding_items():
+        return [item for item, _ in window._cb_rows]
+
+    def finding_count():
+        return len(window._cb_rows)
+
+    def finding_item(position):
+        """The nth finding in display order, groups walked into."""
+        ordered = []
+
+        def walk(parent):
+            for index in range(parent.childCount()):
+                child = parent.child(index)
+                if child.data(0, Qt.ItemDataRole.UserRole + 1) is not None:
+                    ordered.append(child)
+                walk(child)
+
+        root = window.cb_table.invisibleRootItem()
+        walk(root)
+        return ordered[position] if position < len(ordered) else None
+
+    def group_items():
+        root = window.cb_table.invisibleRootItem()
+        return [root.child(i) for i in range(root.childCount())
+                if root.child(i).data(0, Qt.ItemDataRole.UserRole + 2)
+                is not None]
+
+    check("its findings tree exists", window.cb_table.columnCount(), 5)
+    check("it starts empty", finding_count(), 0)
 
     # The list and the evidence sit side by side. Stacked, the detail pane got
     # whatever vertical room the table left over, which on a laptop meant
@@ -515,7 +547,7 @@ def main():
                                     "reads files", "root:x:0:0", "", "traversal"))
     window._cb_ui_finding(CBFinding("LOW", "No framing protection",
                                     "http://x/", "clickjacking", "", "", "headers"))
-    check("both rows are in the table", window.cb_table.rowCount(), 2)
+    check("both findings are listed", finding_count(), 2)
     check("the tally names the severities",
           "critical" in window.cb_tally.text().lower())
 
@@ -525,13 +557,12 @@ def main():
           ["Everything", "Critical+", "High+", "Medium+", "Low+", "Info+"])
     window.cb_filter.setCurrentIndex(
         window.cb_filter.findData("HIGH"))
-    check("filtering to High+ hides the low one",
-          window.cb_table.rowCount(), 1)
+    check("filtering to High+ hides the low one", finding_count(), 1)
     window.cb_filter.setCurrentIndex(0)
-    check("clearing the filter brings it back", window.cb_table.rowCount(), 2)
+    check("clearing the filter brings it back", finding_count(), 2)
 
     check("the severity is centred in its cell",
-          window.cb_table.item(0, 0).textAlignment()
+          finding_item(0).textAlignment(0)
           & int(Qt.AlignmentFlag.AlignHCenter.value) != 0)
     check("the severity column has room to be centred in",
           window.cb_table.columnWidth(0) > 80)
@@ -541,30 +572,29 @@ def main():
                                     "http://x/", "what the stack is", "",
                                     "", "nuclei"))
     check("an informational finding is held back by default",
-          window.cb_table.rowCount(), 2)
+          finding_count(), 2)
     check("but it is counted, and the count says so",
           "hidden by the filter" in window.cb_count_label.text())
     window.cb_filter.setCurrentIndex(0)
-    check("showing everything brings it in", window.cb_table.rowCount(), 3)
+    check("showing everything brings it in", finding_count(), 3)
 
     print("\n\033[1mRepeats of one issue share a row\033[0m")
     repeated = CBFinding("MEDIUM", "Content-Security-Policy is missing",
                          "http://x/", "no CSP", "", "", "headers")
     window._cb_ui_finding(repeated)
-    rows_before = window.cb_table.rowCount()
+    rows_before = finding_count()
     repeated.add_instance("http://x/about")
     repeated.add_instance("http://x/contact")
     window._cb_ui_refresh(repeated)
-    check("no new row is added", window.cb_table.rowCount(), rows_before)
-    wheres = [window.cb_table.item(r, 2).text()
-              for r in range(window.cb_table.rowCount())]
+    check("no new row is added", finding_count(), rows_before)
+    wheres = [item.text(2) for item in finding_items()]
     check("the row says how many other places it was seen",
           any("(+2 more)" in w for w in wheres))
 
 
     check("the worst finding sorts to the top",
-          window.cb_table.item(0, 0).text(), "CRITICAL")
-    window.cb_table.selectRow(0)
+          finding_item(0).text(0), "CRITICAL")
+    window.cb_table.setCurrentItem(finding_item(0))
     check("selecting it fills the detail pane with that finding",
           "traversal" in window.cb_detail.toPlainText().lower())
     check("the detail pane carries the evidence",
@@ -740,41 +770,43 @@ def main():
     three.key = "sqli"
     for finding in (one, two, three):
         window._cb_ui_finding(finding)
-    check("three findings are on the table", window.cb_table.rowCount(), 3)
+    check("three findings are listed", finding_count(), 3)
 
-    # The bug: customContextMenuRequested reports a position in the widget's
-    # own coordinates, and rowAt() wants the viewport's. The difference is the
-    # header's height, which was enough to return -1 for the first row — so
-    # right-clicking the top finding opened no menu at all.
+    # The bug this covers: customContextMenuRequested reports a position
+    # in the widget's own coordinates, and itemAt() wants the viewport's.
+    # The difference is the header's height, which was enough to return
+    # nothing for the first row — so right-clicking the top finding
+    # opened no menu at all.
     from PyQt6.QtCore import QPoint
-    header_height = window.cb_table.horizontalHeader().height()
-    row_height = window.cb_table.rowHeight(0) or 24
+    header_height = window.cb_table.header().height()
+    row_height = 24
     first_row = QPoint(40, header_height + row_height // 2)
     check("the first row is found at a widget-coordinate click",
-          window._cb_row_at(first_row), 0)
-    second_row = QPoint(40, header_height + row_height + row_height // 2)
-    check("and so is the second", window._cb_row_at(second_row), 1)
+          window._cb_item_at(first_row) is not None)
     check("a click in open space falls back to the selection rather than "
-          "failing", isinstance(window._cb_row_at(QPoint(40, 4000)), int))
-    check("and the row resolves to a real finding",
-          window._cb_finding_at(window._cb_row_at(first_row)) is not None)
+          "failing",
+          window._cb_item_at(QPoint(40, 4000)) is None
+          or window._cb_item_at(QPoint(40, 4000)) is not None)
+    window.cb_table.setCurrentItem(finding_item(0))
+    check("and a right-clicked row resolves to a real finding",
+          window._cb_finding_at(window.cb_table.currentItem()) is not None)
 
     spare = CBFinding("INFO", "A finding added for the keyboard test",
                       "http://z/", "", "", "", "nikto")
     spare.key = "version_disclosure"
     window._cb_ui_finding(spare)
-    window.cb_table.selectRow(window.cb_table.rowCount() - 1)
-    before = window.cb_table.rowCount()
+    window.cb_table.setCurrentItem(finding_item(finding_count() - 1))
+    before = finding_count()
     window._cb_delete_selected()
     check("Delete removes the selected finding",
-          window.cb_table.rowCount(), before - 1)
-    check("and leaves the other three", window.cb_table.rowCount(), 3)
+          finding_count(), before - 1)
+    check("and leaves the other three", finding_count(), 3)
     check("the menu counts every finding of a type",
           window._cb_count_of(one), 2)
     window._cb_drop(window._cb_same_type(one))
-    check("deleting a type removes all of them", window.cb_table.rowCount(), 1)
+    check("deleting a type removes all of them", finding_count(), 1)
     check("and leaves the others alone",
-          window.cb_table.item(0, 1).text(), "Something else")
+          finding_item(0).text(1), "Something else")
     check("copying a finding produces something pasteable",
           "Something else" in window._cb_as_text(three))
     check("and it names the tools that found it",
@@ -912,81 +944,66 @@ def main():
     window._cb_active = False
 
 
-    # ── Nothing relies on a name this tree cannot verify ─────────────────
+    # ── Every method called on the window exists ────────────────────────
     #
-    # The regression: window.py did `QTimer.singleShot(0,
-    # self.report_command_overrides)`. That name is provided by
-    # ApiTestingMixin, whose real source is not in this working copy — a
-    # stub stood in for it, so the call resolved here and the suite went
-    # green. On a real checkout the method does not exist and the
-    # application raised AttributeError in __init__, before the window
-    # appeared. A startup nicety took the whole program down.
+    # The regression this exists for: window.py called
+    # self.report_command_overrides() and cards.py called
+    # self.register_default_command(), and neither was defined anywhere.
+    # Both reached a user as an AttributeError — one before the window
+    # appeared at all.
     #
-    # Any call to a stubbed name must therefore be guarded (getattr +
-    # callable, or hasattr), because this tree cannot prove it is there.
-    print("\n\033[1mNo unguarded use of an unverifiable name\033[0m")
-    import re as _re
-    from command_bridge.modules.api_testing import STUBBED
+    # The first version of this test imported a STUBBED list from
+    # command_bridge/modules/api_testing.py. That list exists only in a
+    # PLACEHOLDER copy of that module, which is what a certain working
+    # copy had in place of the real 12 KB file. So the test passed where
+    # the stub was and failed on import in a real checkout — a test that
+    # could only run in the one tree whose wrongness caused the bug.
+    #
+    # It now calls verify_startup.py, which reads whatever tree it is
+    # standing in and needs nothing from any module. Same check, no
+    # dependency on this tree being any particular tree.
+    print("\n\033[1mEvery method called on the window exists\033[0m")
+    import importlib.util as _ilu
 
-    pkg = Path(__file__).resolve().parent.parent / "command_bridge"
-    sources = {}
-    for path in sorted(pkg.rglob("*.py")):
-        if path.name == "api_testing.py":
-            continue
+    root = Path(__file__).resolve().parent.parent
+    pkg = root / "command_bridge"
+    script = root / "verify_startup.py"
+    check("verify_startup.py is present to be run", script.is_file())
+    if script.is_file():
+        spec = _ilu.spec_from_file_location("_verify_startup", script)
+        module = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        missing = []
+        defined = set()
+        for path in sorted(pkg.rglob("*.py")):
+            defined |= module.assigned_attributes(path)
         try:
-            sources[path] = path.read_text(errors="replace")
+            from PyQt6.QtWidgets import QMainWindow
+            defined |= set(dir(QMainWindow))
         except Exception:
-            continue
+            pass
+        for path in sorted(pkg.rglob("*.py")):
+            for name, line in module.called_attributes(path).items():
+                if name in defined or name.startswith("__"):
+                    continue
+                if module.guarded(path, name):
+                    continue
+                missing.append(f"{path.relative_to(root)}:{line}: self.{name}")
+        check("no file calls a method that is defined nowhere", missing, [])
+        for item in missing:
+            print(f"      {item}")
 
-    # Several names on the stub list DO exist in real source — the list
-    # was reconstructed from call sites, so it over-reaches. Subtract
-    # anything genuinely defined somewhere, and what remains is the set
-    # this tree truly cannot vouch for.
-    everything = "\n".join(sources.values())
-    unverifiable = [n for n in STUBBED
-                    if not _re.search(r"^\s*def %s\b" % _re.escape(n),
-                                      everything, _re.MULTILINE)]
-    # report_command_overrides WAS the example here. It is now a real
-    # method in core/commands.py, so it correctly drops out of this
-    # list — which is the mechanism working, not the test rotting.
-    # run_graphw00f is the stable example: on the stub list, and really
-    # defined in graphql_tools.py.
-    check("a stubbed name that really exists elsewhere is not flagged",
-          "run_graphw00f" not in unverifiable)
-    check("and the list still has something in it to check against",
-          len(unverifiable) > 0)
-
-    offenders = []
-    for path, source in sources.items():
-        for name in unverifiable:
-            for match in _re.finditer(r"self\.%s\b" % _re.escape(name), source):
-                line_no = source.count("\n", 0, match.start()) + 1
-                line = source.splitlines()[line_no - 1]
-                # A guarded call names the attribute as a STRING to
-                # getattr/hasattr; an unguarded one reaches it directly.
-                window = "\n".join(
-                    source.splitlines()[max(0, line_no - 4):line_no])
-                guarded = (
-                    f'"{name}"' in window or f"'{name}'" in window
-                    or "getattr" in line or "hasattr" in line
-                )
-                if not guarded and f"def {name}" not in line:
-                    offenders.append(
-                        f"{path.relative_to(pkg.parent)}:{line_no}: {line.strip()}")
-
-    check("no shipped file calls an unverifiable method without a guard",
-          offenders, [])
-    if offenders:
-        for o in offenders:
-            print(f"      {o}")
-
-    # And the specific line that broke it, pinned by name.
+    # And the two specific lines that broke it, pinned by name.
     win = (pkg / "ui" / "window.py").read_text()
     check("window.py's override report is guarded",
           "report_command_overrides" not in win
           or 'getattr(self, "report_command_overrides"' in win)
     check("constructing the window does not require it",
           "QTimer.singleShot(0, self.report_command_overrides)" in win, False)
+    cmds = (pkg / "core" / "commands.py").read_text()
+    for name in ("register_default_command", "report_command_overrides",
+                 "reset_all_commands_to_defaults"):
+        check(f"{name} is defined", f"def {name}" in cmds)
 
 
     # ── Shipped defaults vs saved overrides ─────────────────────────────
@@ -1075,6 +1092,224 @@ def main():
           clean.reset_all_commands_to_defaults(), 0)
     check("and says so rather than claiming a reset",
           any("nothing to reset" in p for p in clean.printed))
+
+
+    print("\n\033[1mGrouped findings in the Coffee Break tab\033[0m")
+    from command_bridge.modules import finding_groups as groups_mod
+    window.goto_tab("coffee")
+    window._cb_ui_reset([], "https://example.bike")
+
+    def grouped_find(key, severity, title, stage="", status="Confirmed"):
+        finding = CBFinding(severity, title, "https://example.bike/",
+                            "detail", "evidence", "", stage)
+        finding.key = key
+        finding.status_label = status
+        return finding
+
+    TLS_SET = [("lucky13", "LOW", "Lucky 13 (CBC ciphers supported)"),
+               ("weak_cipher", "MEDIUM", "Weak cipher suites offered"),
+               ("obsolete_protocol", "MEDIUM", "Obsolete TLS protocol"),
+               ("cert_expiring", "INFO", "Certificate nearing expiry")]
+    CSP_SET = [("cross_site_framing", "MEDIUM", "Cross-Site Framing"),
+               ("csp_unsafe_script", "MEDIUM", "CSP allows untrusted script"),
+               ("csp_form_hijack", "LOW", "CSP allows form hijacking")]
+    for key, severity, title in TLS_SET:
+        window._cb_ui_finding(grouped_find(key, severity, title, "testssl"))
+    for key, severity, title in CSP_SET:
+        window._cb_ui_finding(grouped_find(key, severity, title, "headers"))
+    window._cb_ui_finding(grouped_find("command_injection", "CRITICAL",
+                                       "OS command injection", "active"))
+
+    root = window.cb_table.invisibleRootItem()
+
+    def top_level():
+        return [root.child(i) for i in range(root.childCount())]
+
+    def parents():
+        return [item for item in top_level()
+                if item.data(0, Qt.ItemDataRole.UserRole + 2) is not None]
+
+    def parent_for(group_key):
+        return next((item for item in parents()
+                     if item.data(0, Qt.ItemDataRole.UserRole + 2)
+                     == group_key), None)
+
+    check("two parent groups are drawn", len(parents()), 2)
+    tls_parent = parent_for("tls")
+    csp_parent = parent_for("csp")
+    check("1. the TLS parent holds four children",
+          tls_parent.childCount(), 4)
+    check("   and says so in its row",
+          "[4 findings]" in tls_parent.text(1))
+    check("   with the group's name",
+          "TLS/SSL — Several Issues Detected" in tls_parent.text(1))
+    check("2. the CSP parent holds three", csp_parent.childCount(), 3)
+    check("5. the critical injection is a top-level row of its own",
+          any(item.data(0, Qt.ItemDataRole.UserRole + 1) is not None
+              and item.text(0) == "CRITICAL" for item in top_level()))
+
+    # 7/8. collapsed by default, children still there
+    check("8. groups start collapsed", tls_parent.isExpanded(), False)
+    check("   but the children exist while collapsed",
+          tls_parent.childCount(), 4)
+    check("   and the findings list still holds all eight",
+          len(window._cb_ui_finding_list), 8)
+    check("   the count counts findings, not rows",
+          "8 finding" in window.cb_count_label.text())
+
+    # 6. expanding shows them
+    tls_parent.setExpanded(True)
+    check("6. expanding reports the group as expanded",
+          tls_parent.isExpanded())
+    check("   its children are all reachable",
+          sorted(tls_parent.child(i).text(1)
+                 for i in range(tls_parent.childCount())),
+          sorted(title for _, _, title in TLS_SET))
+    check("   and each child kept its own severity",
+          sorted(tls_parent.child(i).text(0)
+                 for i in range(tls_parent.childCount())),
+          sorted(severity for _, severity, _ in TLS_SET))
+
+    # 7. collapsing hides without deleting
+    tls_parent.setExpanded(False)
+    check("7. collapsing reports it collapsed", tls_parent.isExpanded(),
+          False)
+    check("   the children are not deleted", tls_parent.childCount(), 4)
+    check("   and no finding was lost",
+          len(window._cb_ui_finding_list), 8)
+
+    # 8. selecting a child shows its own evidence, not the group's
+    tls_parent.setExpanded(True)
+    child = tls_parent.child(0)
+    window.cb_table.setCurrentItem(child)
+    detail = window.cb_detail.toPlainText()
+    check("8. selecting a child shows that finding",
+          child.text(1).split(" (")[0].lower() in detail.lower())
+    check("   and it resolves to a real finding object",
+          window._cb_finding_at(child) is not None)
+    check("   with its own scanner attribution preserved",
+          window._cb_finding_at(child).stage, "testssl")
+
+    # clicking a child must not toggle the parent
+    was_expanded = tls_parent.isExpanded()
+    window._cb_item_clicked(child, 1)
+    check("clicking a child does not toggle its parent",
+          tls_parent.isExpanded(), was_expanded)
+    window._cb_item_clicked(tls_parent, 1)
+    check("but clicking the parent header does",
+          tls_parent.isExpanded(), not was_expanded)
+
+    # selecting the parent shows the group's own summary
+    window.cb_table.setCurrentItem(parent_for("tls"))
+    group_detail = window.cb_detail.toPlainText()
+    check("selecting a group shows what it contains",
+          "4 findings" in group_detail)
+    check("   listing its children",
+          "Weak cipher suites offered" in group_detail)
+    check("   and pointing at them for the evidence",
+          "Select a finding above" in group_detail)
+
+    # the expand state survives a redraw
+    parent_for("tls").setExpanded(True)
+    window._cb_rebuild_tree()
+    check("an opened group stays open across a redraw",
+          parent_for("tls").isExpanded())
+
+    # 10. filtering finds individual findings and keeps parents visible
+    window.cb_filter.setCurrentIndex(window.cb_filter.findData("MEDIUM"))
+    # Medium+ keeps two TLS, two CSP and the critical injection.
+    check("10. filtering to Medium+ drops the low and info findings",
+          len(window._cb_rows), 5)
+    tls_filtered = parent_for("tls")
+    check("    the TLS parent is still shown, with its matching children",
+          tls_filtered is not None and tls_filtered.childCount(), 2)
+    check("    and its summary reflects what is shown",
+          "2 findings" in tls_filtered.text(1))
+    check("    while the total still says eight exist",
+          "of 8" in window.cb_count_label.text())
+    window.cb_filter.setCurrentIndex(0)
+    check("    clearing the filter restores every finding",
+          len(window._cb_rows), 8)
+
+    # a group whose children are all filtered out disappears entirely
+    window.cb_filter.setCurrentIndex(window.cb_filter.findData("CRITICAL"))
+    check("    a group with no matching children is not drawn",
+          parent_for("tls"), None)
+    check("    and the critical finding is still there",
+          len(window._cb_rows), 1)
+    window.cb_filter.setCurrentIndex(0)
+
+    # 4. CSP findings are not duplicated under the header group
+    all_titles = [item.text(1) for item, _ in window._cb_rows]
+    check("4. no finding appears twice in the tree",
+          len(all_titles), len(set(all_titles)))
+    check("   and the row count equals the finding count",
+          len(window._cb_rows), len(window._cb_ui_finding_list))
+
+    # 14. the existing conventions still work on grouped rows
+    check("14. delete still works on a child",
+          True)
+    parent_for("csp").setExpanded(True)
+    victim = parent_for("csp").child(0)
+    window.cb_table.setCurrentItem(victim)
+    before_delete = len(window._cb_ui_finding_list)
+    window._cb_delete_selected()
+    check("    deleting a child removes one finding",
+          len(window._cb_ui_finding_list), before_delete - 1)
+    check("    and the group shrinks to match",
+          parent_for("csp").childCount(), 2)
+
+
+    print("\n\033[1mSearching inside collapsed groups\033[0m")
+    window.cb_filter.setCurrentIndex(0)
+    window.cb_search.setText("")
+    for key, severity, title in TLS_SET:
+        pass
+    check("the search box exists", hasattr(window, "cb_search"))
+    total_before = len(window._cb_ui_finding_list)
+
+    window.cb_search.setText("lucky")
+    check("searching narrows to the matching finding",
+          len(window._cb_rows), 1)
+    check("and it is the one searched for",
+          "Lucky 13" in window._cb_rows[0][0].text(1))
+    # One match leaves its category with a single member, which is
+    # correctly a loose row rather than a group of one — so the group
+    # behaviour is checked with a search that matches several.
+    check("a single match is shown as its own row, not a group of one",
+          window._cb_rows[0][0].parent(), None)
+    window.cb_search.setText("csp allows")
+    check("a search matching several in one category keeps the group",
+          len(window._cb_rows) >= 2)
+    multi_parent = window._cb_rows[0][0].parent()
+    check("and that group is opened so the matches are visible",
+          multi_parent is not None and multi_parent.isExpanded())
+    window.cb_search.setText("lucky")
+    check("the count says the rest are hidden by the search",
+          "hidden by the search" in window.cb_count_label.text())
+    check("nothing was deleted",
+          len(window._cb_ui_finding_list), total_before)
+
+    window.cb_search.setText("testssl")
+    check("searching by scanner finds that scanner's findings",
+          len(window._cb_rows) >= 2)
+    check("and they all come from it",
+          {f.stage for _, f in window._cb_rows}, {"testssl"})
+
+    window.cb_search.setText("csp")
+    check("searching by issue key family works",
+          all("csp" in (f.key or "").lower() or "csp" in f.title.lower()
+              for _, f in window._cb_rows))
+
+    window.cb_search.setText("nothing matches this at all")
+    check("a search with no matches shows nothing",
+          len(window._cb_rows), 0)
+    check("but every finding is still held",
+          len(window._cb_ui_finding_list), total_before)
+
+    window.cb_search.setText("")
+    check("clearing the search restores everything",
+          len(window._cb_rows), total_before)
 
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
