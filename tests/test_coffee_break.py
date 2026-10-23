@@ -2755,6 +2755,97 @@ back-end DBMS: MySQL >= 5.6
           "xss-deprecated-header" in cb_evidence.detail_html(deprecated))
     hdr_srv.shutdown()
 
+    print("\n\033[1mA1 — the same row with nowhere to read the header "
+          "back\033[0m")
+    # The live sighting: nuclei claiming HIGH, against a host this
+    # process cannot reach. Nothing about the rating may come from the
+    # scanner's claim or from "xss" in the template id.
+    unreachable = Engine("https://rider-web.basis-development.bike")
+    live_row = {
+        "template-id": "xss-deprecated-header",
+        "matched-at": "https://rider-web.basis-development.bike",
+        "info": {"name": "X-XSS-Protection Header - Deprecated",
+                 "severity": "high", "tags": ["xss", "misconfig"],
+                 "description": "The X-XSS-Protection header is deprecated."},
+        "extracted-results": ["1; mode=block"],
+        "request": "GET / HTTP/1.1",
+    }
+    unreachable._cb_parse_nuclei({"key": "nuclei"}, json.dumps(live_row))
+    check("1. one finding, and it is not XSS",
+          len(unreachable._cb_findings), 1)
+    live = unreachable._cb_findings[0]
+    check("   not reflected cross-site scripting",
+          "scripting" in live.title.lower(), False)
+    check("   named as the header", live.key, "xss_protection_deprecated")
+    check("2. Informational, not the scanner's HIGH", live.severity, "INFO")
+    check("3. inconclusive, because nothing read the header back",
+          getattr(live, "status_label", ""), "Inconclusive")
+    check("   and not 'Potential', which would read as a potential "
+          "vulnerability",
+          getattr(live, "status_label", "") == "Potential", False)
+    check("   the affected URL is the scan's own target",
+          "rider-web.basis-development.bike" in live.where)
+    check("   nuclei keeps the attribution",
+          getattr(live, "scanner_severity", ""), "HIGH")
+
+    # 4. through export.
+    blob = unreachable._cb_findings_json()
+    exported = json.loads(blob)["findings"][0]
+    check("4. the export never says reflected XSS",
+          "reflected" in blob.lower(), False)
+    check("   and carries the corrected title",
+          "Deprecated X-XSS-Protection header" in blob)
+    check("   with the rating it was given", exported["severity"], "INFO")
+    check("   and the template id, for audit",
+          exported["template_id"], "xss-deprecated-header")
+    check("   attributed to nuclei", exported["detected_by"], "nuclei")
+    check("   the exported state agrees with the table, not the raw "
+          "verification",
+          exported["state"], "INCONCLUSIVE")
+    check("   and the exported status reads the same",
+          exported["status"], "Inconclusive")
+
+    # 7. reprocessing the same scanner output.
+    before = len(unreachable._cb_findings)
+    unreachable._cb_parse_nuclei({"key": "nuclei"}, json.dumps(live_row))
+    check("7. reprocessing the same row adds no duplicate",
+          len(unreachable._cb_findings), before)
+
+    print("\n\033[1mA2 — a genuine XSS template is untouched\033[0m")
+    # 5/6. The guard is one template, not the word "xss". A template
+    # that demonstrates reflection with a payload still reports as XSS.
+    class _Reflects(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"<html>search: <script>alert(1)</script></html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    xss_srv, xss_base = _serve(_Reflects)
+    real = Engine(xss_base)
+    real._cb_parse_nuclei({"key": "nuclei"}, json.dumps({
+        "template-id": "reflected-xss",
+        "matched-at": xss_base + "/?q=%3Cscript%3Ealert(1)%3C/script%3E",
+        "info": {"name": "Reflected Cross-Site Scripting",
+                 "severity": "high", "tags": ["xss", "cve"],
+                 "description": "Payload reflected into the response body."},
+        "extracted-results": ["<script>alert(1)</script>"],
+        "request": "GET /?q=<script>alert(1)</script> HTTP/1.1",
+    }))
+    check("5. the genuine template still produces a finding",
+          len(real._cb_findings), 1)
+    genuine = real._cb_findings[0]
+    check("   and is not forced down to the header observation",
+          genuine.key == "xss_protection_deprecated", False)
+    check("6. nor flattened to Informational by a blanket xss rule",
+          genuine.severity in ("LOW", "MEDIUM", "HIGH", "CRITICAL"))
+    xss_srv.shutdown()
+
     print("\n\033[1mThe rule generalises to detectors with no entry\033[0m")
     invented = dreg.Detection(
         detector=dreg.Detector(

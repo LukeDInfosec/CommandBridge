@@ -1,7 +1,7 @@
 ================================================================================
  COMMAND BRIDGE v4 — PROJECT REFERENCE & CHANGELOG
  (Reference doc for Claude / future sessions. Keep this updated after changes.)
- Last updated: 2026-10-22
+ Last updated: 2026-10-23
 ================================================================================
 
 HOW TO USE THIS FILE
@@ -18,6 +18,45 @@ HOW TO USE THIS FILE
 ================================================================================
  CHANGELOG (most recent first)
 ================================================================================
+
+## 2026-10-23 — ONE STATUS, ONE PATH (6.9.7)
+
+Luke reported xss-deprecated-header still coming back as reflected
+XSS at HIGH. Replaying his exact nuclei row through the current tree
+produced the corrected finding — the 6.9.4 rule holds, and the
+sighting was from a build older than it. But chasing it found three
+real faults.
+
+1. TWO LINES, WRONG ORDER. _cb_record_detection ended with:
+
+       finding.state = _state_for(decision.status)
+       finding.state = _state_for(outcome.status)
+
+   The engine's verdict was computed and then overwritten by the raw
+   verification status. The table said Inconclusive while the exported
+   JSON said POTENTIAL for the same finding. The decision is now the
+   one source for state, status_label and confidence alike.
+
+2. "POTENTIAL" ON AN OBSERVATION. A self-evident observation has no
+   middle ground: the header was read back, or it was not. "Potential"
+   between them reads as a potential VULNERABILITY — the exact
+   conflation this detector exists to stop — so it now collapses to
+   Inconclusive unless a check actually established it.
+
+3. A SECOND NUCLEI PATH. externals_reporting.py (Active Scan) builds
+   rows straight from nuclei's own name and severity and never passes
+   the detector registry. A template the registry has corrected was
+   published there with the scanner's wording intact. It now consults
+   the registry for the name and the unconfirmed rating. Nothing else
+   is touched: a blanket "downgrade anything tagged xss" rule would
+   flatten genuine findings, which is the opposite mistake.
+
+Also: the findings JSON now carries status, detected_by, template_id
+and template_name, so a corrected classification can be audited
+against what the scanner actually said.
+
+CHANGED: modules/coffee_break.py, modules/classification.py,
+         modules/externals_reporting.py, tests/test_coffee_break.py
 
 ## 2026-10-22 — THE PARENT ROW HAD NO NAME (6.9.6)
 

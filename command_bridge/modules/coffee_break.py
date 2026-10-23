@@ -48,6 +48,7 @@ from command_bridge.constants import BASE_DIR
 from command_bridge.modules import cb_control, cb_evidence, cb_issues
 from command_bridge.modules import detector_registry, risk, verification
 from command_bridge.modules import cipher_properties, csp_analysis, explanations
+from command_bridge.modules import classification
 from command_bridge.modules.cb_control import RunGate, Stopped
 from command_bridge.modules.cb_evidence import Evidence
 from command_bridge.modules.cb_issues import ISSUES, clean_title
@@ -1712,6 +1713,15 @@ class CoffeeBreakMixin:
                     "key": finding.key,
                     "cwe": finding.cwe,
                     "scanner_severity": finding.scanner_severity,
+                    # Provenance, so a corrected classification can be
+                    # audited against what the scanner actually said.
+                    "status": getattr(finding, "status_label", ""),
+                    "detected_by": getattr(
+                        getattr(finding, "proof", None), "detector", ""),
+                    "template_id": getattr(
+                        getattr(finding, "proof", None), "template_id", ""),
+                    "template_name": getattr(
+                        getattr(finding, "proof", None), "template_name", ""),
                     "detail": finding.detail,
                     "evidence": finding.evidence,
                     "remediation": finding.remediation,
@@ -1879,6 +1889,56 @@ class CoffeeBreakMixin:
             return False
         return bool(candidate) and candidate == target_host
 
+    def _cb_explanation_context(self, detection, outcome, detector):
+        """What the explanation rules need, from what was established.
+
+        One place, so a rule is never handed a value nobody read. Each
+        entry below comes from the detection or from the verifier's own
+        outcome — never from the detector's metadata, which is what a
+        rule must not be allowed to describe as evidence.
+        """
+        verification = outcome.as_dict() if outcome is not None else {}
+        confirmed = (outcome is not None
+                     and outcome.status == detector_registry.CONFIRMED)
+        catch_all = "catch-all" in ((outcome.reason if outcome else "") or "")
+        extracted = [str(x) for x in (detection.extracted or ()) if x]
+        name = detection.detector_name or ""
+
+        if detector.observation == classification.HEADER_VALUE:
+            value = ""
+            for line in (outcome.evidence if outcome else []):
+                prefix = f"{detector.header}:"
+                if detector.header and str(line).strip().startswith(prefix):
+                    value = str(line).split(":", 1)[1].strip()
+                    break
+            return {"header_name": detector.header,
+                    "header_value": value or (extracted[0] if extracted
+                                              else ""),
+                    "present": bool(value or extracted),
+                    "url": detection.url}
+
+        if name == "shell_history":
+            return {"path": detection.path or detection.url,
+                    "http_status": verification.get("http_status") or 0,
+                    "content_type": verification.get("content_type") or "",
+                    "body_bytes": _bytes_in(
+                        outcome.evidence if outcome else []),
+                    "confirmed": confirmed, "catch_all": catch_all}
+
+        if detector.issue_key in ("component_admin_exposed",
+                                  "component_known_vulnerable"):
+            return {"name": detector.component or detector.name,
+                    "version": _version_in(
+                        outcome.evidence if outcome else []),
+                    "path": detection.path or detection.url,
+                    "cves": detector.cves,
+                    "reachable": (outcome is not None and outcome.status
+                                  != detector_registry.INCONCLUSIVE)}
+
+        if detector.issue_key == "sri_missing":
+            return {"scripts": extracted, "url": detection.url}
+        return {}
+
     def _cb_explain_detection(self, detection, outcome, issue_key):
         """The explanation rule for a verified detection, or None.
 
@@ -1927,16 +1987,26 @@ class CoffeeBreakMixin:
         outcome = self._cb_verifier().run(detection)
         detection.status = outcome.status
 
-        issue_key = detector.issue_key
-        library = cb_issues.ISSUES.get(issue_key, {}) if issue_key else {}
-        impact_severity = library.get("severity") or \
-            detector.severity_if_confirmed
+        # The decision engine. Stages 2-8 in one place, the same for
+        # every scanner — see modules/classification.py. Its stage 3 is
+        # the general rule that replaced a table of special cases: a
+        # class needing a demonstrated behaviour cannot be carried by an
+        # observation that is only a header value, a cipher, a path or a
+        # banner, whatever the detector is named or tagged.
+        decision = classification.decide(
+            detection, outcome, issue_library=cb_issues.ISSUES,
+            verified=outcome.verified,
+            explanation_context=self._cb_explanation_context(
+                detection, outcome, detector))
 
-        reported, impact, note = risk.assess(
-            impact_severity, outcome.status,
-            vuln_class=issue_key or detector.vuln_class,
-            scanner_severity=detection.scanner_severity,
-            verified=outcome.verified)
+        issue_key = decision.issue_key
+        library = cb_issues.ISSUES.get(issue_key, {}) if issue_key else {}
+        reported, impact, note = (decision.severity, decision.impact_if_real,
+                                  "; ".join(decision.notes))
+        if decision.mismatch:
+            self.console.append_ansi(
+                f"    [i] {detection.scanner} '{detector.name}' was not "
+                f"reported as {detector.issue_key}: {decision.mismatch}\n")
 
         # A confirmed file exposure is a different issue from the
         # signature that led to it, and the library has an entry for it.
@@ -1948,17 +2018,14 @@ class CoffeeBreakMixin:
                 library["severity"], outcome.status,
                 vuln_class=issue_key, verified=True)
 
-        title = library.get("title") or detector.name
-        if detector.name and outcome.status != detector_registry.CONFIRMED:
+        title = decision.title or library.get("title") or detector.name
+        if detector.name and not decision.mismatch and \
+                outcome.status != detector_registry.CONFIRMED:
             title = detector.name
 
-        # The explanation rule for this class, built from the structured
-        # evidence the verifier gathered. See modules/explanations.py:
-        # the point is that every sentence is selected by a value that
-        # was read, so a finding says why it was raised rather than
-        # describing its vulnerability class in the abstract.
-        explanation = self._cb_explain_detection(detection, outcome,
-                                                 issue_key)
+        explanation = (decision.explanation
+                       or self._cb_explain_detection(detection, outcome,
+                                                     issue_key))
 
         evidence_lines = list(outcome.evidence)
         if detection.extracted:
@@ -2003,14 +2070,22 @@ class CoffeeBreakMixin:
         # The four fields the Findings section shows, settled here rather
         # than reconstructed by the renderer.
         finding.summary = (explanation.text() if explanation
-                           else outcome.summary)
+                           else (decision.summary or outcome.summary))
         if explanation:
             finding.explanation = explanation.as_dict()
-        finding.status_label = risk.status_label(outcome.status)
         finding.impact_if_real = impact
         finding.verification = outcome.as_dict()
         finding.detection = detection.as_dict()
-        finding.state = _state_for(outcome.status)
+        finding.decision = decision.as_dict()
+        finding.status_label = decision.status_label
+        # ONE source of truth for the status. These two lines used to sit
+        # here in this order, so the engine's verdict was computed and
+        # then overwritten by the raw verification status — which meant
+        # the table could say "Inconclusive" while the exported JSON said
+        # POTENTIAL for the same finding. The decision is what both read.
+        finding.state = _state_for(decision.status)
+        finding.confidence = ("firm" if decision.status ==
+                              detector_registry.CONFIRMED else "tentative")
 
         self._cb_record(finding)
         return 1 if reported != "INFO" else 0

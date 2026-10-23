@@ -29,6 +29,8 @@ import tempfile
 import subprocess
 from datetime import datetime
 from pathlib import Path
+
+from . import detector_registry
 from urllib import request as _urlrequest
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -302,6 +304,26 @@ class _ExternalsWebReconWorker(QObject):
                     sev = "INFO"
                 name = info.get("name", obj.get("template-id", "nuclei finding"))
                 target = obj.get("matched-at") or obj.get("host") or ""
+                # The Active Scan path builds its rows straight from
+                # nuclei's own name and severity. That is a second route
+                # into a report that never passes the detector registry,
+                # so a template the registry has corrected would be
+                # published here with the scanner's wording intact.
+                # The registry is consulted for the name and the rating;
+                # a template it does not name is left exactly as before.
+                template_id = obj.get("template-id", "")
+                tags = [str(t) for t in (info.get("tags") or [])] \
+                    if isinstance(info.get("tags"), list) else []
+                ruled = detector_registry.NUCLEI.get(template_id)
+                if ruled is not None:
+                    name = ruled.name or name
+                    # Unverified here: this path runs no follow-up check,
+                    # so the unconfirmed rating is the honest one.
+                    sev = (ruled.severity_unconfirmed
+                           or ruled.severity_if_confirmed or sev).upper()
+                # Nothing else is touched. A broad "downgrade anything
+                # tagged xss" rule would quietly flatten genuine
+                # findings, which is the opposite mistake.
                 findings.append({
                     "severity": sev, "title": f"[nuclei] {name}",
                     "target": target, "detail": obj.get("template-id", ""),
