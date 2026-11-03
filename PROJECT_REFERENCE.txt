@@ -19,6 +19,119 @@ HOW TO USE THIS FILE
  CHANGELOG (most recent first)
 ================================================================================
 
+## 2026-11-03 — THE PORT SCAN NOW MEANS SOMETHING (6.10.1)
+
+Coffee Break's first stage is nmap, and all it did with the result was
+report the dozen services in a hand-written table. So the ORDINARY
+case — SSH on 22 with a version banner, FTP on 21, an admin console on
+8080 — produced nothing at all. A chain of standard checks that runs
+the checks and reports nothing is worse than no chain, because the
+tester assumes it looked.
+
+NEW: modules/port_risk.py — the judgement a tester makes by eye,
+written down. ~40 service entries covering cleartext protocols, remote
+access, file sharing, datastores, container and orchestration APIs,
+management controllers, mail, directory, DNS, brokers, monitoring and
+printers, each with its exposure rating, why it matters in the words
+that go in a report, and the fix.
+
+Three principles it is built around:
+
+  1. REACHABILITY IS PART OF THE FINDING. The same open port is a
+     different finding on a public IP than on 10.0.0.5. SSH public is
+     MEDIUM and internal is INFO; RDP public is HIGH and internal LOW;
+     SMB public is CRITICAL. The address comes from nmap's own scan
+     report line, then from resolving the target. When it cannot be
+     decided the finding is rated as INTERNAL and SAYS which assumption
+     it made and what the public rating would be — not the flattering
+     guess, and not a silent one.
+
+  2. SOME SERVICES ARE DANGEROUS ANYWHERE. Telnet, FTP, the r-services,
+     TFTP, SNMP, Redis, Memcached, the Docker API, IPMI, etcd, kubelet.
+     Their rating does not drop for being internal, and the finding
+     says the weakness is in the protocol rather than in where it is
+     reachable from.
+
+  3. A VERSION BANNER IS ITS OWN FINDING. Asked for explicitly: if SSH
+     answers "OpenSSH 8.9p1", flag it whether or not the release is
+     old, because that string is what a CVE search starts from.
+     Reported as service_version_disclosed (LOW) with the raw banner,
+     and whether it is OUT OF DATE is answered only from the local
+     version catalogue — outdated_software at MEDIUM when the catalogue
+     says so, and an explicit "the catalogue has nothing for this" when
+     it does not. It never repeats another scanner's idea of "current".
+
+nmap's service NAME is trusted over the port number: Redis on 8080 is
+Redis, and an nginx on 2375 is not the Docker API.
+
+Every finding here is about EXPOSURE — the service answered — and says
+so in its own body. None of them claims a vulnerability in the service,
+which would need the service tested.
+
+CHANGED: modules/coffee_break.py (_cb_report_port, _cb_report_version,
+         _cb_host_is_public), modules/cb_issues.py (ten library entries
+         for the categories), tests/test_coffee_break.py
+
+## 2026-11-03 — PROVING WHAT THE TOOL TALKS TO (6.10.0)
+
+A client asks what a pentest tool contacts. "Only your target" is an
+assertion; this release is how it is demonstrated.
+
+NEW: modules/egress.py, tests/test_egress.py
+
+Target tab → "Traffic Transparency". Both controls off by default: an
+application that silently routed a tester's traffic through a proxy
+would be its own kind of surprise.
+
+  * PROXY EVERYTHING. One address sends this application's own HTTP and
+    every tool it launches through Burp / ZAP / mitmproxy. Tools with a
+    flag of their own get it (nuclei -proxy, nikto -useproxy, testssl
+    --proxy host:port, sqlmap --proxy=, ffuf -x, gobuster, dirsearch,
+    wpscan, httpx, katana, curl, graphw00f); everything else gets
+    HTTP_PROXY/HTTPS_PROXY/ALL_PROXY. Both are applied, because a tool
+    honouring neither would otherwise LOOK proxied and not be. A
+    --proxy the operator wrote themselves is never doubled.
+
+  * LOG EVERYTHING. Append-only JSONL: time, component, method, URL,
+    host, whether the host was in scope, whether it is one of the
+    documented hosts, and whether the request was proxied. Readable
+    offline, attachable to a report.
+
+Two rules the module is built around:
+
+  1. It records the ATTEMPT, before the response. A log of successes
+     would hide exactly the request someone would care about — and the
+     test for this fires a request at a dead port and asserts it is
+     logged anyway.
+  2. It records the URL and never the body, with credential-shaped
+     query values redacted. The log says where traffic went; the proxy
+     is where content is inspected, on the operator's own disk.
+
+The wrapper goes on requests.Session.request and urllib urlopen at
+startup, not on each module: a per-module version is a promise that
+holds until someone adds a module. KNOWN_HOSTS documents every host
+the application has a reason to contact (crt.sh, tool downloads, CVE
+lookups) — anything else is flagged, in the log and in the status line.
+There is no telemetry endpoint to list, and a log that stays empty of
+unexplained hosts is the evidence for that, not a comment.
+
+ALSO — two nmap findings a tester writes by hand and the parser never
+produced, because both come from the TABLE rather than any one line:
+
+  * Potentially excessive open ports (LOW) above four open ports, with
+    every port listed. Stated as exposure, not as a flaw in any one
+    service.
+  * Underlying infrastructure identified (INFO) from the version
+    column — nginx was being found by manual scans and never appearing
+    in the findings list, because nginx is not a risky service, it is
+    the infrastructure. ~60 products recognised, spelled as a human
+    writes them.
+
+CHANGED: widgets/runner.py (proxy env + command recording at the one
+         place every tool is launched), ui/window.py (install the
+         wrapper), ui/tabs_target.py (the card), modules/cb_issues.py,
+         modules/coffee_break.py
+
 ## 2026-11-03 — THIRTY CONFIRMED COMMAND INJECTIONS, NONE REAL (6.9.12)
 
 Active Scan produced 30+ CONFIRMED OS command injections on header

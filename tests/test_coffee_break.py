@@ -318,12 +318,59 @@ def main():
                 "6379/tcp open  redis   Redis 7.0\n"
                 "23/tcp   open  telnet\n")
         produced = engine._cb_parse_nmap({"key": "nmap_quick"}, nmap)
-        check("risky services are reported", produced, 2)
+        # Two risky services, plus the infrastructure observation the
+        # banners now produce — counted by key rather than by total, so
+        # this assertion keeps saying what it means.
+        # Telnet, Redis and SSH. SSH is here too now — the tester asked
+        # for it: an open SSH port with a version banner is something
+        # they would flag, and the old table reported nothing for it.
+        check("risky services are reported",
+              sorted(f.key for f in engine._cb_findings
+                     if f.key in ("exposed_datastore", "cleartext_service",
+                                  "remote_access_exposed")),
+              ["cleartext_service", "exposed_datastore",
+               "remote_access_exposed"])
+        check("telnet is High wherever it runs",
+              [f.severity for f in engine._cb_findings
+               if f.key == "cleartext_service"][0], "HIGH")
+        check("SSH with no known reachability is rated as internal",
+              [f.severity for f in engine._cb_findings
+               if f.key == "remote_access_exposed"][0], "INFO")
+        # And when reachability genuinely cannot be decided, the finding
+        # says which assumption it made rather than quietly picking the
+        # flattering one. Asserted on the assessment directly, because
+        # whether a name resolves depends on the machine running this.
+        from command_bridge.modules import port_risk as _pr
+        unknown = _pr.assess(22, "tcp", "ssh", "OpenSSH 8.9", public=None)
+        check("an undecidable host is rated as internal",
+              unknown.severity, "INFO")
+        check("   and says so, with what the public rating would be",
+              "rated as an internal exposure" in " ".join(unknown.notes)
+              and "MEDIUM" in " ".join(unknown.notes))
+        check("four open ports is not yet excessive",
+              any(f.key == "excessive_ports" for f in engine._cb_findings),
+              False)
+        # Every open port is now assessed, not only the ones in a short
+        # table, so the count is ports + version banners + the
+        # infrastructure observation rather than "the risky two".
+        check("every open port produced a finding",
+              len([f for f in engine._cb_findings
+                   if (f.variant or "").count("/") == 1
+                   and not f.variant.startswith("version-")]), 4)
+        check("and each version banner one of its own",
+              len([f for f in engine._cb_findings
+                   if (f.variant or "").startswith("version-")]), 3)
         check("every open port is banked",
               len(engine._cb_artifacts["open_ports"]), 4)
-        check("redis is high",
+        # By KEY, not by a word in the title: the version banner now
+        # produces its own finding whose title also says "redis", and
+        # that one is correctly Low.
+        check("redis exposure is serious",
               [f.severity for f in engine._cb_findings
-               if "redis" in f.title][0], "HIGH")
+               if f.key == "exposed_datastore"][0], "CRITICAL")
+        check("   while its version banner is reported separately, and low",
+              [f.severity for f in engine._cb_findings
+               if (f.variant or "") == "version-6379/tcp"][0], "LOW")
 
         engine = Engine(base)
         nuclei = "\n".join(json.dumps(row) for row in [
@@ -456,6 +503,190 @@ def main():
               ("exposed_datastore", "cleartext_service",
                "remote_access_exposed"))
 
+        print("\n\033[1mEvery open port is judged, not just a listed "
+              "few\033[0m")
+        # The ask: Coffee Break's first stage is nmap, and a chain of
+        # standard checks that runs the checks and reports nothing is
+        # worse than no chain. SSH open with a version banner, FTP, an
+        # admin console — all produced nothing before this.
+        from command_bridge.modules import port_risk
+        public = Engine(base)
+        PUBLIC_OUT = "\n".join([
+            "Nmap scan report for host.example.io (93.184.216.34)",
+            "21/tcp    open  ftp           vsftpd 3.0.3",
+            "22/tcp    open  ssh           OpenSSH 8.9p1 Ubuntu",
+            "23/tcp    open  telnet",
+            "80/tcp    open  http          nginx 1.18.0 (Ubuntu)",
+            "445/tcp   open  microsoft-ds",
+            "2375/tcp  open  docker",
+            "3389/tcp  open  ms-wbt-server",
+            "6379/tcp  open  redis         Redis key-value store 5.0.7",
+            "11211/tcp open  memcached",
+            "9999/tcp  open  unknown-thing",
+        ])
+        public._cb_parse_nmap({"key": "nmap"}, PUBLIC_OUT)
+        by_port = {f.variant: f for f in public._cb_findings if f.variant}
+        check("the public address is recognised as public",
+              port_risk.is_public_address("93.184.216.34"))
+        check("   and an RFC1918 one is not",
+              port_risk.is_public_address("10.0.0.5"), False)
+        check("   and an unresolvable one is unknown, not assumed",
+              port_risk.is_public_address("not-an-address"), None)
+        for port, expected in (("21/tcp", "HIGH"), ("22/tcp", "MEDIUM"),
+                               ("23/tcp", "HIGH"), ("445/tcp", "CRITICAL"),
+                               ("2375/tcp", "CRITICAL"),
+                               ("3389/tcp", "HIGH"),
+                               ("6379/tcp", "CRITICAL"),
+                               ("11211/tcp", "CRITICAL")):
+            check(f"{port} on a public host is {expected}",
+                  by_port[port].severity, expected)
+        check("SSH is flagged at all, which it was not before",
+              "22/tcp" in by_port)
+        check("   and the finding says the exposure is the issue, not a bug "
+              "in sshd",
+              "makes no claim about a vulnerability in the service" in
+              by_port["22/tcp"].summary)
+        check("   with the fix a tester would recommend",
+              "VPN" in by_port["22/tcp"].summary)
+        check("a web port is recorded but not alarming",
+              by_port["80/tcp"].severity, "INFO")
+        check("an unrecognised service is recorded, not guessed at",
+              by_port["9999/tcp"].severity, "INFO")
+        check("   and says plainly that it was not recognised",
+              "does not recognise the service" in
+              by_port["9999/tcp"].summary)
+
+        print("\n\033[1mThe same ports on an internal host read "
+              "differently\033[0m")
+        internal = Engine(base)
+        internal._cb_parse_nmap({"key": "nmap"}, "\n".join([
+            "Nmap scan report for box.internal (10.0.0.5)",
+            "22/tcp    open  ssh           OpenSSH 8.9p1",
+            "23/tcp    open  telnet",
+            "3389/tcp  open  ms-wbt-server",
+            "445/tcp   open  microsoft-ds",
+        ]))
+        inside = {f.variant: f for f in internal._cb_findings if f.variant}
+        check("SSH on an internal host is informational",
+              inside["22/tcp"].severity, "INFO")
+        check("RDP internally is low, not high",
+              inside["3389/tcp"].severity, "LOW")
+        check("but telnet is High wherever it is",
+              inside["23/tcp"].severity, "HIGH")
+        check("   because the weakness is the protocol, and it says so",
+              "the weakness is in the protocol" in inside["23/tcp"].summary)
+        check("the title reflects where it is reachable from",
+              "open internally" in inside["445/tcp"].title)
+
+        print("\n\033[1mA version banner is a finding in its own "
+              "right\033[0m")
+        # Asked for explicitly: if SSH answers with a version, say so,
+        # whether or not the release is old.
+        versions = {f.variant: f for f in public._cb_findings
+                    if (f.variant or "").startswith("version-")}
+        check("SSH's banner is reported", "version-22/tcp" in versions)
+        ssh_version = versions["version-22/tcp"]
+        check("   with the product named as a person writes it",
+              "OpenSSH 8.9p1" in ssh_version.title)
+        check("   and the raw banner kept as evidence",
+              "OpenSSH 8.9p1 Ubuntu" in ssh_version.summary)
+        check("   rated Low on its own: it is a disclosure",
+              ssh_version.severity, "LOW")
+        check("every service that returned a version has one",
+              sorted(versions),
+              ["version-21/tcp", "version-22/tcp", "version-6379/tcp",
+               "version-80/tcp"])
+        check("a service with no banner produces no version finding",
+              "version-23/tcp" in versions, False)
+        check("the banner parser reads product and version",
+              port_risk.product_in_banner("OpenSSH 8.9p1 Ubuntu 3ubuntu0.4"),
+              ("openssh", "8.9p1"))
+        check("   and nginx", port_risk.product_in_banner("nginx 1.18.0"),
+              ("nginx", "1.18.0"))
+        check("   and says nothing for a banner it cannot parse",
+              port_risk.product_in_banner("some-daemon"), ("", ""))
+        # With no catalogue, it must say it does not know rather than
+        # repeat a scanner's idea of "current".
+        check("the currency check never guesses",
+              any(phrase in ssh_version.summary for phrase in
+                  ("catalogue has nothing recorded",
+                   "catalogue does not track",
+                   "behind the current one", "is current")))
+        check("   and never repeats another scanner's figure",
+              "current is at least" in ssh_version.summary, False)
+
+        print("\n\033[1mThe nmap table as a tester reads it\033[0m")
+        # Two findings that come from the TABLE, not from any one line,
+        # which is why neither existed: the parser looked at one line at
+        # a time and reported only the services named individually in
+        # the library. A manual scan showed nginx; the findings list did
+        # not mention it anywhere, and a host with six open ports was
+        # not flagged for having six open ports.
+        nm = Engine(base)
+        NMAP_OUT = "\n".join([
+            "22/tcp   open  ssh      OpenSSH 8.9p1 Ubuntu 3ubuntu0.4",
+            "80/tcp   open  http     nginx 1.18.0 (Ubuntu)",
+            "443/tcp  open  ssl/http nginx 1.18.0 (Ubuntu)",
+            "3306/tcp open  mysql    MySQL 8.0.32",
+            "8080/tcp open  http-proxy",
+            "9090/tcp open  zeus-admin",
+            "12345/tcp closed  netbus",
+        ])
+        nm._cb_parse_nmap({"key": "nmap"}, NMAP_OUT)
+        found = {f.key: f for f in nm._cb_findings}
+        check("six open ports is flagged as potentially excessive",
+              "excessive_ports" in found)
+        excess = found["excessive_ports"]
+        check("   the count is in the title", "6 reachable" in excess.title)
+        check("   a closed port is not counted",
+              "12345" in excess.summary, False)
+        check("   every open port is listed for the report",
+              all(port in excess.summary for port in
+                  ("22/tcp", "80/tcp", "443/tcp", "3306/tcp", "8080/tcp",
+                   "9090/tcp")))
+        check("   rated Low — exposure, not a flaw in any one service",
+              excess.severity, "LOW")
+        check("   and it says so, rather than implying each port is a bug",
+              "not about any one service" in excess.summary)
+        check("   Confirmed, because the ports answered",
+              excess.status_label, "Confirmed")
+
+        check("nginx is reported as the underlying infrastructure",
+              "infrastructure_disclosed" in found)
+        infra = found["infrastructure_disclosed"]
+        check("   named in the title", "nginx" in infra.title)
+        check("   alongside the other products",
+              all(name in infra.title for name in ("OpenSSH", "MySQL")))
+        check("   spelled as a human would write them, not title-cased",
+              any(bad in infra.title for bad in ("Openssh", "Mysql",
+                                                 "Nginx")), False)
+        check("   with the banners as evidence",
+              "nginx 1.18.0" in infra.summary)
+        check("   rated Informational — it is an observation",
+              infra.severity, "INFO")
+        check("   and it does not claim the version is out of date",
+              "does not answer" in infra.summary)
+        check("the datastore on 3306 is still its own finding",
+              "exposed_datastore" in found)
+
+        # Below the threshold, neither finding is forced.
+        small = Engine(base)
+        small._cb_parse_nmap({"key": "nmap"}, "\n".join([
+            "80/tcp  open  http   nginx 1.18.0",
+            "443/tcp open  ssl/http nginx 1.18.0"]))
+        keys = {f.key for f in small._cb_findings}
+        check("two open ports is not excessive", "excessive_ports" in keys,
+              False)
+        check("   but the infrastructure is still named",
+              "infrastructure_disclosed" in keys)
+        check("the threshold is the one a tester uses",
+              cb_issues.EXCESSIVE_PORT_THRESHOLD, 4)
+        check("a banner naming nothing known produces no claim",
+              cb_issues.infrastructure_in("some-unknown-daemon 1.0"), [])
+        check("and a product is recognised inside a longer banner",
+              cb_issues.infrastructure_in(
+                  "nginx 1.18.0 (Ubuntu)"), ["nginx"])
+
         print("\n\033[1mThe TLS stage survives a second run\033[0m")
         # The bug: --jsonfile REFUSES to overwrite. The first scan of a target
         # wrote the file and every scan after it died on a file-exists error,
@@ -539,22 +770,352 @@ def main():
                            ("beast", "BEAST"),
                            ("weak_cipher", "3DES / weak ciphers")):
             check(f"{label} is reported", key in by_key)
-        check("the protocol finding names the versions",
-              by_key["obsolete_protocol"].title,
-              "Obsolete TLS protocol versions enabled: SSLv3, TLS 1.0, TLS 1.1")
-        check("and carries each one as evidence",
-              all(v in by_key["obsolete_protocol"].evidence
-                  for v in ("SSLv3", "TLS1", "TLS1_1")))
+        # One finding PER PROTOCOL. The merged row — "Obsolete TLS
+        # protocol versions enabled: SSLv3, TLS 1.0, TLS 1.1" at the
+        # library's MEDIUM — is how a live engagement missed SSLv3: the
+        # HIGH fact was averaged into the deprecated ones and the title
+        # had to be opened to find it.
+        protocols = {f.variant: f for f in engine._cb_findings
+                     if f.key == "obsolete_protocol"}
+        check("each obsolete protocol is its own finding",
+              sorted(protocols), ["sslv3", "tls1", "tls1_1"])
+        check("SSLv3 is named in the title",
+              "SSLv3" in protocols["sslv3"].title)
+        check("   and rated High, because it is a broken protocol",
+              protocols["sslv3"].severity, "HIGH")
+        check("   and said to be broken, not merely deprecated",
+              "broken" in protocols["sslv3"].title.lower())
+        check("TLS 1.0 is named in its own title",
+              "TLS 1.0" in protocols["tls1"].title)
+        check("   and rated Medium, because it is deprecated not broken",
+              protocols["tls1"].severity, "MEDIUM")
+        check("   and says deprecated", "deprecated" in
+              protocols["tls1"].title.lower())
+        check("SSLv3 and TLS 1.0 are never merged into one row",
+              protocols["sslv3"] is protocols["tls1"], False)
+        check("each carries its own scanner line as evidence",
+              all(v.lower() in protocols[k].evidence.lower()
+                  for k, v in (("sslv3", "SSLv3"), ("tls1", "TLS1"))))
         check("a protocol that is not offered is not reported",
-              "SSLv2" in by_key["obsolete_protocol"].evidence, False)
-        check("and neither is one that is fine",
-              "TLS1_2" in by_key["obsolete_protocol"].evidence, False)
+              "sslv2" in protocols, False)
+        check("and neither is one that is fine", "tls1_2" in protocols, False)
         check("a clean Heartbleed result is not a finding",
               "heartbleed" in by_key, False)
         check("a certificate expiring in 17 days is not called expired",
               "cert_expiring" in by_key)
         check("Lucky 13 carries the CVE",
               "CVE-2013-0169" in by_key["lucky13"].references)
+
+        print("\n\033[1mtestssl's bookkeeping is not a Critical "
+              "finding\033[0m")
+        # Reported from a live engagement:
+        #
+        #     TLS configuration weakness            CRITICAL   Confirmed
+        #       cert_notAfter: 2026-12-12 23:59
+        #       security_headers:
+        #       overall_grade: M
+        #
+        # A certificate's expiry DATE, an empty header list and a letter
+        # grade, rated Critical and titled as a weakness. Two faults:
+        # these records are not checks at all, and the bucket took the
+        # LAST record's severity instead of the worst justified one.
+        meta = Engine(base)
+        meta_path = meta.output_dir / "meta.json"
+        meta_path.write_text(json.dumps([
+            {"id": "cert_notAfter", "severity": "CRITICAL",
+             "finding": "2026-12-12 23:59"},
+            {"id": "security_headers", "severity": "HIGH", "finding": ""},
+            {"id": "overall_grade", "severity": "CRITICAL", "finding": "M"},
+        ]))
+        meta._cb_parse_testssl(
+            {"key": "testssl", "artefact_file": str(meta_path)}, "")
+        check("none of it is reported as a finding",
+              len(meta._cb_findings), 0)
+        check("and certainly not as Critical",
+              any(f.severity == "CRITICAL" for f in meta._cb_findings), False)
+        for identifier in ("cert_notAfter", "security_headers",
+                           "overall_grade", "final_score"):
+            check(f"   {identifier} is bookkeeping, not a check",
+                  bool(cb_issues.TESTSSL_INFORMATIONAL.match(identifier)))
+
+        # The severity of a tls_generic bucket is the worst JUSTIFIED
+        # rating in it, and tls_generic itself cannot reach High: it
+        # names no attack, has no CVE and has demonstrated no impact.
+        capped = Engine(base)
+        capped_path = capped.output_dir / "capped.json"
+        capped_path.write_text(json.dumps([
+            {"id": "cipher_order", "severity": "CRITICAL",
+             "finding": "server does not honour its own cipher order"},
+            {"id": "LOGJAM-common_primes", "severity": "LOW",
+             "finding": "no DH EXPORT ciphers"},
+        ]))
+        capped._cb_parse_testssl(
+            {"key": "testssl", "artefact_file": str(capped_path)}, "")
+        generic = [f for f in capped._cb_findings if f.key == "tls_generic"]
+        if generic:
+            check("an unclassified TLS check cannot be Critical",
+                  generic[0].severity in ("INFO", "LOW", "MEDIUM"))
+            check("   and its title names the checks it is about",
+                  "cipher_order" in generic[0].title)
+
+        print("\n\033[1mCipher findings come from the suites "
+              "themselves\033[0m")
+        # Why: the cipher findings used to exist only if testssl emitted
+        # its own SWEET32 / LUCKY13 / BEAST records. On a run whose JSON
+        # held only the rating section they were absent, so a host
+        # offering 3DES and CBC suites produced no Sweet32 finding, no
+        # BEAST finding and no CBC finding at all.
+        ciphers = Engine(base)
+        safe_name = ciphers.sanitize_target_for_filename(ciphers.target)
+        (ciphers.output_dir / f"{safe_name}_ssl_ciphers.json").write_text(
+            json.dumps({
+                "protocols": {
+                    "TLSv1.0": [
+                        {"name": "TLS_RSA_WITH_3DES_EDE_CBC_SHA",
+                         "bits": 112},
+                        {"name": "TLS_RSA_WITH_AES_128_CBC_SHA",
+                         "bits": 128}],
+                    "TLSv1.2": [
+                        {"name": "TLS_RSA_WITH_AES_128_GCM_SHA256",
+                         "bits": 128}]},
+                "deprecated_protocols": {"TLSv1.0": 1}}))
+        empty = ciphers.output_dir / "ratings-only.json"
+        empty.write_text(json.dumps([
+            {"id": "overall_grade", "severity": "CRITICAL", "finding": "M"}]))
+        ciphers._cb_parse_testssl(
+            {"key": "testssl", "artefact_file": str(empty)}, "")
+        found = {f.key: f for f in ciphers._cb_findings}
+        # Protocols had the same dependency as the ciphers: no testssl
+        # record meant no finding, so a host offering TLS 1.0 and 1.1
+        # was reported as offering neither.
+        check("TLS 1.0 is reported from the enumeration alone",
+              any(f.variant == "tls1" for f in ciphers._cb_findings))
+        tls10 = next(f for f in ciphers._cb_findings if f.variant == "tls1")
+        check("   rated Medium", tls10.severity, "MEDIUM")
+        check("   named in its title", "TLS 1.0" in tls10.title)
+        check("   and Confirmed, because it was negotiated",
+              tls10.status_label, "Confirmed")
+        check("TLS 1.2 is not reported as obsolete",
+              any("1.2" in f.title for f in ciphers._cb_findings), False)
+        check("every spelling of a version normalises to one token",
+              [cb_issues.protocol_token(s) for s in
+               ("TLS 1.0", "TLSv1.0", "TLS1", "SSL 3.0", "SSLv3", "TLS 1.2")],
+              ["tls1", "tls1", "tls1", "sslv3", "sslv3", ""])
+
+        print("\n\033[1mAnd never twice for the same version\033[0m")
+        both = Engine(base)
+        both_safe = both.sanitize_target_for_filename(both.target)
+        (both.output_dir / f"{both_safe}_ssl_ciphers.json").write_text(
+            json.dumps({
+                "protocols": {"TLS 1.0": [
+                    {"name": "TLS_RSA_WITH_AES_128_CBC_SHA", "bits": 128}]},
+                "deprecated_protocols": {"TLS 1.0": {}}}))
+        both_path = both.output_dir / "tls1.json"
+        both_path.write_text(json.dumps([
+            {"id": "TLS1", "severity": "LOW",
+             "finding": "offered (deprecated)"}]))
+        both._cb_parse_testssl(
+            {"key": "testssl", "artefact_file": str(both_path)}, "")
+        check("testssl's record and the enumeration make ONE finding",
+              len([f for f in both._cb_findings
+                   if f.key == "obsolete_protocol"]), 1)
+
+        check("Sweet32 is reported from the 3DES suite alone",
+              "sweet32" in found)
+        check("   rated Medium", found["sweet32"].severity, "MEDIUM")
+        check("   and it NAMES the affected suite, for the report",
+              "TLS_RSA_WITH_3DES_EDE_CBC_SHA" in found["sweet32"].summary)
+        check("the CBC finding is reported", "lucky13" in found)
+        check("   and lists every CBC suite, not just one",
+              all(name in found["lucky13"].summary for name in
+                  ("TLS_RSA_WITH_3DES_EDE_CBC_SHA",
+                   "TLS_RSA_WITH_AES_128_CBC_SHA")))
+        check("BEAST is reported, because TLS 1.0 is offered too",
+              "beast" in found)
+        check("   and names its suites as well",
+              "TLS_RSA_WITH_AES_128_CBC_SHA" in found["beast"].summary)
+        # The phrase "AES-GCM" does appear — in the sentence saying AEAD
+        # suites do NOT have this construction. What must not happen is
+        # the GCM suite appearing in the list of affected suites.
+        check("the GCM suite is not listed as an affected suite",
+              "TLS_RSA_WITH_AES_128_GCM_SHA256" in found["lucky13"].summary,
+              False)
+        check("each is Potential — the suites are proved, the attack "
+              "was not attempted",
+              {found[k].status_label for k in ("sweet32", "lucky13", "beast")},
+              {"Potential"})
+        check("the suites are plain text with real newlines, so a paste "
+              "into a report keeps one per line",
+              found["lucky13"].summary.count("\n") >= 2)
+        # And nothing is invented where there is nothing to report.
+        clean = Engine(base)
+        clean_safe = clean.sanitize_target_for_filename(clean.target)
+        (clean.output_dir / f"{clean_safe}_ssl_ciphers.json").write_text(
+            json.dumps({"protocols": {"TLSv1.3": [
+                {"name": "TLS_AES_256_GCM_SHA384", "bits": 256}]}}))
+        clean_path = clean.output_dir / "none.json"
+        clean_path.write_text("[]")
+        clean._cb_parse_testssl(
+            {"key": "testssl", "artefact_file": str(clean_path)}, "")
+        check("a modern cipher list produces no cipher findings",
+              [f.key for f in clean._cb_findings], [])
+
+        print("\n\033[1mtestssl's cipher inventory is evidence, not a "
+              "finding\033[0m")
+        # Reported from a live engagement: twelve of testssl's per-suite
+        # inventory records, plus two Set-Cookie values, published as
+        # one finding —
+        #
+        #     TLS configuration weakness            MEDIUM   Confirmed
+        #       cipher-tls1_2_xc009: TLSv1.2 xc009 ECDHE-ECDSA-AES128-SHA …
+        #       ipv4_in_header: set-cookie: __cf_bm=…
+        #
+        # — with no statement of what was wrong with any of it. The
+        # inventory is the list of suites the host offers, which is
+        # precisely what the cipher findings need.
+        inv = Engine(base)
+        inv_records = [
+            {"id": "cipher-tls1_2_xc009", "severity": "MEDIUM",
+             "finding": "TLSv1.2 xc009 ECDHE-ECDSA-AES128-SHA ECDH 253 "
+                        "AES 128 TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA"},
+            {"id": "cipher-tls1_2_x2f", "severity": "MEDIUM",
+             "finding": "TLSv1.2 x2f AES128-SHA RSA AES 128 "
+                        "TLS_RSA_WITH_AES_128_CBC_SHA"},
+            {"id": "cipher-tls1_2_xa", "severity": "MEDIUM",
+             "finding": "TLSv1.2 xa DES-CBC3-SHA RSA 3DES 168 "
+                        "TLS_RSA_WITH_3DES_EDE_CBC_SHA"},
+            {"id": "cipher-tls1_2_xc02f", "severity": "INFO",
+             "finding": "TLSv1.2 xc02f ECDHE-RSA-AES128-GCM-SHA256 ECDH "
+                        "253 AESGCM 128 "
+                        "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"},
+            {"id": "ipv4_in_header", "severity": "MEDIUM",
+             "finding": "set-cookie: __cf_bm=SECRETVALUE; HttpOnly; Secure"},
+        ]
+        inv_path = inv.output_dir / "inventory.json"
+        inv_path.write_text(json.dumps(inv_records))
+        inv._cb_parse_testssl(
+            {"key": "testssl", "artefact_file": str(inv_path)}, "")
+        titles = [f.title for f in inv._cb_findings]
+        check("the inventory is not published as a weakness",
+              any("TLS configuration weakness" in t for t in titles), False)
+        check("nor as an unclassified checks row",
+              any("Unclassified TLS" in t for t in titles), False)
+        for identifier in ("cipher-tls1_2_xc009", "cipher-tls1_2_x2f",
+                           "ipv4_in_header"):
+            check(f"   {identifier} is not a check",
+                  bool(cb_issues.TESTSSL_INFORMATIONAL.match(identifier)))
+        # The cookie must not reach the report at all.
+        everything = " ".join(
+            f.evidence + str(getattr(f, "summary", "") or "")
+            for f in inv._cb_findings)
+        check("no Set-Cookie value is pasted into a finding",
+              "__cf_bm" in everything, False)
+        check("and no cookie value is echoed either",
+              "SECRETVALUE" in everything, False)
+
+        # What the inventory DOES produce: named findings with suites.
+        by_inv = {f.key: f for f in inv._cb_findings}
+        check("the 3DES suite becomes a Sweet32 finding",
+              "sweet32" in by_inv)
+        check("   naming the suite it was established from",
+              "TLS_RSA_WITH_3DES_EDE_CBC_SHA" in by_inv["sweet32"].summary)
+        check("   and rated Medium", by_inv["sweet32"].severity, "MEDIUM")
+        check("the CBC suites become a Lucky 13 finding",
+              "lucky13" in by_inv)
+        check("   listing the CBC suites",
+              all(name in by_inv["lucky13"].summary for name in
+                  ("TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA",
+                   "TLS_RSA_WITH_AES_128_CBC_SHA")))
+        check("   and not the GCM suite",
+              "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
+              in by_inv["lucky13"].summary, False)
+        # The parse itself, checked directly: the symmetric key size is
+        # read, not the curve size that precedes it in the same line.
+        parsed = inv._cb_testssl_cipher_inventory(inv_records)
+        check("the inventory parses per protocol", list(parsed), ["TLSv1.2"])
+        check("   with the IANA names",
+              sorted(s["name"] for s in parsed["TLSv1.2"])[:2],
+              ["TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA",
+               "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"])
+        check("   and the symmetric key size, not the curve size",
+              {s["name"]: s["bits"] for s in parsed["TLSv1.2"]}[
+                  "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA"], 128)
+        check("   3DES at 168 bits, read from its own line",
+              {s["name"]: s["bits"] for s in parsed["TLSv1.2"]}[
+                  "TLS_RSA_WITH_3DES_EDE_CBC_SHA"], 168)
+        check("TLS 1.2 in the inventory is not called obsolete",
+              any(f.key == "obsolete_protocol" for f in inv._cb_findings),
+              False)
+
+        print("\n\033[1mNo JSON: testssl's console output is read "
+              "properly\033[0m")
+        # The silent failure. The old fallback looked for the words HIGH
+        # / MEDIUM / LOW in each line — which testssl writes into its
+        # JSON and its logfile, never into the console output. A host
+        # offering SSLv3 printed "SSLv3   offered (NOT ok)", matched
+        # nothing, and produced no finding at all, while the standalone
+        # testssl button showed it plainly.
+        console = Engine(base)
+        CONSOLE = "\n".join([
+            " SSLv2      not offered (OK)",
+            " SSLv3      offered (NOT ok)",
+            " TLS 1      offered (deprecated)",
+            " TLS 1.2    offered (OK)",
+            " BEAST (CVE-2011-3389)      VULNERABLE -- but also supports "
+            "higher protocols TLSv1.2 (likely mitigated)",
+            " SWEET32 (CVE-2016-2183)    VULNERABLE, uses 64 bit block "
+            "ciphers",
+            " LUCKY13 (CVE-2013-0169)    potentially VULNERABLE, uses "
+            "cipher block chaining (CBC) ciphers with TLS",
+            " Heartbleed (CVE-2014-0160) not vulnerable (OK)",
+            " POODLE, SSL (CVE-2014-3566)  VULNERABLE (NOT ok), uses "
+            "SSLv3+CBC",
+        ])
+        rows = console._cb_testssl_from_console(CONSOLE)
+        ids = [r["id"] for r in rows]
+        check("SSLv3 is recovered from the console", "SSLv3" in ids)
+        check("Sweet32 too", "SWEET32" in ids)
+        check("and BEAST", "BEAST" in ids)
+        check("and Lucky 13", "LUCKY13" in ids)
+        check("'POODLE, SSL' is normalised to testssl's own id",
+              "POODLE_SSL" in ids)
+        check("a protocol that is not offered is not a record",
+              "SSLv2" in ids, False)
+        check("nor one that is fine", any(i.startswith("TLS1.2")
+                                          for i in ids), False)
+        check("'not vulnerable (OK)' is not read as vulnerable",
+              any("heartbleed" in i.lower() for i in ids), False)
+        check("severity is left to the library, not scraped from the line",
+              {r["severity"] for r in rows}, {""})
+        check("the CVE is kept", any("CVE-2016-2183" in r["cve"]
+                                     for r in rows))
+        # End to end, with no JSON file anywhere.
+        console._cb_parse_testssl({"key": "testssl",
+                                   "artefact_file": str(
+                                       console.output_dir / "absent.json")},
+                                  CONSOLE)
+        recovered = {f.key: f for f in console._cb_findings}
+        check("the stage now produces findings with no JSON at all",
+              len(console._cb_findings) >= 4)
+        check("including SSLv3, rated High",
+              any(f.key == "obsolete_protocol" and f.severity == "HIGH"
+                  and "SSLv3" in f.title for f in console._cb_findings))
+        for key in ("sweet32", "beast", "lucky13", "poodle"):
+            check(f"   and {key}", key in recovered)
+
+        print("\n\033[1mA TLS stage that reads nothing says so\033[0m")
+        mute = Engine(base)
+        mute._cb_parse_testssl(
+            {"key": "testssl",
+             "artefact_file": str(mute.output_dir / "nothing.json")},
+            "Start 2026-11-02 testssl.sh\nsome output with no verdicts\n")
+        printed = "".join(mute.printed)
+        check("silence is not reported as a clean result",
+              "NO TLS findings were assessed" in printed)
+        check("and the operator is told where to look",
+              "SSL/TLS Analysis" in printed)
+        check("no findings are invented to fill the gap",
+              len(mute._cb_findings), 0)
 
         print("\n\033[1mThe library is the scoring policy\033[0m")
         # A tool's rating no longer overrides the library's, in either
@@ -566,6 +1127,13 @@ def main():
               "LOW")
         check("deprecated protocols are Medium",
               cb_issues.ISSUES["obsolete_protocol"]["severity"], "MEDIUM")
+        # The one place the protocol version, not the tool, decides.
+        check("but SSLv2 and SSLv3 are rated High by version",
+              [cb_issues.OBSOLETE_PROTOCOL_SEVERITY[v]
+               for v in ("sslv2", "sslv3")], ["HIGH", "HIGH"])
+        check("while TLS 1.0 and 1.1 stay Medium",
+              [cb_issues.OBSOLETE_PROTOCOL_SEVERITY[v]
+               for v in ("tls1", "tls1_1")], ["MEDIUM", "MEDIUM"])
         check("RC4 is Medium", cb_issues.ISSUES["rc4"]["severity"], "MEDIUM")
         check("a tool cannot escalate a named issue",
               severity_for("obsolete_protocol", "HIGH"), "MEDIUM")

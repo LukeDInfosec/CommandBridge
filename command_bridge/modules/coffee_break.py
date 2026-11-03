@@ -49,6 +49,7 @@ from command_bridge.modules import cb_control, cb_evidence, cb_issues
 from command_bridge.modules import detector_registry, risk, verification
 from command_bridge.modules import cipher_properties, csp_analysis, explanations
 from command_bridge.modules import classification
+from command_bridge.modules import port_risk, version_catalog, finding_groups
 from command_bridge.modules.cb_control import RunGate, Stopped
 from command_bridge.modules.cb_evidence import Evidence
 from command_bridge.modules.cb_issues import ISSUES, clean_title
@@ -154,6 +155,13 @@ class CBFinding:
     #: words produce the same key, which is what lets them become one finding
     #: instead of two that a reader has to work out are the same.
     key: str = ""
+    #: A subdivision of the key, when one key covers several findings
+    #: that must stay apart. SSLv3 and TLS 1.0 are both
+    #: ``obsolete_protocol``, and merging them on that basis is what
+    #: produced a single MEDIUM row reading "SSLv3, TLS 1.0" — the HIGH
+    #: fact averaged into the LOW one. Two findings with different
+    #: variants never merge; an empty variant behaves as before.
+    variant: str = ""
     #: Which stages saw it. A finding corroborated by three tools is worth
     #: more than one seen by a single signature match, and the report should
     #: say which ones.
@@ -2121,6 +2129,10 @@ class CoffeeBreakMixin:
                    (not finding.key and
                     (existing.title, existing.stage) ==
                     (finding.title, finding.stage))
+            if getattr(existing, "variant", "") != \
+                    getattr(finding, "variant", ""):
+                # Same key, different thing. SSLv3 is not TLS 1.0.
+                same = False
             if not same:
                 continue
             # Same library key is necessary but NOT sufficient. Two findings
@@ -2228,8 +2240,22 @@ class CoffeeBreakMixin:
 
     # ── parsers ──────────────────────────────────────────────────────────
     def _cb_parse_nmap(self, stage, text):
+        """Every open port judged the way a tester judges it.
+
+        This stage used to report only the services named in a short
+        hand-written table, so the ordinary case — SSH on 22 with a
+        version banner, FTP on 21, an admin console on 8080 — produced
+        nothing at all. A chain of standard checks that runs the checks
+        and reports nothing is worse than no chain, because the tester
+        assumes it looked.
+
+        modules/port_risk.py holds the judgement: which services are
+        dangerous to expose and why, which are dangerous wherever they
+        run, and what changes when the host is internet-facing.
+        """
         produced = 0
         ports = self._cb_artifacts.setdefault("open_ports", [])
+        public = self._cb_host_is_public(text)
         for line in text.splitlines():
             match = re.match(r"^(\d+)/(tcp|udp)\s+open\s+(\S+)(?:\s+(.*))?$",
                              line.strip())
@@ -2239,21 +2265,234 @@ class CoffeeBreakMixin:
             entry = f"{port}/{proto} {service}"
             if entry not in ports:
                 ports.append(entry)
-            name = service.lower()
-            key = cb_issues.NMAP_SERVICES.get(name)
-            if key:
-                banner = (version or "").strip()
-                self._cb_record(self._cb_issue(
-                    key, f"{self.get_scanner_target()}:{port}",
-                    line.strip(), stage["key"],
-                    severity=cb_issues.NMAP_SEVERITY.get(name),
-                    title=f"{ISSUES[key]['title']} — {service} on "
-                          f"{port}/{proto}",
-                    detail=ISSUES[key]["detail"]
-                           + (f"\n\nBanner: {banner}" if banner else "")))
-                produced += 1
+            banner = (version or "").strip()
+            produced += self._cb_report_port(
+                stage, line.strip(), port, proto, service, banner, public)
         if ports:
             self.console.append_ansi(f"    open: {', '.join(ports)}\n")
+        produced += self._cb_nmap_inventory(stage, text, ports)
+        return produced
+
+    def _cb_host_is_public(self, text):
+        """Is the scanned host reachable from the internet?
+
+        True, False, or None when it cannot be decided — which is a
+        real answer, and findings built on it say which assumption they
+        made rather than quietly picking the flattering one.
+        """
+        # nmap prints the address it actually scanned, which is better
+        # than resolving the name again here.
+        for pattern in (r"Nmap scan report for \S+ \(([0-9a-fA-F.:]+)\)",
+                        r"Nmap scan report for ([0-9a-fA-F.:]+)\s*$"):
+            found = re.search(pattern, text or "", re.M)
+            if found:
+                verdict = port_risk.is_public_address(found.group(1))
+                if verdict is not None:
+                    return verdict
+        # Failing that, whatever the target resolves to.
+        try:
+            import socket
+            host = self.get_scanner_target()
+            return port_risk.is_public_address(
+                socket.gethostbyname(host)) if host else None
+        except Exception:                                   # noqa: BLE001
+            return None
+
+    def _cb_report_port(self, stage, line, port, proto, service, banner,
+                        public):
+        """One open port: what it is, and what the version banner says."""
+        produced = 0
+        host = self.get_scanner_target()
+        where = f"{host}:{port}"
+        verdict = port_risk.assess(port, proto, service, banner, public)
+
+        evidence = line
+        if banner:
+            evidence += f"\n\nVersion reported by the service: {banner}"
+
+        summary = [verdict.why]
+        if banner:
+            summary.append(
+                f"nmap read a version from this service: {banner}. That is "
+                f"reported separately as a version disclosure, and whether "
+                f"the version is current is answered from the local version "
+                f"catalogue — never guessed.")
+        else:
+            summary.append(
+                "No version was returned by this service, so nothing here "
+                "says which software or release it is running.")
+        summary.extend(verdict.notes)
+        if verdict.fix:
+            summary.append(f"Recommended: {verdict.fix}")
+        summary.append(
+            "This finding is about EXPOSURE — the service answered on "
+            "this port. It makes no claim about a vulnerability in the "
+            "service itself.")
+
+        finding = self._cb_issue(
+            verdict.issue_key, where, evidence, stage["key"],
+            severity=verdict.severity, title=verdict.title,
+            variant=f"{port}/{proto}")
+        finding.summary = "\n\n".join(part for part in summary if part)
+        finding.status_label = "Confirmed"
+        finding.impact_if_real = verdict.severity
+        self._cb_record(finding)
+        produced += 1
+
+        if verdict.has_version:
+            produced += self._cb_report_version(stage, where, port, proto,
+                                                service, banner)
+        return produced
+
+    def _cb_report_version(self, stage, where, port, proto, service, banner):
+        """The version banner as its own finding, plus a catalogue check.
+
+        Asked for explicitly: if SSH answers with "OpenSSH 8.9p1" the
+        tool must say so, whether or not the release is old, because
+        that string is what a CVE search starts from. Whether it IS old
+        is a separate question, answered only from the local catalogue —
+        and when the catalogue has nothing, the finding says that rather
+        than repeating a scanner's idea of "current".
+        """
+        product, version = port_risk.product_in_banner(banner)
+        verdict, detail, severity = "", "", "LOW"
+        if product and version:
+            try:
+                verdict, detail = version_catalog.assess(product, version)
+            except Exception:                               # noqa: BLE001
+                verdict, detail = "unknown", ""
+            if verdict == "outdated":
+                severity = "MEDIUM"
+
+        title = f"Service version disclosed — {service} on {port}/{proto}"
+        if product and version:
+            # Spelled as a person writes it: "OpenSSH 8.9p1", not
+            # "openssh 8.9p1", which reads as a tool's internal key.
+            title += f": {cb_issues.infrastructure_name(product)} {version}"
+
+        parts = [
+            f"The service on {port}/{proto} returns its software and "
+            f"version before authentication:\n\n  {banner}",
+        ]
+        if verdict == "outdated":
+            parts.append(f"The local version catalogue says this release is "
+                         f"behind the current one. {detail}")
+        elif verdict == "current":
+            parts.append(f"The local version catalogue says this release is "
+                         f"current. {detail}")
+        elif product:
+            parts.append(
+                "The local version catalogue has nothing recorded for this "
+                "product, so this finding does not say whether the release "
+                "is current. Press 'Update version data' on the Target tab "
+                "to fetch it. This tool does not repeat another scanner's "
+                "idea of what the current version is.")
+        else:
+            parts.append(
+                "This banner names software the version catalogue does not "
+                "track, so no currency check was attempted. The string "
+                "above is still what a CVE search starts from.")
+        if product and version:
+            try:
+                links = version_catalog.links_for(product, version)
+                if links:
+                    parts.append("Where to check what this version is "
+                                 "vulnerable to:\n"
+                                 + "\n".join(f"  {url}" for url in
+                                             list(links)[:4]))
+            except Exception:                               # noqa: BLE001
+                pass
+
+        key = "outdated_software" if verdict == "outdated" \
+            else "service_version_disclosed"
+        finding = self._cb_issue(
+            key, where, f"{banner}", stage["key"],
+            severity=severity, title=title,
+            variant=f"version-{port}/{proto}")
+        finding.summary = "\n\n".join(parts)
+        finding.status_label = "Confirmed"
+        finding.impact_if_real = severity
+        self._cb_record(finding)
+        return 1
+
+    def _cb_nmap_inventory(self, stage, text, ports):
+        """The two findings a tester writes from an nmap table by hand.
+
+        Neither comes from a single line, which is why neither existed:
+        the parser looked at one line at a time and reported only the
+        services the library names individually.
+
+          * **Port count.** No single open port is a finding, but a host
+            with eight of them is one. A tester flags that; the tool
+            said nothing.
+          * **What the software IS.** The version column named nginx,
+            and the finding list did not mention it anywhere, because
+            nginx is not in NMAP_SERVICES — it is not a risky service,
+            it is the infrastructure. Recorded as an observation, not
+            as a weakness.
+        """
+        produced = 0
+        host = self.get_scanner_target()
+
+        if len(ports) > cb_issues.EXCESSIVE_PORT_THRESHOLD:
+            listing = "\n".join(f"  {entry}" for entry in ports)
+            finding = self._cb_issue(
+                "excessive_ports", host,
+                f"{len(ports)} open ports were found on {host}:\n{listing}",
+                stage["key"],
+                title=(f"Potentially excessive open ports — "
+                       f"{len(ports)} reachable on {host}"))
+            finding.summary = (
+                f"nmap found {len(ports)} listening services on {host}, "
+                f"above the {cb_issues.EXCESSIVE_PORT_THRESHOLD} this "
+                f"report treats as ordinary for one host.\n\n"
+                f"Open ports:\n{listing}\n\n"
+                f"This is a statement about the host's exposure, not about "
+                f"any one service: each port is counted because it answered, "
+                f"and whether a given service belongs here is a question for "
+                f"whoever owns the host. Services that are risky in "
+                f"themselves are reported separately above.")
+            finding.status_label = "Confirmed"
+            finding.impact_if_real = finding.severity
+            self._cb_record(finding)
+            produced += 1
+
+        # Products named in the version column, gathered across the
+        # whole table so one finding lists the stack.
+        seen = {}
+        for line in text.splitlines():
+            match = re.match(
+                r"^(\d+)/(tcp|udp)\s+open\s+(\S+)(?:\s+(.*))?$", line.strip())
+            if not match:
+                continue
+            port, proto, _service, version = match.groups()
+            for product in cb_issues.infrastructure_in(version or ""):
+                seen.setdefault(product, []).append(
+                    f"{port}/{proto}: {(version or '').strip()}")
+        if seen:
+            lines = []
+            for product in sorted(seen):
+                for entry in seen[product]:
+                    lines.append(f"  {entry}")
+            names = ", ".join(sorted(cb_issues.infrastructure_name(p)
+                                     for p in seen))
+            finding = self._cb_issue(
+                "infrastructure_disclosed", host,
+                "\n".join(lines), stage["key"],
+                title=f"Underlying infrastructure identified: {names}")
+            finding.summary = (
+                f"The service banners on {host} name the software behind "
+                f"it: {names}.\n\nAs reported by nmap:\n"
+                + "\n".join(lines)
+                + "\n\nThis is an observation, not a weakness — it is "
+                  "recorded because it is what a reader needs to know the "
+                  "stack, and what a CVE search starts from. Whether any "
+                  "named version is out of date is a separate question this "
+                  "finding does not answer.")
+            finding.status_label = "Confirmed"
+            finding.impact_if_real = finding.severity
+            self._cb_record(finding)
+            produced += 1
         return produced
 
     #: Every ANSI escape, not just the colour ones. testssl emits cursor
@@ -2315,7 +2554,51 @@ class CoffeeBreakMixin:
             pass
 
         records = self._cb_testssl_records(stage, text)
+        # Read the cipher inventory out FIRST, so the findings built
+        # below have the suites to work from, and clear the cache that
+        # may have been filled before it was available.
+        inventory = self._cb_testssl_cipher_inventory(records)
+        if inventory:
+            self._cb_testssl_inventory = inventory
+            self._cb_tls_cache = {}
+            self.console.append_ansi(
+                f"    testssl enumerated "
+                f"{sum(len(v) for v in inventory.values())} cipher suite(s) "
+                f"across {len(inventory)} protocol version(s)\n")
         if not records:
+            # Never silent. A TLS stage that ran and reported nothing is
+            # either a clean host or a parser that read nothing, and the
+            # operator is entitled to know which — the alternative is
+            # finding SSLv3 by hand afterwards and wondering why the
+            # tool missed it.
+            artefact = stage.get("artefact_file") or ""
+            ran = bool((text or "").strip())
+            # The suites may still be available from the SSL/TLS
+            # Analysis, in which case the cipher findings stand on their
+            # own and this stage is not a dead loss.
+            recovered = self._cb_tls_cipher_findings(stage)
+            if recovered:
+                self.console.append_ansi(
+                    f"    testssl produced no readable checks, but "
+                    f"{recovered} cipher issue(s) were established from "
+                    f"the suites this host negotiated\n")
+                return recovered
+            if "not installed" in (text or ""):
+                pass                      # the stage already said so
+            elif not ran:
+                self.console.append_ansi(
+                    "[!] the TLS stage produced no output at all — no TLS "
+                    "findings were assessed for this host.\n")
+            else:
+                self.console.append_ansi(
+                    f"[!] testssl ran but no TLS checks could be read from "
+                    f"its output, so NO TLS findings were assessed. This is "
+                    f"not the same as a clean result.\n"
+                    f"    JSON report: {artefact or 'none written'}"
+                    f"{'' if artefact and Path(artefact).is_file() else ' (missing)'}\n"
+                    f"    Run the SSL/TLS Analysis button in the Web tab "
+                    f"against this host before concluding its TLS "
+                    f"configuration is sound.\n")
             return 0
 
         #: key → (severity, [evidence lines], [cves])
@@ -2345,9 +2628,43 @@ class CoffeeBreakMixin:
                 key, reported if reported in SEVERITIES else "")
             line = clean_title(record.get("finding", ""), 300)
             identifier = str(record.get("id", ""))
-            bucket = grouped.setdefault(key, {"severity": severity,
-                                              "lines": [], "cves": []})
-            bucket["severity"] = severity
+            # One finding per obsolete protocol version, not one merged
+            # row for all of them. SSLv3 and TLS 1.0 are not the same
+            # finding and are not the same severity; merging them rated
+            # SSLv3 at the library's MEDIUM and buried the version that
+            # mattered inside a comma-separated title.
+            bucket_key = key
+            version = ""
+            if key == "obsolete_protocol":
+                version = cb_issues.obsolete_protocol_version(identifier)
+                if version:
+                    bucket_key = f"{key}::{version}"
+                    severity = cb_issues.OBSOLETE_PROTOCOL_SEVERITY.get(
+                        version, severity)
+
+            bucket = grouped.setdefault(bucket_key,
+                                        {"severity": severity, "lines": [],
+                                         "cves": [], "key": key,
+                                         "version": version})
+            # The WORST of the records in the bucket, not the last one
+            # read. This line used to be a plain assignment, so for
+            # tls_generic — the one key that takes the tool's own rating
+            # — whichever record happened to come last set the severity
+            # of the whole group. That is how a bucket holding a
+            # certificate date, an empty header list and a letter grade
+            # came out CRITICAL.
+            bucket["severity"] = cb_issues.worst(bucket["severity"],
+                                                 severity)
+            if key == "tls_generic":
+                # A check that maps to no named attack cannot carry a
+                # High or Critical rating on its own. It has no attack,
+                # no CVE and no demonstrated impact — only testssl's
+                # wording, which is in the evidence for the reader to
+                # judge. Capped here rather than in the library because
+                # tls_generic is deliberately tool-rated.
+                bucket["severity"] = {"CRITICAL": "MEDIUM",
+                                      "HIGH": "MEDIUM"}.get(
+                    bucket["severity"], bucket["severity"])
             entry = f"{identifier}: {line}" if identifier else line
             if entry not in bucket["lines"]:
                 bucket["lines"].append(entry)
@@ -2357,7 +2674,8 @@ class CoffeeBreakMixin:
 
         produced = 0
         host = self.get_scanner_target()
-        for key, bucket in grouped.items():
+        for bucket_key, bucket in grouped.items():
+            key = bucket.get("key") or bucket_key
             evidence = "\n".join(bucket["lines"][:14])
             if len(bucket["lines"]) > 14:
                 evidence += f"\n… and {len(bucket['lines']) - 14} more"
@@ -2390,19 +2708,40 @@ class CoffeeBreakMixin:
             detail = ISSUES[key]["detail"]
             title = None
             if key == "obsolete_protocol":
-                # Name the versions. "Obsolete TLS protocol version enabled"
-                # is the first thing a client asks a follow-up question about.
-                pretty = {"sslv2": "SSLv2", "sslv3": "SSLv3", "tls1": "TLS 1.0",
-                          "tls1_1": "TLS 1.1"}
-                versions = [pretty[v] for v in
-                            sorted({line.split(":")[0].strip().lower()
-                                    for line in bucket["lines"]})
-                            if v in pretty]
-                if versions:
-                    title = (f"Obsolete TLS protocol version"
-                             f"{'s' if len(versions) > 1 else ''} enabled: "
-                             f"{', '.join(versions)}")
+                # Name the version in the title. "Obsolete TLS protocol
+                # version enabled" is the first thing anyone asks a
+                # follow-up question about, and a HIGH row that does not
+                # say SSLv3 is a HIGH row that has to be investigated by
+                # hand — which is exactly what happened.
+                pretty = cb_issues.OBSOLETE_PROTOCOL_NAMES
+                version = bucket.get("version") or ""
+                if version in pretty:
+                    broken = version in ("sslv2", "sslv3")
+                    title = (f"{pretty[version]} enabled"
+                             + (" — broken protocol" if broken
+                                else " — deprecated protocol"))
+                else:
+                    versions = [pretty[v] for v in
+                                sorted({line.split(":")[0].strip().lower()
+                                        for line in bucket["lines"]})
+                                if v in pretty]
+                    if versions:
+                        title = (f"Obsolete TLS protocol version"
+                                 f"{'s' if len(versions) > 1 else ''} "
+                                 f"enabled: {', '.join(versions)}")
             if key == "tls_generic":
+                # The title has to name them too. "TLS configuration
+                # weakness" at the top of a finding, with three raw
+                # record lines under it, is a row a tester has to
+                # investigate by hand to learn what it is about.
+                named = sorted({line.split(":")[0].strip()
+                                for line in bucket["lines"] if line})[:3]
+                if named:
+                    extra = len({line.split(":")[0] for line in
+                                 bucket["lines"]}) - len(named)
+                    title = ("Unclassified TLS configuration checks: "
+                             + ", ".join(named)
+                             + (f" (+{extra} more)" if extra > 0 else ""))
                 # "TLS configuration weakness — reported by testssl" tells the
                 # reader nothing. Name the checks that failed and hand over
                 # testssl's own wording, which at least says what it looked at.
@@ -2418,7 +2757,8 @@ class CoffeeBreakMixin:
                     f"standard this engagement is being measured against.")
             finding = self._cb_issue(key, host, evidence, stage["key"],
                                      severity=bucket["severity"],
-                                     detail=detail, title=title)
+                                     detail=detail, title=title,
+                                     variant=bucket.get("version") or "")
             for cve in bucket["cves"]:
                 if cve not in finding.references:
                     finding.references.append(cve)
@@ -2468,9 +2808,20 @@ class CoffeeBreakMixin:
 
             self._cb_record(finding)
             produced += 1
+
+        # Whatever testssl did or did not emit a record for, the suites
+        # the host negotiated are their own evidence. This fills the
+        # gaps — a run whose JSON held only the rating section used to
+        # produce no Sweet32, BEAST or CBC finding at all — and never
+        # touches a key already reported above.
+        from_ciphers = self._cb_tls_cipher_findings(stage)
+        produced += from_ciphers
+
         self.console.append_ansi(
             f"    {len(records)} TLS check(s) read; {produced} issue(s) worth "
-            f"reporting\n")
+            f"reporting"
+            + (f" ({from_ciphers} from the negotiated cipher suites)"
+               if from_ciphers else "") + "\n")
         return produced
 
     # ── TLS evidence: reuse the SSL/TLS Analysis, do not re-scan ─────────
@@ -2534,11 +2885,87 @@ class CoffeeBreakMixin:
         if (host, port) in cache:
             return cache[(host, port)]
 
+        # testssl's own cipher inventory comes BEFORE sslyze and the
+        # handshake fallback: it is already in hand, it cost no extra
+        # traffic, and it is the enumeration of the host that was
+        # actually scanned. It also removes the dependency that made the
+        # cipher and protocol findings fail silently when no SSL/TLS
+        # Analysis had been run for the host.
         data = self._cb_tls_from_artefact(host, port) or \
+            self._cb_tls_from_testssl(host, port) or \
             self._cb_tls_from_sslyze(host, port) or \
             self._cb_tls_from_handshakes(host, port)
         cache[(host, port)] = data or {}
         return cache[(host, port)]
+
+    #: testssl's per-suite inventory records. The id carries the
+    #: protocol and the hex code; the finding carries the suite itself:
+    #:
+    #:   cipher-tls1_2_xc009: TLSv1.2 xc009 ECDHE-ECDSA-AES128-SHA
+    #:                        ECDH 253 AES 128
+    #:                        TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA
+    #:
+    #: These were being reported AS A FINDING — twelve of them under one
+    #: "TLS configuration weakness" at MEDIUM, with no statement of what
+    #: was wrong. They are an inventory: the list of what the host
+    #: offers. Which is exactly the data the cipher findings need, so
+    #: they are read into the suite enumeration instead of thrown at the
+    #: reader.
+    _TESTSSL_CIPHER_RECORD = re.compile(r"^cipher[-_](?P<proto>[a-z0-9_]+)_x",
+                                        re.I)
+
+    def _cb_testssl_cipher_inventory(self, records):
+        """``{protocol: [{"name", "bits"}]}`` from testssl's cipher records."""
+        inventory = {}
+        for record in records or []:
+            identifier = str(record.get("id", "") or "")
+            if not self._TESTSSL_CIPHER_RECORD.match(identifier):
+                continue
+            text = str(record.get("finding", "") or "")
+            tokens = text.split()
+            if not tokens:
+                continue
+            # The IANA name is the token that looks like one. testssl
+            # prints it last, but reading it by SHAPE rather than by
+            # position survives a column being absent.
+            iana = next((t for t in reversed(tokens)
+                         if t.startswith(("TLS_", "SSL_"))), "")
+            if not iana:
+                continue
+            protocol = tokens[0] if tokens[0].upper().startswith(
+                ("TLS", "SSL")) else ""
+            if not protocol:
+                protocol = str(record.get("protocol", "")
+                               or identifier.split("_x")[0].split("-")[-1])
+            # The symmetric key size is the last bare integer before the
+            # IANA name — "AES 128" — not the curve size that precedes
+            # it ("ECDH 253").
+            bits = 0
+            for token in tokens[:tokens.index(iana)]:
+                if token.isdigit():
+                    bits = int(token)
+            inventory.setdefault(protocol, [])
+            if all(entry["name"] != iana for entry in inventory[protocol]):
+                inventory[protocol].append({"name": iana, "bits": bits})
+        return inventory
+
+    def _cb_tls_from_testssl(self, host, port):
+        """The suite enumeration testssl already produced, if it did."""
+        inventory = getattr(self, "_cb_testssl_inventory", None) or {}
+        if not inventory:
+            return {}
+        deprecated = {}
+        for protocol in inventory:
+            if cb_issues.protocol_token(protocol):
+                deprecated[protocol] = {}
+        return {
+            "tool": "testssl",
+            "host": host,
+            "port": port,
+            "protocols": inventory,
+            "deprecated_protocols": deprecated,
+            "suite_count": sum(len(v) for v in inventory.values()),
+        }
 
     def _cb_tls_from_artefact(self, host, port):
         """An SSL/TLS Analysis already run for this target."""
@@ -2680,6 +3107,191 @@ class CoffeeBreakMixin:
                         rows.append(suite)
         return cipher_properties.parse_all(rows)
 
+    #: Which cipher weakness establishes which named issue, and which
+    #: suites a finding for it must list. Driven by the PROPERTIES of
+    #: the suites the host actually negotiated, parsed from their names
+    #: — not by searching testssl's prose.
+    _CIPHER_ISSUES = (
+        ("sweet32", (cipher_properties.TRIPLE_DES, cipher_properties.DES),
+         "64-bit block cipher suites"),
+        ("lucky13", (cipher_properties.CBC_MODE,),
+         "CBC-mode cipher suites"),
+        ("rc4", (cipher_properties.RC4,), "RC4 cipher suites"),
+        ("weak_cipher", (cipher_properties.NULL_CIPHER,
+                         cipher_properties.EXPORT_GRADE,
+                         cipher_properties.ANONYMOUS,
+                         cipher_properties.SMALL_KEY), "weak cipher suites"),
+    )
+
+    def _cb_tls_protocol_findings(self, stage, data, host, where):
+        """Obsolete protocol findings from the versions actually accepted.
+
+        The enumeration already knows which versions the host
+        negotiated; it was only ever being used for the explanation
+        text. So a host offering TLS 1.0 and 1.1 with no corresponding
+        testssl record produced no finding — the same dependency that
+        hid Sweet32 and BEAST.
+
+        One finding per version, rated by version, and never a duplicate
+        of one the testssl records already produced.
+        """
+        if not data:
+            return 0
+
+        labels = list((data.get("deprecated_protocols") or {}).keys()) + \
+            list((data.get("protocols") or {}).keys())
+        offered = {}
+        for label in labels:
+            token = cb_issues.protocol_token(label)
+            if token:
+                offered.setdefault(token, label)
+        if not offered:
+            return 0
+
+        reported = {getattr(f, "variant", "") for f in self._cb_findings
+                    if f.key == "obsolete_protocol"}
+        produced = 0
+        for token, label in sorted(offered.items()):
+            if token in reported:
+                continue
+            pretty = cb_issues.OBSOLETE_PROTOCOL_NAMES.get(token, label)
+            broken = token in ("sslv2", "sslv3")
+            suites = (data.get("protocols") or {}).get(label) or []
+            names = [s.get("name") if isinstance(s, dict) else str(s)
+                     for s in suites]
+            evidence = (
+                f"{pretty} was negotiated by {where}."
+                + (f"\n\nSuites accepted over {pretty}:\n"
+                   + "\n".join(f"  {n}" for n in names if n)
+                   if names else ""))
+            finding = self._cb_issue(
+                "obsolete_protocol", host, evidence,
+                stage.get("key", "testssl"),
+                severity=cb_issues.OBSOLETE_PROTOCOL_SEVERITY.get(
+                    token, "MEDIUM"),
+                title=(f"{pretty} enabled — "
+                       + ("broken protocol" if broken
+                          else "deprecated protocol")),
+                variant=token)
+            explanation = explanations.explain(
+                "obsolete_protocol", versions=[pretty], host=where,
+                suites_by_version={pretty: names})
+            finding.summary = (explanation.text() if explanation
+                               else evidence)
+            if explanation:
+                finding.explanation = explanation.as_dict()
+            # The version being offered IS the finding — it was
+            # negotiated, not inferred.
+            finding.status_label = "Confirmed"
+            finding.impact_if_real = finding.severity
+            self._cb_record(finding)
+            produced += 1
+        return produced
+
+    def _cb_tls_cipher_findings(self, stage):
+        """Findings from the suites the host offered, with the suites listed.
+
+        Why this exists. The cipher findings used to depend entirely on
+        testssl emitting its own SWEET32 / BEAST / LUCKY13 records. On a
+        run whose JSON held only the rating section, those records were
+        absent — so a host offering 3DES and CBC suites produced no
+        Sweet32 finding, no BEAST finding and no CBC finding, and the
+        report said nothing about any of them.
+
+        The suites themselves are the better evidence anyway: they are
+        what goes in the write-up. So each weakness is established from
+        the parsed properties of the suites that were actually
+        negotiated, and the finding carries them one per line, ready to
+        paste.
+
+        Nothing here overrides a finding testssl already produced — a
+        key already reported is left alone, so this adds, never replaces.
+        """
+        host, port = self._cb_tls_host_port()
+        where = f"{host}:{port}"
+        data = self._cb_tls_structured()
+        produced = 0
+
+        # Protocol versions first, and from the same source as the
+        # suites. These had the same dependency the cipher findings had:
+        # no testssl SSLv3/TLS1 record meant no finding, whatever the
+        # host actually negotiated — so a host offering TLS 1.0 and 1.1
+        # was reported as having neither.
+        produced += self._cb_tls_protocol_findings(stage, data, host, where)
+
+        suites = self._cb_tls_suites()
+        if not suites:
+            return produced
+
+        already = {f.key for f in self._cb_findings if f.key}
+
+        for key, weaknesses, label in self._CIPHER_ISSUES:
+            if key in already:
+                continue
+            affected = []
+            for weakness in weaknesses:
+                for suite in cipher_properties.with_weakness(suites, weakness):
+                    if suite not in affected:
+                        affected.append(suite)
+            if not affected:
+                continue
+            listing = cipher_properties.listing(affected)
+            explanation = explanations.explain(key, suites=affected,
+                                               host=where)
+            evidence = (
+                f"{len(affected)} {label} were negotiated by "
+                f"{where}:\n{listing}")
+            finding = self._cb_issue(
+                key, host, evidence, stage.get("key", "testssl"),
+                severity=cb_issues.severity_for(key))
+            finding.summary = (explanation.text() if explanation
+                               else evidence)
+            if explanation:
+                finding.explanation = explanation.as_dict()
+            # The precondition is established — these suites were
+            # negotiated. The attack was not attempted.
+            if key in self._TLS_PRECONDITION_ONLY:
+                finding.status_label = "Potential"
+                finding.state = cb_evidence.POTENTIAL
+                finding.confidence = "tentative"
+            else:
+                finding.status_label = "Confirmed"
+            finding.impact_if_real = finding.severity
+            self._cb_record(finding)
+            produced += 1
+
+        # BEAST needs a CBC suite AND TLS 1.0, so it is decided here
+        # rather than from a weakness alone.
+        if "beast" not in {f.key for f in self._cb_findings if f.key}:
+            cbc = cipher_properties.with_weakness(
+                suites, cipher_properties.CBC_MODE)
+            protocols = {str(p).lower().replace(".", "").replace(" ", "")
+                         for p in (data.get("protocols") or {})}
+            tls10 = any(p in ("tls10", "tlsv10", "tls1", "tlsv1")
+                        for p in protocols)
+            if cbc and tls10:
+                listing = cipher_properties.listing(cbc)
+                explanation = explanations.explain("beast", suites=cbc,
+                                                   host=where)
+                finding = self._cb_issue(
+                    "beast", host,
+                    f"TLS 1.0 is offered and {len(cbc)} CBC-mode suites "
+                    f"were negotiated by {where}:\n{listing}",
+                    stage.get("key", "testssl"),
+                    severity=cb_issues.severity_for("beast"))
+                finding.summary = (explanation.text() if explanation
+                                   else finding.evidence)
+                if explanation:
+                    finding.explanation = explanation.as_dict()
+                finding.status_label = "Potential"
+                finding.state = cb_evidence.POTENTIAL
+                finding.confidence = "tentative"
+                finding.impact_if_real = finding.severity
+                self._cb_record(finding)
+                produced += 1
+
+        return produced
+
     def _cb_explain_tls(self, key):
         """The explanation rule for one TLS check, or None.
 
@@ -2796,21 +3408,74 @@ class CoffeeBreakMixin:
                 if flat:
                     return flat
 
+        return self._cb_testssl_from_console(text)
+
+    #: Verdicts in testssl's console output that mean "this is a problem".
+    #: Matched case-insensitively against the right-hand side of a line.
+    _TESTSSL_BAD = (
+        "vulnerable", "not ok", "offered (deprecated)", "insecure",
+        "weak", "uses 64 bit block ciphers", "no fs", "expired",
+        "self signed", "self-signed", "mismatch", "untrusted",
+    )
+    #: And the ones that mean the opposite, checked FIRST — "not
+    #: vulnerable (OK)" contains "vulnerable".
+    _TESTSSL_GOOD = (
+        "(ok)", "not offered", "not vulnerable", "no rc4", "ok --",
+        "not susceptible", "none", "no (ok)",
+    )
+
+    def _cb_testssl_from_console(self, text):
+        """Rebuild records from testssl's console output.
+
+        This is the fallback for a run that wrote no JSON — testssl not
+        having the --jsonfile support, a permissions problem on the
+        output directory, or an interrupted scan.
+
+        It used to look for the words HIGH / MEDIUM / LOW in each line,
+        and that was wrong in a way that lost real findings silently:
+        testssl prints severity words into its JSON and its logfile, NOT
+        into the console output the operator sees. So a host offering
+        SSLv3 printed "SSLv3   offered (NOT ok)", no severity word
+        anywhere, no record built, no finding reported — while the same
+        host run through the standalone testssl button showed it plainly.
+
+        What testssl does print is a check name and a verdict. That is
+        what this reads. Severity is not taken from the line at all; it
+        comes from the issue library, which is where the house scoring
+        policy lives.
+        """
         records = []
-        for line in text.splitlines():
+        seen = set()
+        for line in (text or "").splitlines():
             clean = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
-            if len(clean) < 12:
-                continue
-            severity = next((s for s in ("CRITICAL", "HIGH", "MEDIUM", "LOW")
-                             if re.search(rf"\b{s}\b", clean)), None)
-            if not severity:
+            if len(clean) < 8 or clean.startswith(("#", "Start ", "Done ")):
                 continue
             parts = re.split(r"\s{2,}", clean, maxsplit=1)
-            records.append({"id": parts[0].strip(),
-                            "severity": severity,
-                            "finding": (parts[1] if len(parts) > 1
-                                        else clean).strip(),
-                            "cve": " ".join(re.findall(r"CVE-\d{4}-\d+", clean))})
+            if len(parts) < 2:
+                continue
+            name, verdict = parts[0].strip(), parts[1].strip()
+            lowered = verdict.lower()
+            if any(good in lowered for good in self._TESTSSL_GOOD):
+                continue
+            if not any(bad in lowered for bad in self._TESTSSL_BAD):
+                continue
+            # "BEAST (CVE-2011-3389)" → "BEAST"; "POODLE, SSL" → "POODLE_SSL";
+            # "TLS 1" → "TLS1". The identifiers the library matches on are
+            # testssl's JSON ids, so the console names are normalised to them.
+            cves = re.findall(r"CVE-\d{4}-\d+", clean)
+            identifier = re.sub(r"\s*\(.*?\)\s*", "", name).strip()
+            identifier = identifier.replace(", ", "_").replace(" ", "")
+            if not identifier:
+                continue
+            marker = (identifier.lower(), lowered[:60])
+            if marker in seen:
+                continue
+            seen.add(marker)
+            records.append({"id": identifier,
+                            # Left empty on purpose: the library rates it.
+                            "severity": "",
+                            "finding": verdict,
+                            "cve": " ".join(cves)})
         return records
 
     def _cb_parse_nikto(self, stage, text):

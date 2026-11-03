@@ -42,7 +42,57 @@ def _issue(severity, title, detail, remediation, cwe="", references=()):
             "references": list(references)}
 
 
+#: Keys that are OBSERVATIONS, not issues.
+#:
+#: A finding has to be able to say "this is what was seen" without
+#: borrowing a vulnerability class to say it in — that is what the
+#: decision engine falls back to when a detector's class cannot be
+#: supported by its evidence. These entries carry no remediation and no
+#: CWE on purpose: there is nothing to fix and nothing to classify,
+#: because no weakness is being claimed. Writing advice for them would
+#: put back exactly the boilerplate the Findings section was cut down to
+#: remove.
+#:
+#: Declared here rather than exempted inside a test, so the exemption is
+#: visible to anyone reading the library.
+OBSERVATION_KEYS = frozenset({
+    "security_header_observation",
+    "content_observation",
+    "path_observation",
+})
+
 ISSUES = {
+    # ── observations, named as observations ──────────────────────────────
+    #
+    # A finding has to be able to say "this is what was seen" without
+    # borrowing a vulnerability class to say it in. Without these keys,
+    # a detector that reads a header had nowhere to land except a class
+    # that claimed more than the header shows.
+    "xss_protection_deprecated": _issue(
+        "INFO", "Deprecated X-XSS-Protection header",
+        "The response sets the legacy X-XSS-Protection header. Chrome "
+        "removed the XSS auditor in 2019 and no current browser acts on "
+        "this header, so neither its presence nor its value affects the "
+        "application's security. It is not evidence of a cross-site "
+        "scripting vulnerability.",
+        "Remove the header, or leave it — it has no effect either way. A "
+        "Content-Security-Policy is what restricts script execution.",
+        "CWE-1022"),
+    "security_header_observation": _issue(
+        "INFO", "Security header observation",
+        "A scanner reported a response header. The header and its value "
+        "are recorded; no vulnerability is claimed from them alone.",
+        "", "CWE-16"),
+    "content_observation": _issue(
+        "INFO", "Response content observation",
+        "A scanner read something out of a response. The observation is "
+        "recorded; no vulnerability is claimed from it alone.",
+        "", ""),
+    "path_observation": _issue(
+        "INFO", "Reachable path",
+        "A path answered. That it answered is recorded; what it serves and "
+        "whether that matters has not been established.",
+        "", ""),
     # ── component identification, kept apart from exploitation ───────────
     #
     # A component fingerprint, a known-vulnerable component and a
@@ -891,6 +941,125 @@ ISSUES = {
         "'find a vulnerability' into 'look up a CVE'.",
         "Suppress or flatten the header at the proxy.",
         "CWE-200"),
+    # Categories for what a port scan finds. The rating on each finding
+    # comes from modules/port_risk.py, which knows the service and
+    # whether the host is internet-facing; these entries carry the
+    # wording that is the same whichever service it was.
+    "admin_service_exposed": _issue(
+        "HIGH", "Administrative service reachable",
+        "An administrative or build service is answering on this host. "
+        "These authenticate the thing they administer, frequently ship "
+        "with default credentials, and in the case of CI systems execute "
+        "code as their reason for existing.",
+        "Restrict it to a management network or VPN and require strong "
+        "authentication with MFA.",
+        "CWE-284"),
+    "management_interface_exposed": _issue(
+        "HIGH", "Out-of-band management interface reachable",
+        "A management controller or hardware console is answering. These "
+        "sit below the operating system: access means power control, "
+        "console and virtual media, and the protocols have a poor "
+        "security history.",
+        "Management interfaces belong on an isolated network that is not "
+        "routable from user networks and never from the internet.",
+        "CWE-284"),
+    "orchestration_api_exposed": _issue(
+        "CRITICAL", "Container or orchestration API reachable",
+        "A container runtime or cluster control-plane API is answering. "
+        "These are designed to run code and hold the credentials of "
+        "everything they schedule, so reaching one is usually equivalent "
+        "to compromising the hosts behind it.",
+        "Never expose these APIs. Require mutual TLS, disable anonymous "
+        "authentication, and restrict to the control-plane network.",
+        "CWE-306"),
+    "mail_service_exposed": _issue(
+        "LOW", "Mail service reachable",
+        "A mail service is answering and discloses its software. Worth "
+        "testing for open relay and for user enumeration through the "
+        "VRFY, EXPN and RCPT responses.",
+        "Require authentication for submission, disable VRFY and EXPN, "
+        "and confirm the server is not an open relay.",
+        "CWE-200"),
+    "directory_service_exposed": _issue(
+        "HIGH", "Directory service reachable",
+        "A directory service is answering. Anonymous bind, where it is "
+        "permitted, hands over the organisation's user list and group "
+        "membership before any credential is needed.",
+        "Disable anonymous bind, require LDAPS, and restrict access to "
+        "the hosts that need it.",
+        "CWE-200"),
+    "file_share_exposed": _issue(
+        "HIGH", "File sharing service reachable",
+        "A file sharing service is answering. These are the services "
+        "ransomware spreads through, and their authorisation is often "
+        "based on the client asserting who it is.",
+        "Block these at the perimeter and restrict exports and shares by "
+        "address with authenticated, signed protocols.",
+        "CWE-284"),
+    "legacy_service_exposed": _issue(
+        "MEDIUM", "Obsolete service reachable",
+        "A service with no modern purpose is answering. Its existence is "
+        "usually a sign that nobody has reviewed what this host runs.",
+        "Disable the service, and review what else this host is running "
+        "that nobody has looked at recently.",
+        "CWE-1104"),
+    "message_broker_exposed": _issue(
+        "HIGH", "Message broker reachable",
+        "A broker carrying application messages is answering. Several "
+        "common brokers have no authentication in their default "
+        "configuration, and others ship with guest credentials.",
+        "Require authentication and TLS, and restrict to the application "
+        "network.",
+        "CWE-306"),
+    "monitoring_exposed": _issue(
+        "MEDIUM", "Monitoring or metrics service reachable",
+        "A metrics or monitoring endpoint is answering. These routinely "
+        "disclose internal host names, software versions, request paths "
+        "and sometimes credentials in labels.",
+        "Require authentication and restrict to the monitoring network.",
+        "CWE-200"),
+    "service_exposed": _issue(
+        "INFO", "Open port recorded",
+        "This port is open and the service on it was not recognised. "
+        "Recorded so the port inventory in the report is complete.",
+        "Confirm the service is meant to be reachable from where it was "
+        "found.",
+        "CWE-1327"),
+    "web_service_observed": _issue(
+        "INFO", "Web service observed",
+        "A web service is answering on this port. Recorded for the port "
+        "inventory; the web tests cover what it serves.",
+        "No action for the port itself — what it serves is covered by the "
+        "web stages of this scan.",
+        "CWE-1327"),
+    "service_version_disclosed": _issue(
+        "LOW", "Service version disclosed",
+        "The service returns its software name and version before "
+        "authentication. That is the starting point of a CVE search, and "
+        "it tells an attacker which exploits are worth trying before they "
+        "send anything that would be logged as an attack.",
+        "Suppress or generalise version banners where the software allows "
+        "it. This is defence in depth: the fix for the versions "
+        "themselves is to keep them current.",
+        "CWE-200"),
+    "excessive_ports": _issue(
+        "LOW", "Potentially excessive open ports",
+        "More services are reachable than a host serving this role needs. "
+        "Each open port is another service to patch, another authentication "
+        "surface and another thing that can be fingerprinted — and services "
+        "left listening because nobody decided to turn them off are the ones "
+        "least likely to be monitored.",
+        "Review each listening service against what this host is for, and "
+        "restrict the rest at the firewall or by binding them to localhost.",
+        "CWE-1327"),
+    "infrastructure_disclosed": _issue(
+        "INFO", "Underlying infrastructure identified",
+        "The service banners name the software behind this host. That is "
+        "worth recording in its own right: it tells a reader what the stack "
+        "is, and it is what a CVE search starts from.",
+        "Suppress product and version strings in service banners where the "
+        "software allows it.",
+        "CWE-200"),
     "outdated_software": _issue(
         "MEDIUM", "Outdated software version",
         "The version in use is behind the current release and has published "
@@ -1274,6 +1443,73 @@ def for_nuclei(template_id, name, description=""):
 
 #: nmap service names that are findings in themselves, and which issue they
 #: are. A datastore on a public interface is not the same problem as telnet.
+#: How many open ports a tester would start asking questions about.
+#: Four is the working rule: 80 and 443 plus a couple of expected
+#: management services is ordinary; more than that on one host is worth
+#: a line in the report even when each individual service is fine.
+EXCESSIVE_PORT_THRESHOLD = 4
+
+#: Products worth naming when nmap's version column identifies them.
+#: Matched case-insensitively against the version string, longest first
+#: so "Microsoft IIS" is not reported as "IIS httpd" and nginx is not
+#: missed because the banner also says "Ubuntu".
+INFRASTRUCTURE_PRODUCTS = (
+    "nginx", "apache httpd", "apache tomcat", "apache traffic server",
+    "microsoft iis", "iis httpd", "litespeed", "openresty", "caddy",
+    "lighttpd", "haproxy", "varnish", "envoy", "traefik", "squid",
+    "cloudflare", "gunicorn", "uvicorn", "waitress", "jetty", "jboss",
+    "wildfly", "weblogic", "websphere", "glassfish", "node.js",
+    "express", "kestrel", "openssh", "postfix", "exim", "dovecot",
+    "proftpd", "vsftpd", "pure-ftpd", "filezilla", "bind", "powerdns",
+    "unbound", "dnsmasq", "mariadb", "mysql", "postgresql", "redis",
+    "mongodb", "rabbitmq", "kafka", "elasticsearch", "kibana",
+    "jenkins", "gitlab", "grafana", "prometheus", "consul", "vault",
+)
+
+
+#: How each product is spelled in a report. Title-casing a lowercase
+#: match gives "Openssh" and "Mysql", which looks like a tool wrote it.
+INFRASTRUCTURE_NAMES = {
+    "nginx": "nginx", "openresty": "OpenResty", "caddy": "Caddy",
+    "lighttpd": "lighttpd", "haproxy": "HAProxy", "varnish": "Varnish",
+    "envoy": "Envoy", "traefik": "Traefik", "squid": "Squid",
+    "apache httpd": "Apache httpd", "apache tomcat": "Apache Tomcat",
+    "apache traffic server": "Apache Traffic Server",
+    "microsoft iis": "Microsoft IIS", "iis httpd": "Microsoft IIS",
+    "litespeed": "LiteSpeed", "cloudflare": "Cloudflare",
+    "gunicorn": "Gunicorn", "uvicorn": "Uvicorn", "waitress": "Waitress",
+    "jetty": "Jetty", "jboss": "JBoss", "wildfly": "WildFly",
+    "weblogic": "WebLogic", "websphere": "WebSphere",
+    "glassfish": "GlassFish", "node.js": "Node.js", "express": "Express",
+    "kestrel": "Kestrel", "openssh": "OpenSSH", "postfix": "Postfix",
+    "exim": "Exim", "dovecot": "Dovecot", "proftpd": "ProFTPD",
+    "vsftpd": "vsftpd", "pure-ftpd": "Pure-FTPd",
+    "filezilla": "FileZilla", "bind": "BIND", "powerdns": "PowerDNS",
+    "unbound": "Unbound", "dnsmasq": "dnsmasq", "mariadb": "MariaDB",
+    "mysql": "MySQL", "postgresql": "PostgreSQL", "redis": "Redis",
+    "mongodb": "MongoDB", "rabbitmq": "RabbitMQ", "kafka": "Kafka",
+    "elasticsearch": "Elasticsearch", "kibana": "Kibana",
+    "jenkins": "Jenkins", "gitlab": "GitLab", "grafana": "Grafana",
+    "prometheus": "Prometheus", "consul": "Consul", "vault": "Vault",
+}
+
+
+def infrastructure_name(product):
+    """How to write this product's name in a finding."""
+    key = str(product or "").strip().lower()
+    return INFRASTRUCTURE_NAMES.get(key, product)
+
+
+def infrastructure_in(banner):
+    """Products named in an nmap version string, longest match first."""
+    text = str(banner or "").lower()
+    found = []
+    for product in sorted(INFRASTRUCTURE_PRODUCTS, key=len, reverse=True):
+        if product in text and not any(product in seen for seen in found):
+            found.append(product)
+    return found
+
+
 NMAP_SERVICES = {
     "redis": "exposed_datastore", "mongodb": "exposed_datastore",
     "memcached": "exposed_datastore", "elasticsearch": "exposed_datastore",
@@ -1314,6 +1550,67 @@ def severity_for(key, tool_severity=""):
     if key in TOOL_RATED and tool_severity:
         return tool_severity.upper()
     return issue["severity"]
+
+
+#: What each obsolete protocol version is rated, because they are not
+#: one issue. SSLv2 and SSLv3 are broken protocols — POODLE and DROWN
+#: are attacks on the protocol itself, and no browser has spoken either
+#: for years, so a host offering one is offering it to an attacker
+#: performing a downgrade and to nobody else. TLS 1.0 and 1.1 are
+#: deprecated rather than broken: still negotiated by real clients,
+#: still failing a modern baseline.
+#:
+#: Rating them all MEDIUM under one merged finding is what hid SSLv3 on
+#: a live engagement. The row said "Obsolete TLS protocol versions
+#: enabled: SSLv3, TLS 1.0" at MEDIUM, and the fact that mattered —
+#: SSLv3, which testssl itself rates high — was averaged away.
+OBSOLETE_PROTOCOL_SEVERITY = {
+    "sslv2": "HIGH",
+    "sslv3": "HIGH",
+    "tls1": "MEDIUM",
+    "tls1_1": "MEDIUM",
+}
+
+#: Display names, so a finding is titled with the version a tester would
+#: write in a report rather than testssl's identifier.
+OBSOLETE_PROTOCOL_NAMES = {
+    "sslv2": "SSLv2",
+    "sslv3": "SSLv3",
+    "tls1": "TLS 1.0",
+    "tls1_1": "TLS 1.1",
+}
+
+
+#: Every spelling of an obsolete protocol that reaches this code, mapped
+#: to the one token the rest of it uses. testssl's JSON ids are SSLv3 /
+#: TLS1 / TLS1_1; ssl_cipher_check records "SSL 3.0" and "TLS 1.0";
+#: sslyze says TLSv1.0. One table so a finding does not depend on which
+#: tool happened to supply the version.
+_PROTOCOL_SPELLINGS = {
+    "sslv2": "sslv2", "ssl2": "sslv2", "ssl20": "sslv2", "sslv20": "sslv2",
+    "sslv3": "sslv3", "ssl3": "sslv3", "ssl30": "sslv3", "sslv30": "sslv3",
+    "tls1": "tls1", "tls10": "tls1", "tlsv1": "tls1", "tlsv10": "tls1",
+    "tls11": "tls1_1", "tlsv11": "tls1_1", "tls1_1": "tls1_1",
+}
+
+
+def protocol_token(label):
+    """Normalise any spelling of a protocol version, or return "".
+
+    Returns "" for a current version, so TLS 1.2 and 1.3 never produce
+    a finding however they are written.
+    """
+    squashed = re.sub(r"[^a-z0-9]", "",
+                      str(label or "").strip().lower())
+    return _PROTOCOL_SPELLINGS.get(squashed, "")
+
+
+def obsolete_protocol_version(identifier):
+    """Which obsolete protocol a testssl record id names, or ""."""
+    token = str(identifier or "").strip().lower()
+    if token in OBSOLETE_PROTOCOL_NAMES:
+        return token
+    return protocol_token(identifier)
 
 
 def worst(*severities):
@@ -1444,7 +1741,37 @@ TESTSSL_INFORMATIONAL = re.compile(
     r"HTTP_(status_code|clock_skew|headerTime)|banner_|service|"
     r"engine_problem|scanTime|clientsimulation|protocol_negotiated|"
     r"TLS_extensions|TLS_session_ticket|SSL_sessionID_support|"
-    r"sub_cipherlists|std_|grade|cert_chain_of_trust$)", re.I)
+    r"sub_cipherlists|std_|grade|cert_chain_of_trust$|"
+    # testssl's own bookkeeping and its rating section. None of these
+    # fault anything, and all of them were falling through to
+    # tls_generic — which is how a finding reading
+    #
+    #     TLS configuration weakness            CRITICAL
+    #       cert_notAfter: 2026-12-12 23:59
+    #       security_headers:
+    #       overall_grade: M
+    #
+    # reached a report. A certificate's expiry DATE is not a weakness
+    # (cert_expirationStatus is the check that says whether it is a
+    # problem), an empty header list is not a weakness, and a letter
+    # grade is a summary of the other checks, not a check.
+    r"overall_grade|final_score|grade_cap_reason|security_headers$|"
+    r"cert_not(After|Before)$|cert_revocation|cert_validity|"
+    r"certificate_transparency|cert_extlifeSpan|rating|"
+    r"scanProblem|scanResult|startTime|optimal_proto|"
+    r"cipher_negotiated|cert_keyUsage|cert_extKeyUsage|"
+    # The per-suite inventory — "cipher-tls1_2_xc009: TLSv1.2 xc009
+    # ECDHE-ECDSA-AES128-SHA …". Twelve of these came out as one
+    # "TLS configuration weakness" at MEDIUM with no statement of what
+    # was wrong with any of them. They are the list of suites the host
+    # offers; they are read into the cipher enumeration instead, where
+    # they become the evidence for the findings that DO name a weakness.
+    r"cipher[-_][a-z0-9_]+_x|cipher-|"
+    # And testssl's observation that a header contains an IP or a
+    # cookie. Not a weakness, and it was pasting Set-Cookie values —
+    # session cookies included — into the report.
+    r"ipv4_in_header|ip_in_header|cookie_(count|bogus)|"
+    r"HSTS_time|security_headers_)", re.I)
 
 #: The few testssl records that are informational by id but worth a named
 #: entry of their own rather than silence.
