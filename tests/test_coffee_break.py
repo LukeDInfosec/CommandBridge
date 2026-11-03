@@ -434,9 +434,16 @@ def main():
                  "+ OSVDB-3233: /icons/README: Apache default file found.\n")
         produced = engine._cb_parse_nikto({"key": "nikto"}, nikto)
         check("banner lines are not counted as findings", produced, 2)
+        # "Server: nginx" names the software and no release, so it is
+        # software identification rather than a version leak — the
+        # distinction that stopped "server: cloudflare" being reported
+        # as a disclosed VERSION.
         check("the server banner is kept as information, not a finding",
               [f.severity for f in engine._cb_findings
-               if f.key == "version_disclosure"], ["INFO"])
+               if f.key == "software_disclosed"], ["INFO"])
+        check("   and is not called a version disclosure",
+              any(f.key == "version_disclosure"
+                  for f in engine._cb_findings), False)
         # Nikto pattern-matches; it does not reproduce anything. On the
         # evidence scale that is a long way from confirmed, whatever Nikto
         # itself says.
@@ -502,6 +509,107 @@ def main():
                cb_issues.NMAP_SERVICES.get("ms-wbt-server")),
               ("exposed_datastore", "cleartext_service",
                "remote_access_exposed"))
+
+        print("\n\033[1mIdentification is not a version leak\033[0m")
+        # "Software version disclosed" whose evidence was
+        # "server: cloudflare". No version was disclosed — the pattern
+        # that catches a Server header could not tell the two apart.
+        check("a Server header with no release is software identification",
+              cb_issues.for_text("server: cloudflare")[0],
+              "software_disclosed")
+        check("   rated Informational",
+              cb_issues.ISSUES["software_disclosed"]["severity"], "INFO")
+        check("   and titled as identification, not as a version leak",
+              "version" in
+              cb_issues.ISSUES["software_disclosed"]["title"].lower(), False)
+        check("a Server header WITH a release still is a version leak",
+              cb_issues.for_text("Server: nginx 1.18.0")[0],
+              "version_disclosure")
+        check("   as is an x-powered-by carrying one",
+              cb_issues.for_text(
+                  "Retrieved x-powered-by header: PHP/8.1.2")[0],
+              "version_disclosure")
+
+        print("\n\033[1mOne product, one row\033[0m")
+        # "server: cloudflare" and "Cloudflare detected via cf-ray
+        # header" are one fact reported twice.
+        dupe = Engine(base)
+        first = dupe._cb_issue("software_disclosed", base,
+                               "server: cloudflare", "nikto")
+        dupe._cb_record(first)
+        second = dupe._cb_issue("software_disclosed", base,
+                                "Cloudflare detected via cf-ray header",
+                                "nuclei")
+        dupe._cb_record(second)
+        identified = [f for f in dupe._cb_findings
+                      if f.key == "software_disclosed"]
+        check("the same product is not reported twice", len(identified), 1)
+        check("   and the second sighting's wording is kept",
+              "cf-ray" in identified[0].evidence)
+        check("   with both tools credited",
+              sorted(identified[0].sources), ["nikto", "nuclei"])
+        # A different product is a different finding.
+        dupe._cb_record(dupe._cb_issue("software_disclosed", base,
+                                       "server: nginx", "nikto"))
+        check("a different product still gets its own row",
+              len([f for f in dupe._cb_findings
+                   if f.key == "software_disclosed"]), 2)
+
+        print("\n\033[1mNamed findings, and the scanner's own "
+              "complaints\033[0m")
+        check("a wildcard certificate is a named finding",
+              cb_issues.for_text(
+                  "Server is using a wildcard certificate: *.example.com")[0],
+              "wildcard_certificate")
+        check("   titled the way the house words it",
+              cb_issues.ISSUES["wildcard_certificate"]["title"],
+              "Wildcard certificate in use")
+        # The scanner telling us ITS scan failed is not a finding about
+        # the client. These were going into the findings list.
+        for line in (
+                "ERROR: *** Error limit (20) reached for host, giving up. "
+                "Last error: opening stream: ssl connect failed. ***",
+                "ERROR: *** Consider using mitmproxy to avoid TLS "
+                "fingerprinting. ***",
+                "+ ERROR: Cannot resolve hostname",
+                "+ Connection timed out"):
+            check(f"'{line[:38]}…' is the scan talking about itself",
+                  cb_issues.is_statement(line))
+        errors = Engine(base)
+        errors._cb_parse_nikto({"key": "nikto"}, "\n".join([
+            "+ ERROR: *** Error limit (20) reached for host, giving up. ***",
+            "+ ERROR: *** Consider using mitmproxy to avoid TLS "
+            "fingerprinting. ***",
+        ]))
+        check("so no finding is produced from them",
+              len(errors._cb_findings), 0)
+
+        print("\n\033[1mrobots.txt: the contents, not an instruction to "
+              "go and look\033[0m")
+        # "contains 27 entries which should be manually viewed" is the
+        # scanner telling the operator to do the work. The entries were
+        # already fetched to decide whether this was worth reporting.
+        robots = Engine(base)
+        robots._cb_artifacts["robots_checked"] = True
+        robots._cb_artifacts["robots_entries"] = [
+            "Disallow: /admin/", "Disallow: /backup/",
+            "Disallow: /internal-api/", "Allow: /public/"]
+        robots._cb_parse_nikto({"key": "nikto"}, (
+            "+ /robots.txt: contains 27 entries which should be manually "
+            "viewed. See: https://developer.mozilla.org/"))
+        found_robots = [f for f in robots._cb_findings
+                        if f.key == "robots_disclosure"]
+        check("the finding is produced", len(found_robots), 1)
+        entry_text = found_robots[0].summary + found_robots[0].evidence
+        check("   and lists the actual entries",
+              all(path in entry_text for path in
+                  ("/admin/", "/backup/", "/internal-api/")))
+        check("   counted from the file, not from nikto's sentence",
+              "4 path rule(s)" in found_robots[0].summary)
+        check("   and does not tell the reader to go and view it manually",
+              "manually viewed" in found_robots[0].summary, False)
+        check("   while saying what the file is and is not",
+              "not an access control" in found_robots[0].summary)
 
         print("\n\033[1mEvery open port is judged, not just a listed "
               "few\033[0m")
@@ -1451,9 +1559,14 @@ def main():
         check("observations are collected as Info, not Low",
               [f.severity for f in engine._cb_findings
                if "inventory" in f.title.lower()], ["INFO"])
-        check("two tools' wording for the same banner is one finding",
-              len([f for f in engine._cb_findings
-                   if f.key == "version_disclosure"]), 1)
+        # One row PER PRODUCT. nginx/1.24 and PHP/8.1 are two products
+        # with two disclosed versions; they used to fold into one row
+        # because they share an issue key, which lost one of them.
+        # Repeated sightings of the SAME product still merge — see
+        # "One product, one row" above.
+        check("each product's disclosed version is its own finding",
+              sorted(f.variant for f in engine._cb_findings
+                     if f.key == "version_disclosure"), ["nginx", "php"])
         check("nothing was reported at Low that is only an observation",
               [f.title for f in engine._cb_findings
                if f.severity == "LOW" and "Server:" in f.evidence], [])

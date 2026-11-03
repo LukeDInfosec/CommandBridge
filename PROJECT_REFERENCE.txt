@@ -19,6 +19,61 @@ HOW TO USE THIS FILE
  CHANGELOG (most recent first)
 ================================================================================
 
+## 2026-11-03 — WORDING, DUPLICATES, AND THREE CARDS THAT DID NOT WORK (6.10.4)
+
+1. "SOFTWARE VERSION DISCLOSED" OVER "server: cloudflare". No version
+   was disclosed. The text rule that catches a Server header cannot
+   tell identification from a version leak, so the TEXT decides now: a
+   release number in the line keeps version_disclosure, and without one
+   it is the new software_disclosed (INFO, "Software identified in
+   response headers"). Same fault as the nmap one in 6.10.3, same fix,
+   different parser.
+
+2. ONE PRODUCT, ONE ROW. "server: cloudflare" and "Cloudflare detected
+   via cf-ray header" are one fact reported twice. Identification
+   findings now merge on the PRODUCT named, keeping the second
+   sighting's wording and crediting both tools. The other half of that:
+   different products no longer fold together either — nginx/1.24 and
+   PHP/8.1 share an issue key and were becoming one row, losing one of
+   them.
+
+3. "Server is using a wildcard certificate:" was the scanner's own
+   sentence used as a title. Named: "Wildcard certificate in use", with
+   the reason a tester gives — one private key protects every host
+   under the domain, so a compromise anywhere it is deployed is a
+   compromise of all of them.
+
+4. THE SCANNER'S OWN COMPLAINTS WERE BEING REPORTED AS FINDINGS:
+
+       ERROR: *** Error limit (20) reached for host, giving up. ***
+       ERROR: *** Consider using mitmproxy to avoid TLS fingerprinting.
+
+   The first says the scan failed; the second is advice to the
+   operator. Neither says anything about the target. Added to
+   NOT_A_FINDING with the other scan-about-itself patterns, along with
+   timeouts, connection failures and resolver errors.
+
+5. robots.txt SAID "contains 27 entries which should be manually
+   viewed". The entries were already fetched — that is how the stage
+   decides whether robots.txt is worth reporting at all — so they go
+   IN the finding now, counted from the file rather than from nikto's
+   sentence, with the note that the list is a shortlist of places to
+   look and not an access control.
+
+REMOVED: the Web tab's SSRF, SSTI and Path Traversal / File Inclusion
+cards. Every button in them guessed a parameter name — ?url=, ?file=,
+a form field called "name" — and fired a probe at it. On a target
+without that parameter the request is meaningless, and "[safe]" from a
+grep that never had anything to match reads as a test that passed. The
+capability they implied (find the parameter, test it, decide what the
+response proves) is what the Active Scan engine does with a controlled
+differential behind it; a row of curl one-liners is not a second
+implementation of that, it is a way to believe a test ran when it did
+not.
+
+CHANGED: modules/cb_issues.py, modules/coffee_break.py,
+         ui/tabs_web.py, tests/test_coffee_break.py
+
 ## 2026-11-03 — FOUR CORRECTIONS FROM A LIVE SCAN (6.10.3)
 
 1. AN NMAP GROUP. The port findings now collapse under "Open Ports and

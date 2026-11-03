@@ -935,6 +935,23 @@ ISSUES = {
         "internal paths, component versions and query structure.",
         "Return a generic error to the client and log the detail server-side.",
         "CWE-209"),
+    "software_disclosed": _issue(
+        "INFO", "Software identified in response headers",
+        "The response names the software serving the application. On its "
+        "own that is identification rather than a version leak: it tells "
+        "a reader what the stack is without saying which release.",
+        "Suppress or generalise the header where the software allows it, "
+        "if the exposure is unwanted.",
+        "CWE-200"),
+    "wildcard_certificate": _issue(
+        "INFO", "Wildcard certificate in use",
+        "The certificate is valid for every host under a domain. One "
+        "private key therefore protects every one of those hosts, so a "
+        "compromise anywhere it is deployed — including a host nobody is "
+        "watching — is a compromise of all of them.",
+        "Prefer per-host certificates with automated renewal. Where a "
+        "wildcard is kept, restrict where its private key is deployed.",
+        "CWE-295"),
     "version_disclosure": _issue(
         "INFO", "Software version disclosed",
         "The response names the software and often its version, which turns "
@@ -1392,9 +1409,21 @@ _TEXT_ISSUES = (
     (r"secure flag|cookie without secure|cookies-without-secure",
      "cookie_no_secure"),
     (r"session (token|id) in url", "session_token_in_url"),
+    (r"wildcard certificate|\*\.[a-z0-9-]+\.[a-z]{2,}\s+certificate",
+     "wildcard_certificate"),
     (r"version (disclos|leak)|banner|^server\s*:\s*\S|"
      r"^retrieved x-powered-by", "version_disclosure"),
 )
+
+
+#: A release number in a line: two dotted parts, or one with a letter
+#: suffix the way OpenSSH writes 8.9p1. "cloudflare" has none; "nginx
+#: 1.18.0" does.
+_VERSION_IN_TEXT = re.compile(r"\b\d+\.\d+(?:\.\d+)*[A-Za-z]*\d*\b")
+
+
+def _has_version(text):
+    return bool(_VERSION_IN_TEXT.search(str(text or "")))
 
 
 def for_text(text, default=None):
@@ -1407,6 +1436,12 @@ def for_text(text, default=None):
     blob = str(text or "")
     for pattern, key in _TEXT_ISSUES:
         if re.search(pattern, blob, re.I):
+            # "Software version disclosed" over the evidence
+            # "server: cloudflare" is wrong in the way that matters: no
+            # version was disclosed. The pattern that catches a Server
+            # header cannot tell the two apart, so the text decides.
+            if key == "version_disclosure" and not _has_version(blob):
+                key = "software_disclosed"
             return key, ISSUES[key]
     if default and default in ISSUES:
         return default, ISSUES[default]
@@ -1464,6 +1499,10 @@ INFRASTRUCTURE_PRODUCTS = (
     "unbound", "dnsmasq", "mariadb", "mysql", "postgresql", "redis",
     "mongodb", "rabbitmq", "kafka", "elasticsearch", "kibana",
     "jenkins", "gitlab", "grafana", "prometheus", "consul", "vault",
+    # Runtimes, because a disclosed PHP or OpenSSL version is the one a
+    # reader looks up first — and because identification findings are
+    # kept one per product, which needs the product to be recognised.
+    "php", "openssl", "perl", "python", "ruby", "asp.net", "coldfusion",
 )
 
 
@@ -1491,6 +1530,9 @@ INFRASTRUCTURE_NAMES = {
     "elasticsearch": "Elasticsearch", "kibana": "Kibana",
     "jenkins": "Jenkins", "gitlab": "GitLab", "grafana": "Grafana",
     "prometheus": "Prometheus", "consul": "Consul", "vault": "Vault",
+    "php": "PHP", "openssl": "OpenSSL", "perl": "Perl",
+    "python": "Python", "ruby": "Ruby", "asp.net": "ASP.NET",
+    "coldfusion": "ColdFusion",
 }
 
 
@@ -1695,6 +1737,27 @@ NOT_A_FINDING = (
     re.compile(r"^(done|finished|complete)\b", re.I),
     re.compile(r"^-+$"),
     re.compile(r"^\d+:\d+:\d+\s+(start|end)", re.I),
+    # The scanner telling us about ITS OWN trouble. These were being
+    # reported as findings against the client:
+    #
+    #   ERROR: *** Error limit (20) reached for host, giving up.
+    #          Last error: opening stream: ssl connect failed. ***
+    #   ERROR: *** Consider using mitmproxy to avoid TLS fingerprinting.
+    #
+    # The first says the scan failed, the second is advice to the
+    # operator. Neither says anything about the target, and a scan that
+    # gave up is a gap in coverage — which belongs in the console, not
+    # in the findings list.
+    re.compile(r"^\**\s*error\b.*\*{0,3}$", re.I),
+    re.compile(r"error limit\s*\(?\d*\)?\s*reached", re.I),
+    re.compile(r"\bgiving up\b", re.I),
+    re.compile(r"consider using mitmproxy", re.I),
+    re.compile(r"tls fingerprinting", re.I),
+    re.compile(r"opening stream\s*:", re.I),
+    re.compile(r"^cannot (connect|resolve)", re.I),
+    re.compile(r"^(connection|read) (timed out|refused|reset)", re.I),
+    re.compile(r"^no web server found", re.I),
+    re.compile(r"^\**\s*(warning|notice)\s*:", re.I),
 )
 
 

@@ -2109,6 +2109,14 @@ class CoffeeBreakMixin:
         if finding.key and finding.key in self._cb_muted:
             return
 
+        # Identification is identification, whichever header or template
+        # noticed it. "Software identified in response headers:
+        # server: cloudflare" and "Cloudflare detected via cf-ray
+        # header" are one fact reported twice — the second row tells the
+        # reader nothing the first did not.
+        if self._cb_already_identified(finding):
+            return
+
         if finding.key:
             drop, why = self._cb_presence_conflict(finding)
             if drop:
@@ -2177,6 +2185,58 @@ class CoffeeBreakMixin:
             self.console.append_ansi(
                 f"      ⚠ CLASSIFICATION/EVIDENCE MISMATCH — "
                 f"manual validation required\n")
+
+    #: Keys that say "this host runs X" and nothing more. Several tools
+    #: notice the same X by different means, and each used to produce
+    #: its own row.
+    _IDENTIFICATION_KEYS = frozenset({
+        "software_disclosed", "infrastructure_disclosed",
+        "version_disclosure", "technology_detected",
+    })
+
+    def _cb_already_identified(self, finding):
+        """Is this product already reported as identified?
+
+        Merges the duplicate into the finding that is already there,
+        keeping its evidence as another instance, so nothing is lost —
+        the second ROW is what goes, not the second observation.
+        """
+        if finding.key not in self._IDENTIFICATION_KEYS:
+            return False
+        text = " ".join([str(finding.title or ""),
+                         str(finding.evidence or ""),
+                         str(getattr(finding, "summary", "") or "")])
+        products = set(cb_issues.infrastructure_in(text))
+        if not products:
+            return False
+        for existing in self._cb_findings:
+            if existing.key not in self._IDENTIFICATION_KEYS:
+                continue
+            seen = set(cb_issues.infrastructure_in(
+                " ".join([str(existing.title or ""),
+                          str(existing.evidence or ""),
+                          str(getattr(existing, "summary", "") or "")])))
+            if products & seen:
+                existing.add_instance(finding.where, finding.evidence,
+                                      finding.proof)
+                # Keep the second observation visible even when the two
+                # share a URL, because what differs is HOW it was seen —
+                # a Server header and a cf-ray header are two sightings
+                # of one fact, and dropping the wording loses the second
+                # tool's contribution.
+                if finding.evidence and \
+                        finding.evidence not in (existing.evidence or ""):
+                    existing.evidence = ((existing.evidence or "")
+                                         + "\n" + finding.evidence).strip()
+                for source in (finding.sources or []):
+                    if source not in existing.sources:
+                        existing.sources.append(source)
+                return True
+        # A DIFFERENT product is a different finding. These share an
+        # issue key, so without a variant the ordinary same-key merge
+        # would fold nginx into cloudflare.
+        finding.variant = finding.variant or sorted(products)[0]
+        return False
 
     @staticmethod
     def _cb_compatible(existing, incoming):
@@ -3657,14 +3717,40 @@ class CoffeeBreakMixin:
             if key:
                 if issue["severity"] != "INFO":
                     produced += 1
-                self._cb_record(self._cb_issue(
-                    key, located, body[:500],
+                evidence = body[:500]
+                extra_summary = ""
+                if key == "robots_disclosure":
+                    # "contains 27 entries which should be manually
+                    # viewed" is the scanner telling the operator to go
+                    # and look. The entries were already fetched to
+                    # decide whether this was worth reporting at all —
+                    # so put them IN the finding, which is the manual
+                    # viewing done.
+                    entries = self._cb_artifacts.get("robots_entries") or []
+                    if entries:
+                        listing = "\n".join(f"  {line}" for line in entries)
+                        evidence = (f"robots.txt on this host lists "
+                                    f"{len(entries)} path rule(s):\n"
+                                    f"{listing}")
+                        extra_summary = (
+                            f"The file names {len(entries)} path rule(s). "
+                            f"Each one is somewhere the operator asked "
+                            f"search engines not to index, which makes the "
+                            f"list a shortlist of places to look — it is "
+                            f"not an access control.\n\n{listing}")
+                finding = self._cb_issue(
+                    key, located, evidence,
                     stage["key"], confidence="tentative",
                     **({"title": override_title} if override_title else {}),
-                    detail=issue["detail"] + f"\n\nNikto reported: {body}\n\n"
-                           "Nikto matches signatures and does not confirm "
-                           "what it finds; verify before this goes in a "
-                           "report." + reachable_note))
+                    detail=issue["detail"]
+                           + (f"\n\nNikto reported: {body}" if not extra_summary
+                              else "")
+                           + "\n\nNikto matches signatures and does not "
+                             "confirm what it finds; verify it independently."
+                           + reachable_note)
+                if extra_summary:
+                    finding.summary = extra_summary
+                self._cb_record(finding)
                 continue
 
             if cb_issues.is_observation(body):
