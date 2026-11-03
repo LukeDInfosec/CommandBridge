@@ -2306,9 +2306,19 @@ class CoffeeBreakMixin:
         where = f"{host}:{port}"
         verdict = port_risk.assess(port, proto, service, banner, public)
 
+        # A rating that rests on nmap guessing from the port number is
+        # confirmed before it is stated. "Jenkins reachable from the
+        # internet on 8080" at CRITICAL, from nothing but an open 8080,
+        # is a finding that has to be withdrawn in front of a client.
+        confirmation = None
+        if port_risk.needs_confirmation(verdict):
+            confirmation = self._cb_confirm_service(host, port, verdict)
+
         evidence = line
         if banner:
             evidence += f"\n\nVersion reported by the service: {banner}"
+        if confirmation and confirmation.get("evidence"):
+            evidence += "\n\n" + confirmation["evidence"]
 
         summary = [verdict.why]
         if banner:
@@ -2329,12 +2339,36 @@ class CoffeeBreakMixin:
             "this port. It makes no claim about a vulnerability in the "
             "service itself.")
 
+        severity = verdict.severity
+        status = "Confirmed"
+        title = verdict.title
+        if confirmation is not None and not confirmation["confirmed"]:
+            # The port is open — that much nmap established. WHAT is
+            # listening on it is not, so the finding says so, is capped,
+            # and names the check that would settle it.
+            severity = port_risk.cap_unconfirmed(severity)
+            status = "Potential"
+            title = (f"Service on {port}/{proto} reported by nmap as "
+                     f"{verdict.entry.name} — not confirmed")
+            summary.insert(1, (
+                f"THIS IDENTIFICATION IS NOT CONFIRMED. nmap named the "
+                f"service from the port, and {confirmation['why']} So the "
+                f"open port is established and the software on it is not. "
+                f"Rated at {severity} rather than "
+                f"{verdict.severity} for that reason.\n\n"
+                f"To settle it: request the port directly and look at what "
+                f"answers — a login page, a product name in the body or a "
+                f"product header. If it is what nmap said, this is a "
+                f"{verdict.severity} finding."))
+        elif confirmation is not None:
+            summary.insert(1, f"Confirmed by request: {confirmation['why']}")
+
         finding = self._cb_issue(
             verdict.issue_key, where, evidence, stage["key"],
-            severity=verdict.severity, title=verdict.title,
+            severity=severity, title=title,
             variant=f"{port}/{proto}")
         finding.summary = "\n\n".join(part for part in summary if part)
-        finding.status_label = "Confirmed"
+        finding.status_label = status
         finding.impact_if_real = verdict.severity
         self._cb_record(finding)
         produced += 1
@@ -2343,6 +2377,80 @@ class CoffeeBreakMixin:
             produced += self._cb_report_version(stage, where, port, proto,
                                                 service, banner)
         return produced
+
+    #: What confirms each product, in the response to one GET. Matched
+    #: case-insensitively against the status line, the headers and the
+    #: first part of the body.
+    _SERVICE_SIGNATURES = {
+        "Jenkins": ("jenkins", "x-jenkins", "hudson"),
+        "Management or admin interface": (
+            "webmin", "portainer", "grafana", "kibana", "prometheus",
+            "rabbitmq", "activemq", "glassfish", "weblogic", "vault",
+            "nessus", "login", "sign in", "dashboard", "console"),
+        "Docker API": ("docker", "api version", "\"apiversion\""),
+        "Kubernetes API server": ("kubernetes", "forbidden", "apiversion"),
+        "Kubelet API": ("kubelet", "node", "pods"),
+        "Message broker": ("rabbitmq", "activemq", "mqtt", "kafka"),
+        "IPMI / BMC": ("ipmi", "bmc", "idrac", "ilo", "supermicro"),
+    }
+
+    def _cb_confirm_service(self, host, port, verdict):
+        """Ask the port what it is, once.
+
+        Returns ``{"confirmed": bool, "why": str, "evidence": str}``.
+        One request per scheme, no payload, nothing written — the same
+        thing a tester does by hand before putting a service in a
+        report.
+        """
+        name = verdict.entry.name if verdict.entry else ""
+        signatures = self._SERVICE_SIGNATURES.get(name, ())
+        attempts = []
+        for scheme in ("https", "http"):
+            url = f"{scheme}://{host}:{port}/"
+            try:
+                session = _session({"url": url,
+                                    "headers": self._cb_extra_headers()})
+                response = session.get(url, timeout=8, allow_redirects=False,
+                                       verify=False)
+            except Exception as exc:                        # noqa: BLE001
+                attempts.append(f"{scheme}: no response ({exc.__class__.__name__})")
+                continue
+            body = (response.text or "")[:4000]
+            haystack = " ".join([
+                str(response.status_code),
+                " ".join(f"{k}: {v}" for k, v in response.headers.items()),
+                body]).lower()
+            hit = next((token for token in signatures
+                        if token in haystack), "")
+            title = ""
+            found = re.search(r"<title[^>]*>(.{0,120}?)</title>", body,
+                              re.I | re.S)
+            if found:
+                title = " ".join(found.group(1).split())
+            evidence = (f"Confirmation request: GET {url}\n"
+                        f"  HTTP {response.status_code}"
+                        + (f"\n  Title: {title}" if title else "")
+                        + (f"\n  Server: {response.headers.get('Server')}"
+                           if response.headers.get("Server") else ""))
+            if hit:
+                return {"confirmed": True,
+                        "why": (f"GET {url} returned HTTP "
+                                f"{response.status_code} and the response "
+                                f"names it ('{hit}')"
+                                + (f"; page title: {title}" if title else "")),
+                        "evidence": evidence}
+            attempts.append(
+                f"{scheme}: HTTP {response.status_code}"
+                + (f", title '{title}'" if title else "")
+                + ", nothing identifying it")
+        return {
+            "confirmed": False,
+            "why": ("a direct request did not find anything identifying it ("
+                    + "; ".join(attempts) + ")." if attempts
+                    else "no confirmation request could be made."),
+            "evidence": ("Confirmation attempted:\n  "
+                         + "\n  ".join(attempts) if attempts else ""),
+        }
 
     def _cb_report_version(self, stage, where, port, proto, service, banner):
         """The version banner as its own finding, plus a catalogue check.

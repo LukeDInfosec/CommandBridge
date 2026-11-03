@@ -534,12 +534,92 @@ def main():
               port_risk.is_public_address("not-an-address"), None)
         for port, expected in (("21/tcp", "HIGH"), ("22/tcp", "MEDIUM"),
                                ("23/tcp", "HIGH"), ("445/tcp", "CRITICAL"),
-                               ("2375/tcp", "CRITICAL"),
                                ("3389/tcp", "HIGH"),
                                ("6379/tcp", "CRITICAL"),
                                ("11211/tcp", "CRITICAL")):
             check(f"{port} on a public host is {expected}",
                   by_port[port].severity, expected)
+        print("\n\033[1mA guessed service is confirmed before it is "
+              "stated\033[0m")
+        # Reported from a live engagement: "Jenkins reachable from the
+        # internet on 8080" at CRITICAL, with no endpoint, no status
+        # code and no evidence — nmap had guessed from the port number.
+        # That is a finding that has to be withdrawn in front of a
+        # client, so the identification is probed first.
+        docker = by_port["2375/tcp"]
+        check("an unconfirmed admin/API service is capped",
+              docker.severity, "MEDIUM")
+        check("   and says plainly that it is not confirmed",
+              "NOT CONFIRMED" in docker.summary)
+        check("   with the title saying nmap reported it, not that it is so",
+              "not confirmed" in docker.title)
+        check("   it names what would settle it",
+              "request the port directly" in docker.summary)
+        check("   and what the rating would be if it were confirmed",
+              "CRITICAL" in docker.summary)
+        check("   reported as Potential, not Confirmed",
+              docker.status_label, "Potential")
+        check("the categories that need confirming are the guessable ones",
+              sorted(port_risk.NEEDS_CONFIRMATION),
+              sorted({port_risk.ADMIN_SERVICE, port_risk.MANAGEMENT,
+                      port_risk.ORCHESTRATION, port_risk.BROKER,
+                      port_risk.MONITORING}))
+        check("a service with a real version banner is not 'guessed'",
+              port_risk.needs_confirmation(
+                  port_risk.assess(8080, "tcp", "jenkins",
+                                   "Jetty 9.4.43.v20210629")), False)
+        check("   but one named from the port alone is",
+              port_risk.needs_confirmation(
+                  port_risk.assess(8080, "tcp", "jenkins", "")))
+        check("a datastore is NOT held back — nothing is guessed about it",
+              by_port["6379/tcp"].status_label, "Confirmed")
+
+        # And when the service IS what nmap said, the probe confirms it
+        # and the full rating stands — the guard must not bury real
+        # findings.
+        class _Jenkins(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = (b"<html><head><title>Dashboard [Jenkins]</title>"
+                        b"</head><body>Welcome to Jenkins!</body></html>")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("X-Jenkins", "2.414.1")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        jenkins_srv = ThreadingHTTPServer(("127.0.0.1", 0), _Jenkins)
+        threading.Thread(target=jenkins_srv.serve_forever,
+                         daemon=True).start()
+        jenkins_base = f"http://127.0.0.1:{jenkins_srv.server_address[1]}"
+        jenkins_port = urllib.parse.urlparse(jenkins_base).port
+        real = Engine(jenkins_base)
+        real._cb_parse_nmap({"key": "nmap"}, "\n".join([
+            f"Nmap scan report for 127.0.0.1",
+            f"{jenkins_port}/tcp open  jenkins"]))
+        confirmed = next(f for f in real._cb_findings
+                         if f.key == "admin_service_exposed")
+        check("a service the probe recognises IS confirmed",
+              confirmed.status_label, "Confirmed")
+        # HIGH, not CRITICAL: the test server is on loopback, so this
+        # is an internal exposure — which is the reachability rule
+        # working, not the confirmation cap. The cap would have made it
+        # MEDIUM.
+        check("   keeps the full rating for where it is",
+              confirmed.severity, "HIGH")
+        check("   and is not capped as unconfirmed",
+              "NOT CONFIRMED" in confirmed.summary, False)
+        check("   and carries the request as evidence",
+              "HTTP 200" in confirmed.evidence)
+        check("   naming what identified it",
+              "jenkins" in confirmed.summary.lower())
+        check("   with the page title, which is what a tester screenshots",
+              "Jenkins" in confirmed.evidence)
+        jenkins_srv.shutdown()
+
         check("SSH is flagged at all, which it was not before",
               "22/tcp" in by_port)
         check("   and the finding says the exposure is the issue, not a bug "
@@ -592,6 +672,38 @@ def main():
               "OpenSSH 8.9p1 Ubuntu" in ssh_version.summary)
         check("   rated Low on its own: it is a disclosure",
               ssh_version.severity, "LOW")
+        # The contradiction: "Service version disclosed — http on 80"
+        # whose evidence held no version, because nmap's version column
+        # had "http" or "ssl/http" in it rather than a release.
+        check("a column holding 'http' is not a version",
+              port_risk.version_token("http"), "")
+        check("nor 'ssl/http'", port_risk.version_token("ssl/http"), "")
+        check("nor an empty column", port_risk.version_token(""), "")
+        check("nor a bare product name",
+              port_risk.version_token("Apache httpd"), "")
+        check("a real release is", port_risk.version_token("nginx 1.18.0"),
+              "1.18.0")
+        check("   including OpenSSH's own form",
+              port_risk.version_token("OpenSSH 8.9p1 Ubuntu"), "8.9p1")
+        bare = Engine(base)
+        bare._cb_parse_nmap({"key": "nmap"}, "\n".join([
+            "Nmap scan report for host.example.io (93.184.216.34)",
+            "80/tcp  open  http",
+            "443/tcp open  ssl/http",
+            "8443/tcp open https      Apache httpd",
+        ]))
+        check("no version finding is produced when no version was returned",
+              [f.variant for f in bare._cb_findings
+               if (f.variant or "").startswith("version-")], [])
+        check("   and the port itself is still reported",
+              len([f for f in bare._cb_findings
+                   if (f.variant or "") in ("80/tcp", "443/tcp",
+                                            "8443/tcp")]), 3)
+        check("   saying no version was returned",
+              "No version was returned" in
+              [f.summary for f in bare._cb_findings
+               if f.variant == "80/tcp"][0])
+
         check("every service that returned a version has one",
               sorted(versions),
               ["version-21/tcp", "version-22/tcp", "version-6379/tcp",
@@ -3677,6 +3789,62 @@ back-end DBMS: MySQL >= 5.6
           (len(single_groups), len(single_loose)), (0, 1))
 
     # 11. separate targets never share a group instance
+    print("\n\033[1mWhat belongs where, corrected from a real scan\033[0m")
+    # 1. A missing CSP is an HTTP security header finding. A reader
+    # looking for it under HTTP Security Headers was not finding it,
+    # because one CSP finding is not a CSP group and it fell out as a
+    # loose row of its own.
+    one_csp = groups_mod.organise(HEADERS + [
+        made("csp_missing", "MEDIUM", "Content-Security-Policy missing",
+             "headers")])
+    header_group = next(g for g in one_csp[0] if g.key == "headers")
+    check("a lone CSP finding joins the HTTP security headers",
+          any(f.key == "csp_missing" for f in header_group.findings))
+    check("   and is not left as a row of its own",
+          any(f.key == "csp_missing" for f in one_csp[1]), False)
+    check("   while several CSP findings still form their own group",
+          {g.key for g in groups_mod.organise(CSP + HEADERS)[0]},
+          {"csp", "headers"})
+    check("   with no finding counted twice",
+          groups_mod.total_shown(*groups_mod.organise(CSP + HEADERS)),
+          len(CSP + HEADERS))
+
+    # 2. HSTS is a response header, found the way a missing CSP is
+    # found. Grouping it under TLS/SSL implied testssl had reported it,
+    # and buried a Medium finding behind a chevron.
+    hsts = made("hsts_missing", "MEDIUM",
+                "HTTP Strict-Transport-Security not set", "headers")
+    with_hsts = groups_mod.organise(TLS + [hsts])
+    check("HSTS is never folded into the TLS group",
+          any(f.key == "hsts_missing"
+              for g in with_hsts[0] for f in g.findings), False)
+    check("   it stays a row of its own, visible without a click",
+          any(f.key == "hsts_missing" for f in with_hsts[1]))
+    check("   and it is not in the TLS category's key list",
+          "hsts_missing" in next(c for c in groups_mod.CATEGORIES
+                                 if c.key == "tls").keys, False)
+    check("   nor quietly moved into the header group either",
+          groups_mod.category_for(hsts), None)
+
+    # 3. The nmap findings get a group of their own.
+    PORTS = [made("remote_access_exposed", "MEDIUM", "SSH on 22/tcp",
+                  "nmap"),
+             made("cleartext_service", "HIGH", "FTP on 21/tcp", "nmap"),
+             made("service_version_disclosed", "LOW",
+                  "Service version disclosed — ssh", "nmap"),
+             made("excessive_ports", "LOW", "Potentially excessive ports",
+                  "nmap")]
+    port_group = next(g for g in groups_mod.organise(PORTS)[0]
+                      if g.key == "ports")
+    check("the open ports form one group", port_group.count, 4)
+    check("   titled as the scan a tester ran",
+          "Open Ports and Services" in port_group.category.title)
+    check("   naming its worst findings on the parent row",
+          "FTP on 21/tcp" in port_group.headline())
+    check("   and an unrecognised nmap finding still lands there",
+          groups_mod.category_for(
+              made("", "INFO", "something", "nmap_quick")).key, "ports")
+
     first = groups_mod.organise(TLS)[0][0]
     other_target = [made(f.key, f.severity, f.title, f.stage) for f in TLS]
     for finding in other_target:

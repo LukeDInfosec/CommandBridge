@@ -426,7 +426,39 @@ class Assessment:
 
     @property
     def has_version(self):
-        return bool(self.version.strip())
+        """Did the service actually disclose a VERSION?
+
+        Not "did nmap print anything in that column". nmap writes
+        "http" or "ssl/http" or a product name with no release in it,
+        and a finding titled "Service version disclosed" whose evidence
+        contains no version is a finding that contradicts itself —
+        which is exactly what it did on ports 80 and 443.
+        """
+        return bool(version_token(self.version))
+
+
+#: A release number: at least two dot-separated numeric parts, or one
+#: number with a suffix the way OpenSSH writes 8.9p1. A bare "2" in a
+#: banner is not a version, and "(Ubuntu)" is not either.
+_VERSION = re.compile(r"\b\d+\.\d+(?:\.\d+)*[A-Za-z]?\d*\b|\b\d+\.\d+p\d+\b")
+
+#: Things nmap puts in the version column that are NOT versions. These
+#: are tunnel and protocol notes, which is why "ssl/http" and a bare
+#: "http" were producing version-disclosure findings with no version in
+#: them.
+NOT_A_VERSION = frozenset({
+    "http", "https", "ssl", "ssl/http", "ssl/https", "tcpwrapped",
+    "http-proxy", "http-alt", "unknown", "filtered", "generic",
+})
+
+
+def version_token(banner):
+    """The release number in a banner, or "" when there is not one."""
+    text = str(banner or "").strip()
+    if not text or text.lower() in NOT_A_VERSION:
+        return ""
+    match = _VERSION.search(text)
+    return match.group(0) if match else ""
 
 
 def lookup(port, service_name=""):
@@ -530,6 +562,44 @@ def max_severity(*values):
                 _ORDER.index(str(value).upper()) > _ORDER.index(best):
             best = str(value).upper()
     return best
+
+
+#: Categories whose rating rests on the service being what nmap says it
+#: is, where nmap is often guessing from the port number alone. "Jenkins
+#: reachable from the internet on 8080" at CRITICAL, from nothing but an
+#: open 8080, is a finding that has to be withdrawn in front of a
+#: client. These need a probe before they are stated as fact.
+NEEDS_CONFIRMATION = frozenset({
+    ADMIN_SERVICE, MANAGEMENT, ORCHESTRATION, BROKER, MONITORING,
+})
+
+#: What an unconfirmed finding in those categories is capped at. The
+#: port IS open, which is worth saying; what is listening on it is not
+#: established, so it cannot carry the rating of the worst thing it
+#: might be.
+UNCONFIRMED_CEILING = "MEDIUM"
+
+
+def needs_confirmation(assessment):
+    """Must this finding be probed before it is reported as fact?"""
+    if assessment is None or assessment.entry is None:
+        return False
+    if assessment.entry.category not in NEEDS_CONFIRMATION:
+        return False
+    # A version banner means nmap read a response and parsed it, which
+    # is evidence of what the service is. A bare service name from the
+    # port number is not.
+    return not version_token(assessment.version)
+
+
+def cap_unconfirmed(severity):
+    """The rating an unconfirmed service identification may carry."""
+    order = list(_ORDER)
+    if str(severity).upper() not in order:
+        return severity
+    if order.index(str(severity).upper()) > order.index(UNCONFIRMED_CEILING):
+        return UNCONFIRMED_CEILING
+    return str(severity).upper()
 
 
 #: Products whose version string in an nmap banner is worth checking

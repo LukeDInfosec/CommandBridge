@@ -19,6 +19,72 @@ HOW TO USE THIS FILE
  CHANGELOG (most recent first)
 ================================================================================
 
+## 2026-11-03 — FOUR CORRECTIONS FROM A LIVE SCAN (6.10.3)
+
+1. AN NMAP GROUP. The port findings now collapse under "Open Ports and
+   Services (nmap)" like the TLS ones, keyed on the port-scan issue
+   keys and on the nmap stages, so an unrecognised one still lands
+   there rather than alone at the bottom.
+
+2. "SERVICE VERSION DISCLOSED — http on 80" WITH NO VERSION IN IT. The
+   check was "did nmap print anything in the version column", and nmap
+   prints "http" and "ssl/http" there. A finding whose title says a
+   version was disclosed and whose evidence holds no version
+   contradicts itself. port_risk.version_token() now requires an actual
+   release number — two dotted parts, or OpenSSH's 8.9p1 form — and a
+   bare product name with no release does not qualify either. The port
+   is still reported; it says no version was returned.
+
+3. WHERE HSTS AND CSP BELONG.
+   * A missing CSP is an HTTP security header finding. One CSP finding
+     is not a CSP group, so it was falling out as a loose row and a
+     reader looking under HTTP Security Headers did not find it.
+     Categories can now name a `fallback`: below its minimum, CSP hands
+     its findings to the header group instead of leaving them loose.
+     Several CSP findings still form their own group.
+   * HSTS was in the TLS category, which buried a Medium finding behind
+     a chevron AND implied testssl had reported it — it is a response
+     header, found the way a missing CSP is found. finding_groups.
+     NEVER_GROUPED keeps it a row of its own.
+
+4. "JENKINS REACHABLE FROM THE INTERNET ON 8080" AT CRITICAL, WITH NO
+   ENDPOINT AND NO STATUS CODE. nmap had named it from the port number.
+   That is a finding that has to be withdrawn in front of a client.
+   Categories whose rating rests on the identification being right —
+   admin services, management controllers, orchestration APIs, brokers,
+   monitoring — are now PROBED before being stated: one GET per scheme,
+   matched against product signatures in the status line, headers and
+   title. Confirmed, the full rating stands with the request as
+   evidence. Unconfirmed, it is capped at MEDIUM, reported as Potential,
+   titled "reported by nmap as X — not confirmed", and says what would
+   settle it and what the rating would be if it were.
+
+   A service with a real version banner is not treated as guessed:
+   nmap parsed a response to get it. Datastores are not held back
+   either — nothing is being guessed about Redis on 6379.
+
+CHANGED: modules/finding_groups.py, modules/port_risk.py,
+         modules/coffee_break.py, tests/test_coffee_break.py
+
+## 2026-11-03 — NO REPORT INSTRUCTIONS ON SCREEN (6.10.2)
+
+The header review printed its paragraph under a heading reading
+"### Penetration Test Report Extract ###". That heading tells the
+operator what to paste into a document, and this screen gets shown to
+management during presentations. Removed: the paragraph stands on its
+own as an assessment of the headers, which is what it is.
+
+One finding string went the same way — a command injection reported as
+potential said "confirm it by hand before writing it up"; it now says
+"before relying on it". The advice is the same and it is about the
+evidence rather than about paperwork.
+
+Left alone: "paste into Burp Repeater" and "paste this into a browser".
+Those name an action the operator takes with a tool, not what goes in a
+document.
+
+CHANGED: modules/web_testing.py, modules/scanner/checks/injection.py
+
 ## 2026-11-03 — THE PORT SCAN NOW MEANS SOMETHING (6.10.1)
 
 Coffee Break's first stage is nmap, and all it did with the result was

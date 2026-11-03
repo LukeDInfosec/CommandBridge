@@ -57,6 +57,11 @@ class Category:
     #: shown as ordinary rows — a parent over one child is a row that
     #: costs a click and says nothing.
     minimum: int = 2
+    #: Where this category's findings go when it is below its minimum,
+    #: instead of becoming loose rows. One CSP finding on its own is
+    #: still an HTTP security header finding, and belongs with the
+    #: others rather than alone at the bottom of the list.
+    fallback: str = ""
     order: int = 50
 
 
@@ -78,7 +83,7 @@ CATEGORIES = (
             "anonymous_cipher", "cert_expired", "cert_expiring",
             "cert_untrusted", "cert_hostname", "cert_weak_signature",
             "cert_weak_key", "cert_self_signed", "tls_config",
-            "hsts_missing", "hsts_short_max_age", "cleartext_http",
+            "cleartext_http",
         }),
         prefixes=("cert_", "tls_"),
         stages=frozenset({"testssl", "tls"}),
@@ -93,6 +98,9 @@ CATEGORIES = (
             "csp_missing_object_base", "cross_site_framing",
         }),
         prefixes=("csp_",),
+        # A single CSP finding is not a CSP group; it is one of the
+        # header findings, which is where a reader looks for it.
+        fallback="headers",
         order=20,
     ),
     Category(
@@ -152,6 +160,22 @@ CATEGORIES = (
         order=70,
     ),
     Category(
+        key="ports",
+        title="Open Ports and Services (nmap)",
+        keys=frozenset({
+            "cleartext_service", "exposed_datastore", "remote_access_exposed",
+            "admin_service_exposed", "management_interface_exposed",
+            "orchestration_api_exposed", "mail_service_exposed",
+            "directory_service_exposed", "file_share_exposed",
+            "legacy_service_exposed", "message_broker_exposed",
+            "monitoring_exposed", "service_exposed", "web_service_observed",
+            "service_version_disclosed", "excessive_ports",
+            "infrastructure_disclosed",
+        }),
+        stages=frozenset({"nmap", "nmap_quick", "nmap_full", "nmap_udp"}),
+        order=15,
+    ),
+    Category(
         key="components",
         title="Components and Services",
         keys=frozenset({
@@ -162,6 +186,15 @@ CATEGORIES = (
         order=80,
     ),
 )
+
+#: Findings that are never folded into a group, whatever they share a
+#: category with. A missing HSTS header is a Medium finding a reader
+#: should see without opening anything — and it used to sit inside the
+#: TLS/SSL group, which also implied testssl had reported it when it is
+#: a response-header check like any other.
+NEVER_GROUPED = frozenset({
+    "hsts_missing", "hsts_short_max_age",
+})
 
 _BY_KEY = {}
 for _category in CATEGORIES:
@@ -244,10 +277,38 @@ class Group:
             line += " · no vulnerability claimed"
         return line
 
+    def headline(self, limit=3):
+        """The worst findings by name, for the parent row itself.
+
+        A group row saying "4 findings · 1 High" and nothing else makes
+        the reader open it to learn what the High one IS — and if the
+        row is skimmed rather than opened, a host offering SSLv3 reads
+        as "some TLS issues". So the parent names its worst children:
+
+            SSLv3 enabled, POODLE, Sweet32 (+1 more)
+
+        The names are the children's own titles. Nothing is summarised
+        or reworded, because a parent inventing its own description of
+        what is underneath it is how a finding loses its name.
+        """
+        ordered = sorted(
+            self.findings,
+            key=lambda f: -SEVERITY_RANK.get(
+                str(getattr(f, "severity", "INFO") or "INFO").upper(), 0))
+        names = [str(getattr(f, "title", "") or "").strip()
+                 for f in ordered]
+        names = [n for n in names if n][:max(1, limit)]
+        if not names:
+            return ""
+        rest = self.count - len(names)
+        return ", ".join(names) + (f" (+{rest} more)" if rest > 0 else "")
+
     def accessible_name(self):
         """What a screen reader should say for the parent row."""
+        headline = self.headline()
         return (f"{self.category.title}, {self.count} findings. "
-                f"{self.summary()}")
+                f"{self.summary()}."
+                + (f" Including: {headline}." if headline else ""))
 
 
 def _pretty_severity(name):
@@ -271,6 +332,8 @@ def category_for(finding):
     the same mistake the classifier was built to stop.
     """
     key = str(getattr(finding, "key", "") or "")
+    if key in NEVER_GROUPED:
+        return None
     if key and key in _BY_KEY:
         return _BY_KEY[key]
     if key:
@@ -314,8 +377,14 @@ def organise(findings, minimum_override=None):
         minimum = (category.minimum if minimum_override is None
                    else minimum_override)
         if len(members) < minimum:
-            # One TLS finding is a TLS finding, not a group of one.
-            loose.extend(members)
+            # One TLS finding is a TLS finding, not a group of one. But
+            # a category with a fallback hands its members to that
+            # group instead of leaving them loose: one CSP finding is
+            # still an HTTP security header finding.
+            if category.fallback:
+                buckets.setdefault(category.fallback, []).extend(members)
+            else:
+                loose.extend(members)
             continue
         groups.append(Group(category=category, findings=members))
 
