@@ -1,7 +1,7 @@
 ================================================================================
  COMMAND BRIDGE v4 — PROJECT REFERENCE & CHANGELOG
  (Reference doc for Claude / future sessions. Keep this updated after changes.)
- Last updated: 2026-10-23
+ Last updated: 2026-11-03
 ================================================================================
 
 HOW TO USE THIS FILE
@@ -18,6 +18,216 @@ HOW TO USE THIS FILE
 ================================================================================
  CHANGELOG (most recent first)
 ================================================================================
+
+## 2026-11-03 — THIRTY CONFIRMED COMMAND INJECTIONS, NONE REAL (6.9.12)
+
+Active Scan produced 30+ CONFIRMED OS command injections on header
+insertion points behind a CDN, plus a crowd of SQL and code injection
+findings on the same points.
+
+1. THE CANARY WAS FOUR DIGITS. `expr 7 \* 191` looks for "1337", and
+   the file's own comment claimed that "does not appear on a normal
+   page". It does. A page carrying a cache cookie, a nonce, an asset
+   hash or a unix timestamp carries dozens of four-digit runs that
+   change between responses:
+
+       __cf_bm=.qP1337uRafjeE4-1793616881.798538-1.0.1.1
+
+   One baseline is one sample, so "absent from the baseline, present
+   in this response" was satisfiable by coincidence — on every
+   parameter, every header, every page. The command check now builds a
+   random pair per test (products of six or seven digits, never the
+   same twice).
+
+2. NO CONTROL REQUEST. Before believing a marker, the check now sends
+   the same request with a harmless value and requires the number NOT
+   to come back, then repeats with a DIFFERENT random pair and
+   requires the new product to come back. A coincidence passes
+   neither; an executing shell passes both.
+
+3. A BLIND ARITHMETIC PROOF WAS CALLED CONFIRMED. The finding rated
+   itself Confirmed and then explained in its own body that id,
+   whoami, uname -a, pwd and cat /etc/passwd all returned nothing —
+   a contradiction the reader had to resolve. Output from a real
+   command, or a unique token the shell printed, is EXECUTION. A
+   computed number with no command output is a DIFFERENTIAL: it
+   settles as potential, and the body says why.
+
+4. DIFFERENTIALS ON CONTROL HEADERS. X-Original-URL, X-Rewrite-URL,
+   X-Forwarded-For and Referer change how a request is routed, cached
+   or authorised, so "the true form returned the page and the false
+   form did not" says the server READ the header. Two agreeing pairs
+   could not tell that apart from a database parsing a condition.
+   Differential.confirm() now sends a control pair with no SQL, no
+   quotes and no operators in it; if those land on opposite sides of
+   the baseline, the point answers differently for any input and the
+   differential is discarded.
+
+   The control judges each value against the BASELINE, not the two
+   against each other: a page that echoes its input differs for any
+   two values, and judging on that suppressed real injections on the
+   endpoints most likely to have them (caught by the existing suite).
+   An unanswered control counts as unproven, never as clean.
+
+CHANGED: modules/scanner/checks/injection.py, modules/scanner/oracles.py
+
+## 2026-11-03 — THE INVENTORY WAS THE EVIDENCE (6.9.11)
+
+Reported from a live engagement:
+
+    TLS configuration weakness            MEDIUM   Confirmed
+      cipher-tls1_2_xc009: TLSv1.2 xc009 ECDHE-ECDSA-AES128-SHA …
+      cipher-tls1_2_x2f:   TLSv1.2 x2f AES128-SHA RSA AES 128 …
+      ipv4_in_header: set-cookie: __cf_bm=…; HttpOnly; Secure
+      … and 1 more
+
+Twelve of testssl's per-suite INVENTORY records and two Set-Cookie
+values, published as one Medium finding with no statement of what was
+wrong with any of it — and a session cookie pasted into the report.
+
+cipher-* records are not checks. They are the list of suites the host
+offers, which is exactly the data the cipher findings were missing. So
+they are now read into the suite enumeration
+(_cb_testssl_cipher_inventory) and become the evidence for the
+findings that DO name a weakness:
+
+    Sweet32 (64-bit block ciphers)    MEDIUM   Potential
+      TLS_RSA_WITH_3DES_EDE_CBC_SHA  168-bit 3DES_EDE
+
+The IANA name is read by shape, not by column position, and the key
+size is the last bare integer before it — "AES 128", not the curve
+size "ECDH 253" earlier in the same line.
+
+This also removes the dependency flagged in 6.9.10: the cipher and
+protocol findings no longer need a separate SSL/TLS Analysis to have
+been run, because testssl's own enumeration now feeds them. Source
+order: a saved analysis, then testssl's inventory, then sslyze, then
+direct handshakes.
+
+ipv4_in_header and friends are informational too. A header containing
+an IP is not a weakness, and it was putting Set-Cookie values —
+session cookies included — in front of the reader.
+
+CHANGED: modules/coffee_break.py, modules/cb_issues.py
+
+## 2026-11-03 — PROTOCOLS FROM THE ENUMERATION TOO (6.9.10)
+
+TLS 1.0 and 1.1 were offered on the same host and Coffee Break
+reported neither. Same dependency 6.9.9 removed from the cipher
+findings, left in place for the protocol ones: no testssl SSLv3/TLS1
+record meant no finding, whatever the host actually negotiated. The
+enumeration already knew the accepted versions — it was only being
+used to write the explanation text.
+
+Protocol findings now come from the accepted versions as well, one per
+version, rated by version (SSLv2/SSLv3 High, TLS 1.0/1.1 Medium) and
+Confirmed, because a version that was negotiated is not an inference.
+Each carries the suites accepted over it.
+
+A version testssl already reported is not reported twice: the variant
+added in 6.9.8 is what makes that check possible.
+
+cb_issues.protocol_token() normalises every spelling that reaches this
+code — testssl's TLS1, ssl_cipher_check's "TLS 1.0", sslyze's TLSv1.0
+— so a finding does not depend on which tool supplied the version. It
+returns "" for current versions, so TLS 1.2 and 1.3 never produce one.
+
+CHANGED: modules/coffee_break.py, modules/cb_issues.py
+
+## 2026-11-03 — A CRITICAL FINDING THAT SAID NOTHING (6.9.9)
+
+Reported from a live engagement:
+
+    TLS configuration weakness        CRITICAL   Confirmed
+      cert_notAfter: 2026-12-12 23:59
+      security_headers:
+      overall_grade: M
+
+A certificate's expiry DATE, an empty header list and a letter grade,
+rated Critical. Meanwhile Sweet32, BEAST and the CBC suites on the
+same host were not reported at all.
+
+1. BOOKKEEPING WAS BEING READ AS CHECKS. cert_notAfter,
+   security_headers, overall_grade, final_score and friends fell
+   through TESTSSL_INFORMATIONAL into tls_generic. None of them faults
+   anything: the expiry date is a date (cert_expirationStatus is the
+   check that judges it), an empty header list is empty, and the grade
+   is a summary OF the other checks. They are informational ids now.
+
+2. THE BUCKET TOOK THE LAST RECORD'S SEVERITY. `bucket["severity"] =
+   severity` inside the record loop, so for tls_generic — the one key
+   that takes the tool's own rating — whichever record came last set
+   the rating for the whole group. Now the WORST of them, and
+   tls_generic is capped at MEDIUM: it names no attack, carries no CVE
+   and has demonstrated no impact. Its title names the checks too.
+
+3. CIPHER FINDINGS DEPENDED ENTIRELY ON testssl EMITTING RECORDS. No
+   SWEET32 record meant no Sweet32 finding, whatever suites the host
+   actually offered. The suites are the better evidence anyway — they
+   are what goes in the write-up — so each weakness is now established
+   from the parsed properties of the suites that were negotiated:
+
+       Sweet32    64-bit block ciphers (3DES, DES)
+       Lucky 13   CBC-mode suites
+       BEAST      CBC-mode suites AND TLS 1.0 offered
+       RC4        RC4 suites
+       weak_cipher  NULL, export, anonymous, small-key
+
+   Each finding lists its affected suites one per line with key sizes,
+   plain text, ready to paste. Nothing overrides a finding testssl
+   already produced; this only fills gaps. A stage that read no
+   records at all now still reports the cipher findings if the SSL/TLS
+   Analysis data is available.
+
+CHANGED: modules/coffee_break.py, modules/cb_issues.py
+
+## 2026-11-02 — SSLv3 WAS THERE AND NOBODY SAID SO (6.9.8)
+
+Luke's engagement: Coffee Break reported High-risk TLS issues, the row
+said "High" and nothing else, and the actual cause — SSLv3 enabled —
+had to be found by hand with testssl and sslscan afterwards. Sweet32
+and BEAST were never reported at all.
+
+Three separate faults, all of which hid the same host.
+
+1. ONE MERGED PROTOCOL FINDING, AVERAGED DOWN. Every obsolete protocol
+   shared the key obsolete_protocol, so SSLv3 and TLS 1.0 merged into
+   one row — "Obsolete TLS protocol versions enabled: SSLv3, TLS 1.0"
+   at the library's MEDIUM. The HIGH fact was averaged into the
+   deprecated ones and the version was buried in a comma list.
+
+   Now one finding per version, rated by version:
+
+       SSLv3 enabled — broken protocol        HIGH
+       TLS 1.0 enabled — deprecated protocol  MEDIUM
+
+   SSLv2/SSLv3 are broken protocols: POODLE and DROWN attack the
+   protocol itself and no browser has spoken either for years. TLS
+   1.0/1.1 are deprecated, not broken. They are not one issue and no
+   longer rated as one. CBFinding grew a `variant` so two findings
+   under one key never merge.
+
+2. THE CONSOLE FALLBACK READ FOR WORDS THAT ARE NOT THERE. When
+   testssl writes no JSON the parser falls back to its console output,
+   and it looked for HIGH / MEDIUM / LOW in each line. testssl writes
+   severity words into its JSON and its logfile, NEVER into the console.
+   So "SSLv3   offered (NOT ok)" matched nothing and produced nothing.
+   The fallback now reads what testssl actually prints — a check name
+   and a verdict — and takes severity from the library, where the
+   scoring policy lives. "not vulnerable (OK)" is checked before
+   "vulnerable", because it contains it.
+
+3. SILENCE LOOKED LIKE A CLEAN RESULT. A TLS stage that read no
+   records returned 0 without a word. It now says so, names the JSON
+   it expected, and says to run the Web tab's SSL/TLS Analysis before
+   concluding the host is sound.
+
+Also: a group row now names its worst children — "… · SSLv3 enabled,
+POODLE, Sweet32 (+1 more)" — because a parent reporting a High and not
+saying what is High is a row that gets skimmed past.
+
+CHANGED: modules/coffee_break.py, modules/cb_issues.py,
+         modules/finding_groups.py, ui/tabs_coffee.py
 
 ## 2026-10-23 — ONE STATUS, ONE PATH (6.9.7)
 

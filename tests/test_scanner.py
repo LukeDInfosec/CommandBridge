@@ -224,6 +224,88 @@ def main():
           len(oracles.Differential(auth, baseline).confirm(
               point, [(" AND 1=1", " AND 1=2"), (" AND 1=1", " AND 1=2")])), 2)
 
+    print("\n\033[1mThe arithmetic oracle cannot be satisfied by "
+          "chance\033[0m")
+    from command_bridge.modules.scanner.checks import injection as inj
+    pairs = [inj.arithmetic_canary() for _ in range(40)]
+    check("every product is at least six digits",
+          all(len(product) >= 6 for _, _, product in pairs))
+    check("and they are not all the same number",
+          len({product for _, _, product in pairs}) > 30)
+    check("the product really is the product",
+          all(int(product) == a * b for a, b, product in pairs))
+    # Why it matters: 1337 is four digits, and a page carrying a cache
+    # cookie, a nonce or a timestamp carries four-digit runs that change
+    # between responses. "Absent from the baseline, present in this
+    # response" was therefore satisfiable by coincidence — which is how
+    # one scan produced thirty-odd CONFIRMED command injections on
+    # header insertion points behind a CDN.
+    rotating = "__cf_bm=.qP1337uRafjeE4-1793616881.798538-1.0.1.1"
+    check("the old canary occurs in an ordinary rotating cookie",
+          inj.CANARY_RESULT in rotating)
+    check("a random product does not",
+          any(product in rotating for _, _, product in pairs), False)
+
+    print("\n\033[1mA point that splits for ANY value proves nothing\033[0m")
+    # Reported from a live engagement: dozens of injection findings on
+    # header insertion points — X-Original-URL, X-Forwarded-For,
+    # Referer. Those headers change how a request is ROUTED, cached or
+    # authorised, so one value returning the page and another returning
+    # a 404 says the server read the header, not that a database parsed
+    # it. Two agreeing pairs could not tell the difference.
+    #
+    # The control is two values with no SQL, no quotes and no operators
+    # in them. If THOSE land on opposite sides of the baseline, this
+    # point changes its answer for any input.
+    class _Routing:
+        """Answers by the LAST character of the value, like a header
+        that routes: any two distinct values land on opposite sides."""
+
+        sent = []
+
+        def send(self, request, allow_redirects=False, timeout=None):
+            if request.url.rstrip("&").endswith(("b", "2")):
+                return without_row
+            return with_row
+
+    routing = _Routing()
+    split_any = oracles.Differential(routing, baseline)
+    check("the control pair is seen to split",
+          split_any.splits_without_syntax(point))
+    check("so two agreeing pairs are NOT reported",
+          split_any.confirm(point, [(" AND 1=1", " AND 1=2"),
+                                    (" AND 1=1", " AND 1=2")]), [])
+    # And the guard must not swallow a real one. An endpoint that
+    # answers the same way for both syntax-free values still confirms.
+    honest = oracles.Differential(auth, baseline)
+    check("a genuine differential is still confirmed",
+          len(honest.confirm(point, [(" AND 1=1", " AND 1=2"),
+                                     (" AND 1=1", " AND 1=2")])), 2)
+    check("   because its control pair does not split",
+          honest.splits_without_syntax(point), False)
+    # A page that ECHOES its input differs for any two values, which is
+    # not the same thing at all — judging on that suppressed real
+    # injections on the endpoints most likely to have them.
+    echoing = FakeAuth({"cbcontrol": with_row, "1%3D1": with_row,
+                        "1%3D2": without_row})
+    check("an echoing page is not mistaken for a routing header",
+          oracles.Differential(echoing, baseline)
+          .splits_without_syntax(point), False)
+    check("   and its differential still confirms",
+          len(oracles.Differential(echoing, baseline).confirm(
+              point, [(" AND 1=1", " AND 1=2"),
+                      (" AND 1=1", " AND 1=2")])), 2)
+    # A control request that fails is not evidence of innocence.
+    class _Dead:
+        sent = []
+
+        def send(self, request, allow_redirects=False, timeout=None):
+            return None
+
+    check("an unanswered control is treated as unproven, not as clean",
+          oracles.Differential(_Dead(), baseline)
+          .splits_without_syntax(point))
+
     print("\n\033[1mThe timing oracle only believes proportion\033[0m")
     quick = oracles.Baseline([FakeResponse("ok")] * 3, [0.05, 0.06, 0.05])
     sleepy = FakeAuth({"sleep": FakeResponse("ok")},

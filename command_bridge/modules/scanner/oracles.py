@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import difflib
 import re
+import secrets
 import statistics
 import time
 
@@ -236,8 +237,52 @@ class Differential:
             if result and result["confirmed"]:
                 agreed.append(result)
             if len(agreed) >= 2:
-                return agreed
-        return agreed if len(agreed) >= 2 else []
+                break
+        if len(agreed) < 2:
+            return []
+        if self.splits_without_syntax(point, mode):
+            return []
+        return agreed
+
+    def splits_without_syntax(self, point, mode="append"):
+        """Does this point split the response for values with NO syntax in them?
+
+        The guard that was missing, and the reason a scan produced
+        findings on header injection points by the dozen.
+
+        Two payloads differing only in ``'1'='1`` versus ``'1'='2'``
+        agreeing twice is strong evidence — IF the only thing that
+        differs between the two requests is the condition. On control
+        headers it is not. ``X-Original-URL``, ``X-Rewrite-URL``,
+        ``X-Forwarded-For``, ``Referer`` and their relatives change how
+        the request is ROUTED, cached or authorised, so one value
+        returning the page and another returning a 404 says the server
+        read the header, not that a database parsed it.
+
+        So: send two values of the same shape with no SQL, no quotes and
+        no operators in them. If the response splits for those as well,
+        this point changes the response for any input and the
+        differential means nothing here.
+        """
+        marker = secrets.token_hex(4)
+        first = self.auth.send(point.build(f"cbcontrol{marker}a", mode))
+        second = self.auth.send(point.build(f"cbcontrol{marker}b", mode))
+        if first is None or second is None:
+            # Could not establish it either way. Do not silently treat
+            # "unknown" as "clean".
+            return True
+        # What makes an injected condition evidence is that the TRUE
+        # form looks like the baseline and the FALSE form does not. So
+        # that is what the control tests for: two syntax-free values
+        # landing on opposite sides of the baseline.
+        #
+        # NOT whether the two control responses differ from each other —
+        # a page that echoes its input differs for any two values, and
+        # judging on that suppressed real injections on exactly the
+        # endpoints most likely to have them.
+        first_like = self.baseline.matches(first, self.threshold)
+        second_like = self.baseline.matches(second, self.threshold)
+        return first_like != second_like
 
 
 # ─────────────────────────────────────────────────────────────────────────────

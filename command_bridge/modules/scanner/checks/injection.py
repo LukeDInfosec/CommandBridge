@@ -41,7 +41,39 @@ from command_bridge.modules.scanner.model import Evidence, ScanFinding, \
 from command_bridge.modules.scanner import oracles, grading
 
 #: 7 * 191 = 1337, which does not appear on a normal page the way 49 does.
+#: Except that it does. "1337" is four digits, and a page carrying a
+#: cache cookie, a nonce, an asset hash or a unix timestamp carries
+#: dozens of four-digit runs that change between responses — so a
+#: baseline without it and a test response with it is not evidence of
+#: anything. That is how one scan produced thirty-odd CONFIRMED command
+#: injections on header injection points behind a CDN.
+#:
+#: Kept only for the template and code checks, which confirm with a
+#: second, different product before reporting. The command check uses
+#: the randomised pair below.
 CANARY_RESULT = "1337"
+
+#: Smallest product the arithmetic oracle will accept. Six digits: a
+#: four-digit number appears by chance in ordinary page content, a
+#: six-digit one picked at random does not.
+_MIN_PRODUCT = 100_000
+
+
+def arithmetic_canary():
+    """``(a, b, product)`` — a multiplication nobody can predict.
+
+    The product is what the oracle looks for, so it has to be a number
+    that could not already be on the page. Random operands give a
+    different six- or seven-digit product on every test, which also
+    means a cached response from an earlier test cannot satisfy a later
+    one.
+    """
+    while True:
+        first = secrets.randbelow(600) + 400        # 400-999
+        second = secrets.randbelow(600) + 400
+        product = first * second
+        if product >= _MIN_PRODUCT:
+            return first, second, str(product)
 
 TEMPLATE_PAYLOADS = (
     ("Jinja2 / Twig", "{{7*191}}"),
@@ -64,7 +96,8 @@ CODE_PAYLOADS = (
 
 #: Separators that get a second command run.
 COMMAND_SEPARATORS = (";", "|", "||", "&&", "\n", "`{cmd}`", "$({cmd})")
-COMMAND_ECHO = "expr 7 \\* 191"
+#: The arithmetic command, built per test around a random pair.
+COMMAND_ECHO_TEMPLATE = "expr {a} \\* {b}"
 COMMAND_TIME = "sleep {d}"
 WINDOWS_TIME = "ping -n {d} 127.0.0.1"
 
@@ -260,14 +293,15 @@ class CommandInjectionCheck:
         """Find a working separator, then capture real command output."""
         canary = "CB" + secrets.token_hex(4).upper()
         baseline_body = getattr(baseline, "body", "") or ""
+        first, second, product = arithmetic_canary()
 
         for separator in COMMAND_SEPARATORS:
-            for command in (f"echo {canary}", COMMAND_ECHO):
+            for command in (f"echo {canary}",
+                            COMMAND_ECHO_TEMPLATE.format(a=first, b=second)):
                 payload = (separator.format(cmd=command)
                            if "{cmd}" in separator
                            else f"{separator} {command}")
-                expected = canary if command.startswith("echo") \
-                    else CANARY_RESULT
+                expected = canary if command.startswith("echo") else product
                 for mode in ("append", "replace"):
                     request = point.build(payload, mode)
                     response = ctx.auth.send(request)
@@ -287,10 +321,58 @@ class CommandInjectionCheck:
                         continue
                     if expected in baseline_body:
                         continue
+                    # THE GUARD THAT WAS MISSING. One baseline is one
+                    # sample. A page that carries a rotating cookie, a
+                    # nonce or a timestamp carries different digits in
+                    # every response, so "absent from the baseline,
+                    # present in this one" is a coincidence waiting to
+                    # be reported as a CRITICAL. Before believing it:
+                    #
+                    #   * send the same request with a harmless value
+                    #     and require the number NOT to come back, and
+                    #   * repeat the test with a DIFFERENT random pair
+                    #     and require the new product to come back.
+                    #
+                    # A coincidence passes neither. An executing shell
+                    # passes both.
+                    if not self._controlled(ctx, point, separator, mode,
+                                            command, expected):
+                        continue
                     return self._capture(ctx, point, separator, mode,
                                          request, response, payload,
                                          command, expected, baseline_body)
         return None
+
+    def _controlled(self, ctx, point, separator, mode, command, expected):
+        """Is the marker caused by the payload, or just present sometimes?
+
+        Two questions, both of which a coincidence fails.
+        """
+        # 1. A control request with nothing injected. If the number shows
+        #    up here too, the page simply contains numbers like it.
+        control = point.build("cb-control-" + secrets.token_hex(3), mode)
+        response = ctx.auth.send(control)
+        if response is None:
+            return False
+        if expected in (response.text or ""):
+            return False
+
+        # 2. The echo path carries its own unique token, so it needs no
+        #    second pair. The arithmetic path does: a fresh product that
+        #    nothing could have cached or guessed.
+        if command.startswith("echo"):
+            return True
+        first, second, product = arithmetic_canary()
+        while product == expected:
+            first, second, product = arithmetic_canary()
+        retest = COMMAND_ECHO_TEMPLATE.format(a=first, b=second)
+        payload = (separator.format(cmd=retest) if "{cmd}" in separator
+                   else f"{separator} {retest}")
+        again = ctx.auth.send(point.build(payload, mode))
+        if again is None:
+            return False
+        body = _without_payload(again.text or "", payload)
+        return product in body
 
     # ── making it produce something worth screenshotting ─────────────────
     def _capture(self, ctx, point, separator, mode, first_request,
@@ -388,11 +470,32 @@ class CommandInjectionCheck:
             auth_context=grading.auth_context(ctx),
             detail_extra=detail,
             evidence=evidence)
-        # The random token is the proof. It is generated per test, so it
-        # cannot already be in the application's own content, and it only
-        # appears in the response if a shell printed it.
+        # How strong this is depends on what came back, and it is not
+        # the same in both cases.
+        #
+        # A unique token (CB…) that the shell printed is an execution
+        # marker: nothing else produces that string. A NUMBER is weaker
+        # evidence even once controlled, and when no follow-up command
+        # returned output there is nothing but the number. Reporting
+        # that as CONFIRMED is what produced a finding that claimed
+        # confirmation in its rating and then explained in its own body
+        # that the follow-ups returned nothing — a contradiction the
+        # reader had to resolve.
+        #
+        # So: output from real commands, or a unique token, is EXECUTION.
+        # A controlled arithmetic result with no command output is a
+        # reproduced differential, which settles as potential rather
+        # than confirmed, and the body says what is missing.
+        arithmetic_only = (not observations
+                           and not first_command.startswith("echo"))
+        if arithmetic_only:
+            detail += (
+                " This rests on a computed value, reproduced with a second "
+                "unpredictable pair and absent from a control request — not "
+                "on the output of any command. It is reported as potential "
+                "for that reason: confirm it by hand before writing it up.")
         finding.add(grading.Signal(
-            grading.EXECUTION,
+            grading.DIFFERENTIAL if arithmetic_only else grading.EXECUTION,
             f"A marker generated for this test ({expected}) was produced by "
             f"server-side command execution and returned in the response. "
             f"The payload itself is not reflected, so the shell ran it."
