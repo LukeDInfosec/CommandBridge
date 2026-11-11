@@ -1,0 +1,173 @@
+# Caddy web server — content discovery wordlist
+#
+# Built for Command Bridge. SecLists has Apache, nginx, IIS and Tomcat
+# lists; it has no Caddy list, which is why this one is bundled.
+#
+# What it is for. Caddy's own attack surface is not files on disk the
+# way Apache's is — it has no .htaccess, no /server-status, no
+# /icons/. What it has is a JSON ADMIN API that can replace the running
+# configuration, and which is supposed to be bound to localhost:2019.
+# The finding worth hunting is that API reachable through the public
+# listener: a reverse-proxy route that forwards everything, a
+# `bind 0.0.0.0` on the admin block, or a container where the admin
+# port was published. POST /load to a reachable admin API replaces the
+# server's whole config, which is remote code execution in practice.
+#
+# Paths below are from Caddy's own API documentation. Hit any of them
+# with a 200 on a public listener and the admin API is exposed.
+#
+# Lines beginning with # are comments; ffuf, feroxbuster, gobuster and
+# dirsearch all skip them.
+
+# ── the admin API, as documented ───────────────────────────────────
+config
+config/
+load
+stop
+id
+id/
+adapt
+reverse_proxy/upstreams
+pki/ca/local
+pki/ca/local/certificates
+metrics
+
+# Config subtrees. A GET on any of these returns part of the running
+# configuration — which carries upstream addresses, and sometimes
+# credentials in headers or basicauth hashes.
+config/apps
+config/apps/http
+config/apps/http/servers
+config/apps/http/servers/srv0
+config/apps/http/servers/srv0/routes
+config/apps/http/servers/srv0/listen
+config/apps/http/servers/myserver
+config/apps/http/servers/myserver/listen
+config/apps/tls
+config/apps/tls/certificates
+config/apps/tls/certificates/automate
+config/apps/tls/automation
+config/apps/layer4
+config/admin
+config/admin/identity
+config/logging
+config/storage
+
+# ── Go runtime debug surfaces, exposed by the admin API ────────────
+# /debug/pprof/* and /debug/vars come with the admin endpoint. A heap
+# or goroutine dump from a live server is a memory disclosure.
+debug
+debug/
+debug/vars
+debug/pprof
+debug/pprof/
+debug/pprof/profile
+debug/pprof/heap
+debug/pprof/goroutine
+debug/pprof/allocs
+debug/pprof/block
+debug/pprof/cmdline
+debug/pprof/mutex
+debug/pprof/threadcreate
+debug/pprof/trace
+debug/pprof/symbol
+
+# ── configuration files served by mistake ──────────────────────────
+# A `root` pointed one directory too high, or a config kept beside the
+# site. The JSON forms are what `caddy adapt` produces.
+Caddyfile
+caddyfile
+Caddyfile.txt
+Caddyfile.bak
+Caddyfile.old
+Caddyfile.orig
+Caddyfile.save
+Caddyfile.dist
+Caddyfile.example
+Caddyfile.local
+Caddyfile.prod
+Caddyfile.dev
+.Caddyfile.swp
+caddy.json
+caddy.conf
+caddy.yaml
+caddy.yml
+config.json
+autosave.json
+caddy_config.json
+caddy-config.json
+conf/Caddyfile
+etc/caddy/Caddyfile
+.config/caddy/Caddyfile
+caddy/Caddyfile
+docker-compose.yml
+docker-compose.yaml
+Dockerfile
+
+# ── Caddy's data and state directories, where a root is misplaced ──
+# Caddy stores certificates and keys under its data directory. A
+# reachable certificates tree means private keys.
+.local/share/caddy
+.local/share/caddy/certificates
+.local/share/caddy/locks
+.local/share/caddy/instance.uuid
+.config/caddy
+caddy/certificates
+certificates
+pki
+pki/authorities
+pki/authorities/local
+pki/authorities/local/root.crt
+pki/authorities/local/intermediate.crt
+
+# ── ACME, which Caddy drives automatically ─────────────────────────
+.well-known
+.well-known/
+.well-known/acme-challenge
+.well-known/acme-challenge/
+.well-known/caddy
+
+# ── file_server directory browsing ─────────────────────────────────
+# Caddy's file_server renders listings as HTML, and these queries ask
+# for other formats. A JSON listing of a directory that was not meant
+# to be browsable is the same finding as an index page, found faster.
+?layout=
+?sort=name&order=asc
+
+# ── reverse-proxy and PHP deployments ──────────────────────────────
+# Caddy is most often a reverse proxy or a php_fastcgi front end, so
+# the backend's surface is reachable through it.
+status
+healthz
+health
+ready
+livez
+readyz
+api
+api/
+app
+backend
+upstream
+ws
+socket.io
+index.php
+info.php
+phpinfo.php
+.env
+.env.local
+.env.production
+.git/config
+.git/HEAD
+
+# ── container and orchestration leftovers ──────────────────────────
+# Caddy is usually run from a container image, and these are what gets
+# left in the image or the bind mount.
+.dockerenv
+srv
+site
+var/www
+var/www/html
+data
+data/caddy
+config
+config/caddy
