@@ -1,7 +1,7 @@
 ================================================================================
  COMMAND BRIDGE v4 — PROJECT REFERENCE & CHANGELOG
  (Reference doc for Claude / future sessions. Keep this updated after changes.)
- Last updated: 2026-11-03
+ Last updated: 2026-11-13
 ================================================================================
 
 HOW TO USE THIS FILE
@@ -18,6 +18,96 @@ HOW TO USE THIS FILE
 ================================================================================
  CHANGELOG (most recent first)
 ================================================================================
+
+## 2026-11-13 — AUTH: A FALSE BAC AND A SILENT BROWSER-LOGIN FAILURE (6.11.1)
+
+Reported from a live engagement: pasted cookies authenticate fine, but
+/myaccount is reported as "Broken Access Control — available regardless
+of authentication" when the operator has confirmed by hand that an
+anonymous visitor is redirected to log in. Form and Browser login both
+say "Authentication Failed".
+
+1. THE FALSE BAC. With the static strategy the username box is normally
+   left empty, so the identity's name defaults to "user" (tabs_scan.py
+   line 678: `name=... or "user"`). The forced-browsing check took that
+   "user" as the OWNER MARKER — the token that is meant to prove a
+   response carries THIS account's private data — found it on the
+   anonymous login page (every login page says "username"), and called
+   a correctly-protected page broken.
+
+   Fix: GENERIC_MARKERS in checks/access.py. _owner_marker now rejects
+   "user", "account", "admin", "login", "email", … and the default
+   names, so a marker has to be a real per-account identifier. With no
+   such marker — the pasted-cookie case — the forced-browsing leak path
+   is simply unavailable and the check falls back to privileged paths
+   only, which is the correct conservative behaviour. A real username
+   that appears on the page is still a marker.
+
+   Also hardened the login-page backstop: it rejected an anonymous
+   response only if it carried logged-out PROSE ("please log in"). A
+   bare "Sign in" form carries none of that, so LOGIN_FORM_SHAPE is now
+   accepted there too.
+
+2. THE BROWSER LOGIN. Chromium returns cookies with a leading-dot
+   domain (".app.example"); setting them on a requests jar that way
+   makes requests decline to send them to https://app.example. The
+   cookies were harvested and never went out, so verification saw the
+   login page and the whole browser login read as failed. New
+   _absorb_browser_cookies strips the leading dot, defaults the path to
+   "/", and survives a malformed cookie instead of losing the login to
+   it.
+
+   The Form-login "Authentication Failed" could not be reproduced here
+   and is app-specific (CSRF token, JSON body, or multi-step login).
+   The per-step auth log the tool already prints is the place to read
+   which step failed — it names the login URL, the fields submitted,
+   the login response status and URL, and the verification verdict.
+
+CHANGED: modules/scanner/checks/access.py (GENERIC_MARKERS, _owner_marker,
+         _forced_browsing backstop), modules/scanner/session.py
+         (_absorb_browser_cookies), tests/test_scanner.py
+
+## 2026-11-11 — A CADDY WORDLIST, AND NO MORE RAW JSON (6.11.0)
+
+NEW: wordlists/caddy.txt, offered as "Caddy" under Server Architecture
+in the Dirsearch / FFUF / feroxbuster / gobuster menus. SecLists has
+Apache, nginx, IIS and Tomcat lists and no Caddy one, so this list is
+bundled with the application and the menu entry points inside the repo.
+
+What it is built around. Caddy has no .htaccess, no /server-status and
+no /icons/ — the surface worth hunting is its JSON ADMIN API, which is
+meant to be bound to localhost:2019. Reachable through the public
+listener (a reverse-proxy route that forwards everything, a bind on
+0.0.0.0, a container that published the port), POST /load replaces the
+running configuration, which is remote code execution in practice. So
+the list leads with the documented admin paths — /config/ and its
+subtrees, /load, /stop, /id/, /adapt, /reverse_proxy/upstreams — then
+the Go debug surfaces that come with that endpoint (/debug/vars,
+/debug/pprof/heap and friends, a live memory disclosure), then Caddy's
+own config file names, its certificate store, and the reverse-proxy and
+php_fastcgi backends it usually fronts. Paths were taken from Caddy's
+API documentation rather than written from memory.
+
+FIXED: two files per fuzzing run. ffuf's "-of json" output is an
+intermediate — a metadata dump (duration, resultfile, scraper,
+position) that ffuf_clean.py reads once and turns into the
+"[STATUS] URL" file anybody actually opens. Both were being kept, so
+the output directory filled up with target_ffuf.txt beside
+target_ffuf_raw.json. ffuf_clean.py now deletes its input once the
+readable file is written.
+
+Two guards, because losing a scan's results to a tidiness feature
+would be a bad trade:
+  * nothing is deleted unless the clean file exists and is non-empty,
+    so an unparseable raw file is kept — it is the only copy;
+  * only a file named *_raw.json is ever removed, so a schema or
+    introspection JSON passed to the same script is left alone.
+
+Older *_raw.json files already on disk are not swept up; they are safe
+to delete by hand.
+
+CHANGED: modules/fuzzing.py (the menu entry),
+         modules/ffuf_clean.py, tests/test_gui_smoke.py
 
 ## 2026-11-03 — WORDING, DUPLICATES, AND THREE CARDS THAT DID NOT WORK (6.10.4)
 

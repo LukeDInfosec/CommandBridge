@@ -523,9 +523,7 @@ class Authenticator:
             except Exception:                           # noqa: BLE001
                 page.keyboard.press("Enter")
             page.wait_for_load_state("networkidle", timeout=20000)
-            for cookie in context.cookies():
-                self.session.cookies.set(cookie["name"], cookie["value"],
-                                         domain=cookie.get("domain"))
+            self._absorb_browser_cookies(context.cookies())
             # Tokens kept in web storage rather than a cookie.
             try:
                 stored = page.evaluate(
@@ -540,6 +538,38 @@ class Authenticator:
             except Exception:                           # noqa: BLE001
                 pass
             browser.close()
+
+    def _absorb_browser_cookies(self, cookies):
+        """Put the browser's cookies into the requests session, correctly.
+
+        The bug this fixes is quiet and total: a cookie harvested from
+        Chromium carries a domain like ``.app.example.com`` (note the dot),
+        and setting it on a requests jar with that domain makes requests
+        decline to send it to ``https://app.example.com`` unless the host
+        matches the jar's domain rules exactly. The cookies were harvested,
+        the jar held them, and not one of them went out on the wire — so the
+        verification URL came back as the login page and a perfectly good
+        browser login was reported as "Authentication Failed".
+
+        A leading dot is stripped, which is what makes a domain cookie match
+        the host it came from, and the path defaults to ``/`` so the cookie
+        is sent for the whole site rather than only the login path.
+        """
+        absorbed = 0
+        for cookie in cookies or []:
+            name = cookie.get("name")
+            if not name:
+                continue
+            domain = (cookie.get("domain") or "").lstrip(".") or None
+            try:
+                self.session.cookies.set(
+                    name, cookie.get("value", ""),
+                    domain=domain, path=cookie.get("path") or "/")
+                absorbed += 1
+            except Exception:                           # noqa: BLE001
+                # A single malformed cookie must never sink the whole login.
+                continue
+        return absorbed
 
     def _mint_token(self):
         self._apply_static()

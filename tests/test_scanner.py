@@ -500,6 +500,108 @@ def main():
         check("but a live login is",
               AccessControlCheck.authenticated(Ctx(LoggedIn())), True)
 
+        print("\n\033[1mBrowser-harvested cookies are actually sent\033[0m")
+        # The browser login's quiet failure: Chromium returns a cookie for
+        # domain ".app.example" (with the dot), and a requests jar set that
+        # way will not send it to https://app.example — so the harvested
+        # session never went out and the login read as failed.
+        import requests
+        import requests.cookies as _rc
+        auth_b = Authenticator(AuthConfig("browser", name="alice"))
+        absorbed = auth_b._absorb_browser_cookies([
+            {"name": "session", "value": "abc123", "domain": ".app.example",
+             "path": "/"},
+            {"name": "csrf", "value": "zz", "domain": "app.example",
+             "path": "/account"},
+            {"name": "", "value": "ignored"},
+        ])
+        check("the well-formed cookies are taken", absorbed, 2)
+        jar_header = auth_b.session.cookies.get_dict(domain="app.example")
+        check("the dotted-domain session cookie is in the jar for the host",
+              jar_header.get("session"), "abc123")
+        # The real proof: does requests put it on the wire for the host?
+        merged = _rc.merge_cookies(_rc.RequestsCookieJar(),
+                                   auth_b.session.cookies)
+        check("and the jar sends the session cookie to the site",
+              "session" in [c.name for c in merged
+                            if c.domain in ("app.example", ".app.example")])
+        check("a nameless cookie is skipped, not fatal",
+              absorbed, 2)
+
+        print("\n\033[1mA generic default name is not an owner marker\033[0m")
+        # The reported false positive: cookies pasted in, username box left
+        # empty, so the identity's name defaults to "user". /myaccount
+        # redirects an anonymous visitor to a login page that (like every
+        # login page) contains the word "user" — and the check reported
+        # broken access control on a page whose access control is working.
+        login_page = ("<html><body><h1>Sign in</h1>"
+                      "<form><input name='username'>"
+                      "<input type='password'></form></body></html>")
+        account_page = ("<html><body>Welcome to your user account. "
+                        "Order #4471 ships Tuesday.</body></html>")
+        marker = AccessControlCheck._owner_marker(
+            account_page, AuthConfig("static", name="user"))
+        check("'user' from the default name is not taken as a marker",
+              marker, "")
+        check("   nor any other generic label",
+              [AccessControlCheck._owner_marker(account_page,
+                                                AuthConfig("static", name=g))
+               for g in ("account", "admin", "second user", "guest")],
+              ["", "", "", ""])
+        check("a real username that is on the page still is a marker",
+              AccessControlCheck._owner_marker(
+                  "<p>Signed in as alice_k</p>",
+                  AuthConfig("static", username="alice_k", name="alice_k")),
+              "alice_k")
+
+        # End to end: the exact shape the user hit. A protected,
+        # non-privileged path (/myaccount) serves anonymous visitors a 200
+        # login page that shares the site's chrome with the real page, so a
+        # naive similarity test scores them as near-identical. It is still a
+        # login page, and the marker is the generic default — so it is not
+        # reported.
+        # A big shared shell and a tiny per-page difference, so the two
+        # score well over 0.9 similar — the case the marker/login-page
+        # backstop has to catch, because the similarity gate does not.
+        _SHELL_HEAD = ("<html><head><title>MyShop</title></head><body>"
+                       "<nav>" + " ".join(f"item{i}" for i in range(200)) +
+                       "</nav><div>")
+        _SHELL_TAIL = ("</div><footer>" +
+                       " ".join(f"foot{i}" for i in range(200)) +
+                       "</footer></body></html>")
+
+        class _Identity:
+            def __init__(self, authed, config):
+                self.authed = authed
+                self.config = config
+
+            def send(self, request, allow_redirects=False, timeout=None):
+                if self.authed:
+                    body = _SHELL_HEAD + "Your user account." + _SHELL_TAIL
+                else:
+                    body = (_SHELL_HEAD + "<form><input name='username'>"
+                            "<input type='password'></form>" + _SHELL_TAIL)
+                return FakeResponse(body, status=200)
+
+            def verify_session(self, force=False):
+                return self.authed
+
+        anon_id = _Identity(False, AuthConfig("none", name="anonymous"))
+        primary = _Identity(True, AuthConfig("static", name="user"))
+        chk = AccessControlCheck(anon_id)
+
+        class _Ctx2:
+            auth = primary
+
+        req = Request("GET", "https://shop/myaccount")
+        authorised = primary.send(req)
+        check("the two pages really are similar enough to fool a naive test",
+              oracles.similarity(
+                  authorised.text, anon_id.send(req).text) >= 0.9)
+        check("but the protected page serving a login page to anonymous "
+              "visitors is not reported", chk._forced_browsing(
+                  _Ctx2(), req, authorised), None)
+
         print("\n\033[1mAnd nothing on the endpoints that are correct\033[0m")
         safe_paths = ("/clean", "/item_safe", "/profile_safe", "/go_safe",
                       "/download_safe", "/jitter", "/wobble", "/about")

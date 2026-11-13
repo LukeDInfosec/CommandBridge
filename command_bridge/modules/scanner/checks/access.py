@@ -110,6 +110,26 @@ PRIVILEGED_PATH = re.compile(
     r"permissions?|audit|billing|invoices?|reports?/all|export|"
     r"impersonate|masquerade)(/|$|\?)", re.I)
 
+#: Words that identify nobody. An "owner marker" is supposed to prove a
+#: response carries *this account's* private data — so it has to be a real
+#: per-account identifier, never a term that is on every page regardless of
+#: who is logged in.
+#:
+#: This set is the fix for a specific false positive. When cookies are
+#: pasted in and the username box is left empty — which is the normal way to
+#: use the static strategy — the identity's name defaults to "user". The
+#: forced-browsing check then took "user" as the owner marker, found it on
+#: the anonymous login page (every login page says "username"), and reported
+#: broken access control on a page that correctly redirects an anonymous
+#: visitor to log in. The marker was never the account's; it was a default.
+GENERIC_MARKERS = frozenset({
+    "user", "users", "username", "admin", "administrator", "account",
+    "accounts", "second user", "guest", "test", "tester", "login",
+    "logon", "name", "none", "null", "member", "members", "customer",
+    "customers", "profile", "example", "demo", "anonymous", "owner",
+    "default", "root", "email", "e-mail", "password",
+})
+
 #: What the second account is, relative to the first.
 SAME, LOWER, HIGHER = "same", "lower", "higher"
 
@@ -278,11 +298,18 @@ class AccessControlCheck:
         # A login page served with HTTP 200 looks nothing like the real page,
         # which the similarity test already catches — but check anyway,
         # because an application that renders a shell around a login form can
-        # score high.
-        if any(sign.search(anonymous.text or "")
-               for sign in __import__(
-                   "command_bridge.modules.scanner.session", fromlist=["x"]
-               ).LOGGED_OUT_SIGNS):
+        # score high, and the user's report is exactly this: /myaccount
+        # redirects an anonymous visitor to a login page, which some stacks
+        # serve as a 200 rather than a 302.
+        #
+        # Both a login FORM and logged-out prose count. The prose-only test
+        # missed a bare "Sign in" form that carries none of the "please log
+        # in" wording, which is the common case.
+        _sess = __import__("command_bridge.modules.scanner.session",
+                           fromlist=["x"])
+        anon_body = anonymous.text or ""
+        if _sess.LOGIN_FORM_SHAPE.search(anon_body) or \
+                any(sign.search(anon_body) for sign in _sess.LOGGED_OUT_SIGNS):
             return None
 
         repeated, again = self._repeats(
@@ -679,10 +706,16 @@ class AccessControlCheck:
         inverts the one thing this function exists to establish.
         """
         for candidate in (config.username, config.name):
-            if candidate and len(candidate) >= 3 and candidate in (body or ""):
-                return candidate
+            token = (candidate or "").strip()
+            if len(token) < 3 or token.lower() in GENERIC_MARKERS:
+                # Too short to prove ownership by substring, or a generic
+                # label like "user" that is on every page. Either way it
+                # cannot show that *this account's* data leaked.
+                continue
+            if token in (body or ""):
+                return token
         username = (config.username or "").lower()
-        if len(username) >= 3:
+        if len(username) >= 3 and username not in GENERIC_MARKERS:
             for match in re.finditer(r"[\w.+-]+@[\w-]+\.[\w.]+", body or ""):
                 local = match.group(0).split("@", 1)[0].lower()
                 if username in local or local in username:
