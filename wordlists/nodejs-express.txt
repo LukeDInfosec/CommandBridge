@@ -1,0 +1,79 @@
+# Node.js / Express — content discovery
+#
+# Express apps rarely sit on disk the way PHP does; the surface is API
+# routes, and the giveaways are a leaked source tree, a .env with the
+# session secret, and dev middleware left enabled. package.json and
+# .git/ at the web root are the two findings that most often matter.
+
+package.json
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+.npmrc
+.nvmrc
+server.js
+app.js
+index.js
+main.js
+ecosystem.config.js
+tsconfig.json
+webpack.config.js
+.env
+.env.local
+.env.development
+.env.production
+.git/config
+.git/HEAD
+node_modules
+node_modules/.package-lock.json
+
+# Express / middleware surfaces.
+api
+api/
+api/v1
+api/v2
+status
+health
+healthz
+livez
+readyz
+metrics
+debug
+__coverage__
+socket.io
+socket.io/
+graphql
+graphiql
+playground
+admin
+admin/
+login
+logout
+auth
+auth/login
+auth/logout
+auth/callback
+auth/refresh
+oauth
+oauth/callback
+token
+session
+sessions
+user
+users
+me
+profile
+
+# Dev servers / build output.
+dist
+build
+public
+static
+assets
+.next
+.nuxt
+coverage
+swagger
+swagger.json
+openapi.json
+api-docs

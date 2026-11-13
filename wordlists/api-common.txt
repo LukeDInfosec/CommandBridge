@@ -1,0 +1,98 @@
+# REST API — common paths
+#
+# A focused list for an API host (or an /api prefix). Versioned roots,
+# the documentation endpoints that describe the whole API, auth, and the
+# health/metrics surfaces. The documentation hit is the valuable one: a
+# reachable OpenAPI/Swagger spec hands over every endpoint and parameter.
+
+api
+api/
+v1
+v2
+v3
+api/v1
+api/v2
+api/v3
+api/latest
+rest
+rest/
+graphql
+graphiql
+
+# Documentation — the endpoint that describes everything.
+swagger
+swagger/
+swagger-ui
+swagger-ui.html
+swagger-ui/index.html
+swagger.json
+swagger.yaml
+openapi
+openapi.json
+openapi.yaml
+api-docs
+api/docs
+docs
+redoc
+spec
+schema
+.well-known/openapi
+
+# Auth.
+auth
+auth/login
+auth/logout
+auth/refresh
+auth/token
+auth/register
+oauth
+oauth/token
+oauth/authorize
+oauth2/token
+token
+login
+logout
+register
+refresh
+revoke
+introspect
+jwks.json
+.well-known/jwks.json
+.well-known/openid-configuration
+
+# Common resources.
+users
+user
+me
+account
+accounts
+profile
+admin
+roles
+permissions
+orders
+products
+items
+search
+upload
+files
+export
+import
+webhook
+webhooks
+callback
+notifications
+messages
+
+# Operational.
+health
+healthz
+livez
+readyz
+status
+ping
+version
+info
+metrics
+debug
+config

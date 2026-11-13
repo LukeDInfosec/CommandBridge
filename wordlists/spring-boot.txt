@@ -1,0 +1,87 @@
+# Spring Boot — content discovery
+#
+# The finding on a Spring Boot app is almost always an exposed Actuator.
+# /actuator/env and /actuator/configprops leak configuration including
+# credentials; /actuator/heapdump downloads the live heap (a memory
+# disclosure that often yields session tokens and secrets); /actuator/
+# mappings and /actuator/beans map the whole app. Older apps expose these
+# at the root (/env, /health) rather than under /actuator.
+
+actuator
+actuator/
+actuator/health
+actuator/health/
+actuator/info
+actuator/env
+actuator/env/
+actuator/configprops
+actuator/beans
+actuator/mappings
+actuator/metrics
+actuator/httptrace
+actuator/httpexchanges
+actuator/threaddump
+actuator/heapdump
+actuator/loggers
+actuator/scheduledtasks
+actuator/sessions
+actuator/shutdown
+actuator/caches
+actuator/conditions
+actuator/auditevents
+actuator/flyway
+actuator/liquibase
+actuator/prometheus
+actuator/gateway/routes
+actuator/refresh
+actuator/restart
+actuator/jolokia
+actuator/jolokia/list
+
+# Pre-2.0 / management-port-at-root spellings.
+env
+health
+info
+beans
+mappings
+metrics
+trace
+httptrace
+dump
+heapdump
+threaddump
+loggers
+configprops
+shutdown
+jolokia
+jolokia/list
+autoconfig
+configurationMetadata
+
+# Swagger / OpenAPI, nearly always present on a Spring API.
+swagger-ui
+swagger-ui/
+swagger-ui.html
+swagger-ui/index.html
+v2/api-docs
+v3/api-docs
+v3/api-docs/swagger-config
+swagger-resources
+openapi.json
+api-docs
+
+# H2 console, a direct-to-database finding when it is on.
+h2-console
+h2-console/
+console
+
+# Build and config files.
+application.properties
+application.yml
+application.yaml
+application-dev.yml
+application-prod.yml
+bootstrap.yml
+pom.xml
+build.gradle
+.git/config

@@ -1,0 +1,55 @@
+# Cloud metadata & storage — content discovery / SSRF targets
+#
+# Two uses. As a wordlist against a proxy or URL parameter, these reach
+# the cloud instance metadata service — the AWS path returns IAM
+# credentials. As ordinary paths, the bucket and config names catch
+# storage left world-readable. Note that metadata lives at 169.254.169.254;
+# the paths here are what you append once an SSRF reaches it.
+
+latest/meta-data
+latest/meta-data/
+latest/meta-data/iam/security-credentials
+latest/meta-data/iam/security-credentials/
+latest/user-data
+latest/dynamic/instance-identity/document
+computeMetadata/v1
+computeMetadata/v1/
+computeMetadata/v1/instance/service-accounts/default/token
+computeMetadata/v1/project/project-id
+metadata/instance
+metadata/identity/oauth2/token
+
+# Storage buckets and their config, as path segments.
+.aws
+.aws/credentials
+.aws/config
+.s3cfg
+.boto
+storage
+uploads
+backups
+backup
+dump
+dumps
+export
+exports
+public
+private
+assets
+static
+media
+files
+documents
+
+# Config files that carry cloud keys.
+.env
+.env.production
+credentials
+config.json
+secrets.json
+serviceaccount.json
+gcp-key.json
+azure.json
+terraform.tfstate
+.terraform
+cloud-config.yml

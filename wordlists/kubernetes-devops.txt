@@ -1,0 +1,96 @@
+# Kubernetes / DevOps / CI — content discovery
+#
+# These are the paths that turn a web host into an infrastructure
+# compromise: a reachable kubelet or Docker API, a CI server with
+# anonymous read, a metrics endpoint that names every internal service.
+# Most are their own hosts/ports, but they turn up proxied behind a web
+# front end often enough to be worth a pass.
+
+metrics
+healthz
+livez
+readyz
+version
+api
+api/v1
+apis
+openapi/v2
+.well-known/openid-configuration
+
+# Kubernetes API / kubelet.
+pods
+runningpods
+spec
+stats/summary
+configz
+metrics/cadvisor
+api/v1/namespaces
+api/v1/namespaces/default/secrets
+api/v1/namespaces/kube-system/secrets
+api/v1/nodes
+api/v1/pods
+
+# Docker.
+version
+info
+containers/json
+images/json
+_ping
+
+# CI / CD and registries.
+jenkins
+jenkins/
+jenkins/script
+jenkins/manage
+jenkins/asynchPeople
+gitlab
+gitlab/
+gogs
+gitea
+drone
+argocd
+argocd/api/v1/applications
+teamcity
+bamboo
+sonarqube
+nexus
+artifactory
+v2/_catalog
+v2/
+harbor
+registry
+
+# Observability, which names internal services.
+prometheus
+prometheus/
+prometheus/api/v1/targets
+grafana
+grafana/
+grafana/api/health
+grafana/api/datasources
+kibana
+kibana/app/kibana
+alertmanager
+consul
+consul/v1/catalog/services
+vault
+vault/v1/sys/health
+nomad
+traefik
+traefik/api/rawdata
+
+# Config and manifests served by mistake.
+.git/config
+.gitlab-ci.yml
+.github/workflows
+Dockerfile
+docker-compose.yml
+docker-compose.yaml
+kustomization.yaml
+values.yaml
+Chart.yaml
+.env
+.kube/config
+terraform.tfstate
+terraform.tfvars
+ansible.cfg

@@ -1,0 +1,103 @@
+# Django — content discovery
+#
+# Django's giveaways are its admin, its debug surface, and the DRF
+# browsable API. The single highest-value hit is DEBUG=True left on in
+# production: any unhandled error then returns a full stack trace with
+# settings, and /__debug__/ (django-debug-toolbar) exposes SQL and
+# config. The admin at /admin/ is the other obvious one.
+
+admin
+admin/
+admin/login
+admin/login/
+admin/logout
+admin/password_change
+admin/jsi18n
+django-admin
+django-admin/
+admin/auth/user
+admin/auth/user/
+admin/auth/group
+admin/auth/
+admin/sites/
+admin/django_admin_log
+
+# Debug surfaces — the DEBUG=True tells.
+__debug__
+__debug__/
+__debug__/render_panel
+static/debug_toolbar
+djdt
+
+# Django REST Framework — the browsable API and its auth.
+api
+api/
+api/v1
+api/v2
+api/schema
+api/schema/
+api/docs
+api/docs/
+api/openapi
+api-auth
+api-auth/login
+api-auth/logout
+api/token
+api/token/refresh
+api/token/verify
+o/token
+o/authorize
+rest-auth
+rest-auth/login
+rest-auth/logout
+rest-auth/user
+rest-auth/password/reset
+
+# Auth and accounts (django.contrib.auth, allauth).
+accounts
+accounts/login
+accounts/logout
+accounts/signup
+accounts/password/reset
+accounts/profile
+login
+logout
+signup
+password_reset
+password_change
+reset
+user
+users
+profile
+
+# Static and media roots, where a misconfigured server lists files.
+static
+static/
+media
+media/
+assets
+staticfiles
+
+# Config and project files served by a misplaced root.
+settings.py
+settings
+local_settings.py
+manage.py
+wsgi.py
+asgi.py
+urls.py
+requirements.txt
+.env
+.env.local
+.env.production
+db.sqlite3
+celerybeat-schedule
+.python-version
+
+# Common app routes.
+health
+healthz
+status
+robots.txt
+sitemap.xml
+.well-known/security.txt

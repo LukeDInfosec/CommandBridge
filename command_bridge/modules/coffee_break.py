@@ -2109,6 +2109,26 @@ class CoffeeBreakMixin:
         if finding.key and finding.key in self._cb_muted:
             return
 
+        # Low-signal issues this house does not flag (BREACH and the like).
+        # Detected, said so once, and kept out of the findings list — not
+        # deleted, so turning any of them back on is a one-line change in
+        # cb_issues.DEFAULT_LOW_SIGNAL rather than re-plumbing a detector.
+        if finding.key and finding.key in cb_issues.DEFAULT_LOW_SIGNAL \
+                and finding.key not in getattr(self, "_cb_force_report", ()):
+            if finding.key not in getattr(self, "_cb_low_signal_noted", set()):
+                noted = getattr(self, "_cb_low_signal_noted", set())
+                noted.add(finding.key)
+                self._cb_low_signal_noted = noted
+                title = ISSUES.get(finding.key, {}).get("title", finding.key)
+                try:
+                    self.console.append_ansi(
+                        f"[i] {title} was detected but not added to the "
+                        f"findings — it is on the low-signal list this "
+                        f"assessment does not flag.\n")
+                except Exception:                           # noqa: BLE001
+                    pass
+            return
+
         # Identification is identification, whichever header or template
         # noticed it. "Software identified in response headers:
         # server: cloudflare" and "Cloudflare detected via cf-ray

@@ -1,0 +1,92 @@
+# Modern / headless CMS — content discovery
+#
+# The CMSs SecLists covers well (WordPress, Drupal, Joomla) are the old
+# guard. This covers what sites are actually built on now: headless and
+# JAMstack CMSs whose admin and content APIs are the surface. The common
+# finding is an unauthenticated content API or an exposed admin panel.
+
+# Ghost.
+ghost
+ghost/
+ghost/api/admin
+ghost/api/content
+ghost/api/v3/content/posts
+ghost/api/v4/content/posts
+ghost/api/admin/site
+
+# Strapi.
+admin
+admin/
+admin/auth/login
+admin/init
+content-manager
+content-type-builder
+api
+api/
+users-permissions
+upload/files
+_health
+
+# Sanity.
+v1/data/query
+v2021-06-07/data/query
+v1/graphql
+studio
+
+# Directus.
+admin
+admin/
+server/info
+server/ping
+items
+collections
+fields
+users
+auth/login
+graphql
+assets
+
+# Contentful / headless delivery APIs.
+spaces
+entries
+assets
+content_types
+sync
+
+# Keystone / Payload / other node CMSs.
+admin
+admin/
+api/graphql
+api/users
+api/media
+keystone
+
+# Netlify / Decap (Git-gateway) CMS.
+admin/config.yml
+.netlify/identity
+.netlify/git/github
+
+# WordPress REST (modern WP exposes this even on "classic" sites).
+wp-json
+wp-json/
+wp-json/wp/v2/users
+wp-json/wp/v2/posts
+wp-json/wp/v2/pages
+wp-json/oembed/1.0
+?rest_route=/wp/v2/users
+
+# Umbraco and other .NET CMSs.
+umbraco
+umbraco/
+umbraco/backoffice/umbracoapi/authentication/getremainingtimeoutseconds
+sitecore
+sitecore/
+episerver
+
+# Common admin spellings across the lot.
+cms
+dashboard
+backend
+manage
+studio
+cockpit

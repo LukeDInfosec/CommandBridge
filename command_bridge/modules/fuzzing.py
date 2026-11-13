@@ -19,6 +19,37 @@ from PyQt6.QtWidgets import (
 from command_bridge.constants import APP_TITLE, APP_VERSION, THEMES, BASE_DIR
 
 
+#: Nicer menu labels for the bundled wordlists, keyed by filename. A file
+#: not listed here gets a title-cased version of its stem, so a new list
+#: still reads sensibly without a code change — the mapping is only to make
+#: the common ones say what they are for.
+_BUNDLED_WORDLIST_LABELS = {
+    "caddy.txt": "Caddy (admin API & config)",
+    "django.txt": "Django (admin, DRF, debug)",
+    "nextjs.txt": "Next.js / React (build & API)",
+    "nodejs-express.txt": "Node.js / Express",
+    "spring-boot.txt": "Spring Boot (actuator)",
+    "flask.txt": "Flask / Werkzeug",
+    "rails.txt": "Ruby on Rails",
+    "fastapi.txt": "FastAPI / OpenAPI",
+    "graphql.txt": "GraphQL API",
+    "kubernetes-devops.txt": "Kubernetes / DevOps / CI",
+    "cloud-metadata.txt": "Cloud metadata & buckets",
+    "api-common.txt": "REST API (common paths)",
+    "modern-cms.txt": "Modern CMS (Ghost, Strapi, Sanity…)",
+    "secrets-config.txt": "Secrets & config files",
+}
+
+
+def _bundled_label(filename):
+    """A readable menu label for a bundled wordlist filename."""
+    name = str(filename or "")
+    if name in _BUNDLED_WORDLIST_LABELS:
+        return _BUNDLED_WORDLIST_LABELS[name]
+    stem = name[:-4] if name.lower().endswith(".txt") else name
+    return stem.replace("-", " ").replace("_", " ").strip().title()
+
+
 # ── Auth helpers ──────────────────────────────────────────────────────────────
 
 _BEARER_PREFIX_RE = re.compile(r'^bearer\s+', re.I)
@@ -308,12 +339,38 @@ class FuzzingMixin:
             raft_large_dirs_action  = menu.addAction("   raft-large-directories.txt")
             raft_large_files_action = menu.addAction("   raft-large-files.txt")
 
+            # ── Bundled with Command Bridge ──────────────────────────────
+            # Every .txt in the app's wordlists/ folder, listed
+            # automatically. Shipping a new list is now dropping a file in
+            # that folder — no code change, and it cannot silently fail to
+            # appear the way a hardcoded entry can. SecLists has no Caddy,
+            # Django or modern-stack lists, which is what these are for.
+            menu.addSeparator()
+            bundled_header = menu.addAction("📦 Bundled with Command Bridge")
+            bundled_header.setEnabled(False)
+            bundled_pairs = []
+            try:
+                wl_dir = _Path(BASE_DIR) / "wordlists"
+                bundled_files = sorted(wl_dir.glob("*.txt")) \
+                    if wl_dir.is_dir() else []
+            except Exception:                           # noqa: BLE001
+                bundled_files = []
+            if bundled_files:
+                for _wl in bundled_files:
+                    _act = menu.addAction(f"   {_bundled_label(_wl.name)}")
+                    bundled_pairs.append((_act, str(_wl)))
+            else:
+                _none = menu.addAction(
+                    "   (none found — upload the wordlists/ folder)")
+                _none.setEnabled(False)
+
             action = menu.exec(button.mapToGlobal(button.rect().bottomLeft()))
 
             if action == edit_action:
                 self.open_command_edit_dialog(button, button_id, default_cmd)
             elif action:
-                wordlist_path = self._get_wordlist_from_action(action, [
+                wordlist_path = self._get_wordlist_from_action(action,
+                    bundled_pairs + [
                     (apache_action,       '/usr/share/seclists/Discovery/Web-Content/Web-Servers/Apache.txt'),
                     (nginx_action,        '/usr/share/seclists/Discovery/Web-Content/Web-Servers/nginx.txt'),
                     (iis_action,          '/usr/share/seclists/Discovery/Web-Content/Web-Servers/IIS.txt'),
@@ -346,7 +403,7 @@ class FuzzingMixin:
                     (raft_medium_dirs_action, '/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt'),
                     (raft_large_dirs_action,  '/usr/share/seclists/Discovery/Web-Content/raft-large-directories.txt'),
                     (raft_large_files_action, '/usr/share/seclists/Discovery/Web-Content/raft-large-files.txt'),
-                ])
+                    ])
 
                 if wordlist_path:
                     if action == other_action:

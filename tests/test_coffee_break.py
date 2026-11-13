@@ -1525,6 +1525,9 @@ def main():
 
         print("\n\033[1mA scanner's bookkeeping is not a finding\033[0m")
         engine = Engine(base)
+        # BREACH is on the default low-signal list; this block tests the
+        # consolidation of one issue across tools, so opt it back in.
+        engine._cb_force_report = {"breach"}
         nikto = "\n".join("+ " + line for line in [
             "Target IP: 127.0.0.1",
             "Server: nginx/1.24",
@@ -1575,6 +1578,11 @@ def main():
         # Nikto words BREACH as a Content-Encoding observation; testssl names
         # it. Two tools, two vocabularies, one problem — and previously two
         # findings that a human had to work out were the same.
+        #
+        # BREACH is suppressed by default (the house does not flag it; see
+        # the suppression test below). This engine opted it back in above,
+        # since the point of this block is the CONSOLIDATION logic — which
+        # applies to every multi-tool issue and only uses breach as example.
         breach = [f for f in engine._cb_findings if f.key == "breach"]
         check("Nikto's deflate line is recognised as BREACH", len(breach), 1)
         records = [{"id": "BREACH", "severity": "LOW", "cve": "CVE-2013-3587",
@@ -1594,13 +1602,42 @@ def main():
         check("and never past the ceiling for something nobody exploited",
               breach[0].confidence != cb_evidence.CONFIRMED_C)
 
+        print("\n\033[1mLow-signal issues this house does not flag\033[0m")
+        # The operator does not flag BREACH, so it is detected but kept out
+        # of the findings list — not deleted, so it can be turned back on.
+        low = Engine(base)
+        low._cb_record(low._cb_issue("breach", base, "gzip + reflected",
+                                     "testssl"))
+        check("BREACH is on the default low-signal list",
+              "breach" in cb_issues.DEFAULT_LOW_SIGNAL)
+        check("so it is not added to the findings", low._cb_findings, [])
+        check("   and the operator is told it was detected, not silently "
+              "dropped",
+              any("low-signal" in line for line in low.printed))
+        # A real finding alongside it is unaffected.
+        low._cb_record(low._cb_issue("hsts_missing", base, "no HSTS",
+                                     "testssl"))
+        check("an issue that IS flagged still lands",
+              [f.key for f in low._cb_findings], ["hsts_missing"])
+        # Opt-in brings it back, which is how the consolidation block above
+        # tests it at all.
+        back = Engine(base)
+        back._cb_force_report = {"breach"}
+        back._cb_record(back._cb_issue("breach", base, "x", "testssl"))
+        check("forcing it on reports it again", len(back._cb_findings), 1)
+
         print("\n\033[1mMuting an issue type\033[0m")
+        # Uses hsts_missing rather than breach: breach is now suppressed by
+        # the low-signal list regardless of muting, which would mask what
+        # this test is about.
         engine = Engine(base)
-        engine._cb_muted = {"breach"}
-        engine._cb_record(engine._cb_issue("breach", base, "x", "testssl"))
+        engine._cb_muted = {"hsts_missing"}
+        engine._cb_record(engine._cb_issue("hsts_missing", base, "x",
+                                           "testssl"))
         check("a muted issue is never recorded", engine._cb_findings, [])
         engine._cb_muted = set()
-        engine._cb_record(engine._cb_issue("breach", base, "x", "testssl"))
+        engine._cb_record(engine._cb_issue("hsts_missing", base, "x",
+                                           "testssl"))
         check("and is recorded again once unmuted",
               len(engine._cb_findings), 1)
 

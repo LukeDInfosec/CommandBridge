@@ -19,6 +19,84 @@ HOW TO USE THIS FILE
  CHANGELOG (most recent first)
 ================================================================================
 
+## 2026-11-13 — WORDLISTS AUTO-POPULATE, MODERN SET, BREACH DROPPED (6.12.0)
+
+Three things from a round of feedback.
+
+1. THE CADDY LIST DID NOT APPEAR. It was a hardcoded menu entry, and a
+   hardcoded entry can silently not be there (older installed copy, or
+   the wordlists/ folder not uploaded). The fuzzing menu now builds its
+   "Bundled with Command Bridge" section by scanning BASE_DIR/wordlists/
+   for *.txt at open time. Shipping a new list is dropping a file in
+   that folder — no code change, and it is listed the moment it is
+   present. _bundled_label() gives each a readable name. (The wordlists/
+   folder MUST be uploaded with the app for any of them to resolve.)
+
+2. A MODERN BUNDLED SET. SecLists is strong on the old guard (Apache,
+   WordPress, Drupal) and thin on current stacks, so these are bundled:
+   caddy, django, spring-boot (actuator/heapdump), nodejs-express,
+   nextjs (build manifest / source maps), flask (Werkzeug console),
+   kubernetes-devops (kubelet, Docker, CI, registries), cloud-metadata
+   (IMDS + buckets), modern-cms (Ghost, Strapi, Sanity, Directus, WP
+   REST, Umbraco), api-common (OpenAPI/Swagger, JWKS, auth), and
+   secrets-config (.env, .git, cloud creds, backups). Each leads with
+   the one or two paths that are actually a finding, and none carries a
+   leading slash (fuzzers append to the URL).
+
+3. BREACH IS NO LONGER REPORTED BY DEFAULT. The house does not flag it,
+   and it is a finding a scanner cannot really confirm. cb_issues.
+   DEFAULT_LOW_SIGNAL holds the keys Coffee Break detects but keeps out
+   of the findings list; _cb_record drops them with one console line
+   saying so, and _cb_force_report opts any back in. Only "breach" is on
+   the list; it is one line to add more.
+
+CHANGED: modules/fuzzing.py (auto-populated bundled menu, _bundled_label),
+         modules/cb_issues.py (DEFAULT_LOW_SIGNAL), modules/coffee_break.py
+         (_cb_record low-signal skip), wordlists/* (10 new lists),
+         tests/test_gui_smoke.py, tests/test_coffee_break.py
+
+## 2026-11-13 — OIDC / IDENTITYSERVER SPA LOGIN (6.11.2)
+
+A captured login showed why browser auth still read as unauthenticated
+against an ASP.NET Core IdentityServer app: it is an OAuth
+Authorization-Code-with-PKCE flow. Login POSTs to /Account/Login on the
+IDP host (example.co.uk); the thing that authenticates the SCANNED app
+(a separate SPA host) is the access token the SPA obtains after the
+code exchange, held in web storage — not the IdP login cookie.
+
+The concrete bug: _login_browser harvested tokens by reading only
+TOP-LEVEL localStorage string values whose key matched token/jwt/auth.
+oidc-client-ts — what an IdentityServer SPA uses — stores the whole
+session as a JSON blob under "oidc.user:<authority>:<client_id>" with
+the access_token NESTED inside. The harvester never saw it, so a
+browser login that really had logged in captured nothing and reported
+failure.
+
+  * NEW bearer_from_web_storage() (+ _access_token_in_json): reads both
+    localStorage and sessionStorage, extracts a nested access_token
+    (oidc-client, and one level down under tokens/auth/session/user),
+    and falls back to the old bare-token-under-a-token-ish-key path.
+    Factored out and unit-tested against the exact oidc-client-ts shape.
+
+  * DIAGNOSTIC: when the browser login captured a token but the
+    verification URL still read as logged-out — the normal outcome for
+    a token SPA, because fetching an HTML route returns the same JS
+    shell with or without a token — the failure now says so and tells
+    the operator to point the session-check URL at an authenticated API
+    endpoint with a signature string, instead of a bare "Authentication
+    Failed".
+
+What NO code change can fix, stated for the record: the FORM strategy
+cannot log into this app. PKCE requires the code_verifier the browser
+generated, which a server-side form POST does not have, so a form
+login can at most establish the IdP cookie and never authenticates the
+SPA. Browser or static (paste the bearer token + an API check URL) are
+the only viable strategies here.
+
+CHANGED: modules/scanner/session.py (bearer_from_web_storage,
+         _login_browser storage read, browser-token diagnostic),
+         tests/test_scanner.py
+
 ## 2026-11-13 — AUTH: A FALSE BAC AND A SILENT BROWSER-LOGIN FAILURE (6.11.1)
 
 Reported from a live engagement: pasted cookies authenticate fine, but

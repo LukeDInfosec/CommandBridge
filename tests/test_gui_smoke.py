@@ -9,6 +9,7 @@ until the application is started.
 
 import os
 import sys
+import json
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -1157,6 +1158,13 @@ def main():
               any("Several Issues Detected" in text for text in painted))
         check("   column 0 carries the worst severity present",
               item.text(0) in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"))
+        # A parent that reports a High and does not say WHAT is High
+        # sends the tester off to find it by hand. The row names its
+        # worst children, using their own titles.
+        check("   and the row names the findings underneath it",
+              any(child.text(1) and child.text(1) in item.text(2)
+                  for child in (item.child(i)
+                                for i in range(item.childCount()))))
 
     check("2. the CSP parent holds three", csp_parent.childCount(), 3)
     check("5. the critical injection is a top-level row of its own",
@@ -1325,6 +1333,97 @@ def main():
     window.cb_search.setText("")
     check("clearing the search restores everything",
           len(window._cb_rows), total_before)
+
+    print("\n\033[1mThe Caddy wordlist is there and is wired in\033[0m")
+    # SecLists has Apache, nginx, IIS and Tomcat lists and no Caddy
+    # one, so this list is bundled with the application — which means
+    # the menu entry points at a path inside the repo, and a missing
+    # file would fail silently at fuzz time.
+    from command_bridge.constants import BASE_DIR as _BASE
+    caddy_list = Path(_BASE) / "wordlists" / "caddy.txt"
+    check("the bundled wordlist exists", caddy_list.is_file())
+    entries = [line.strip() for line in
+               caddy_list.read_text().splitlines()
+               if line.strip() and not line.startswith("#")]
+    check("   and holds a usable number of entries", len(entries) > 80)
+    check("   including the admin API paths that matter",
+          all(path in entries for path in
+              ("config", "config/", "load", "stop", "id/",
+               "reverse_proxy/upstreams")))
+    check("   the Go debug surfaces the admin endpoint exposes",
+          all(path in entries for path in
+              ("debug/vars", "debug/pprof/heap", "debug/pprof/goroutine")))
+    check("   Caddy's own config file names",
+          all(path in entries for path in
+              ("Caddyfile", "caddy.json", "autosave.json")))
+    check("   and the certificate store, where the private keys are",
+          ".local/share/caddy/certificates" in entries)
+    check("no entry starts with a slash — fuzzers append to the URL",
+          [e for e in entries if e.startswith("/")], [])
+
+    # The menu now lists EVERY .txt in wordlists/ automatically, so a new
+    # bundled list appears without a code change and cannot silently fail
+    # to show up the way a hardcoded entry could (which is what happened to
+    # Caddy). Check the folder has the modern set, each one usable.
+    from command_bridge.modules import fuzzing as _fuzz
+    wl_dir = Path(_BASE) / "wordlists"
+    bundled = sorted(p.name for p in wl_dir.glob("*.txt"))
+    for expected in ("caddy.txt", "django.txt", "spring-boot.txt",
+                     "nodejs-express.txt", "nextjs.txt",
+                     "kubernetes-devops.txt", "modern-cms.txt",
+                     "api-common.txt", "secrets-config.txt"):
+        check(f"   {expected} is bundled", expected in bundled)
+    for wl in wl_dir.glob("*.txt"):
+        rows = [l.strip() for l in wl.read_text(encoding="utf-8").splitlines()
+                if l.strip() and not l.startswith("#")]
+        check(f"   {wl.name} is non-empty", len(rows) > 10)
+        check(f"   {wl.name} has no leading-slash entries",
+              [r for r in rows if r.startswith("/")], [])
+    check("the menu builds its bundled list from the folder, not hardcoded",
+          "bundled_pairs" in
+          (Path(_BASE) / "command_bridge" / "modules" /
+           "fuzzing.py").read_text())
+    check("a bundled filename gets a readable menu label",
+          _fuzz._bundled_label("django.txt"), "Django (admin, DRF, debug)")
+    check("   and an unknown one still reads sensibly",
+          _fuzz._bundled_label("some-new-stack.txt"), "Some New Stack")
+
+    print("\n\033[1mNo raw JSON left beside the readable output\033[0m")
+    # The output directory was filling up with two files per run:
+    # target_ffuf.txt and target_ffuf_raw.json. The JSON is an
+    # intermediate this application reads once and converts.
+    import subprocess
+    import tempfile
+    clean = (Path(_BASE) / "command_bridge" / "modules" / "ffuf_clean.py")
+    with tempfile.TemporaryDirectory() as folder:
+        raw = Path(folder) / "t_ffuf_raw.json"
+        txt = Path(folder) / "t_ffuf.txt"
+        raw.write_text(json.dumps({"results": [
+            {"url": "https://x/config", "status": 200, "length": 812,
+             "words": 40, "lines": 3}]}))
+        subprocess.run(["python3", "-I", str(clean), str(raw), str(txt)],
+                       capture_output=True, timeout=60)
+        check("the readable file is written", txt.is_file())
+        check("   and names the finding", "config" in txt.read_text())
+        check("the raw JSON is not left behind", raw.exists(), False)
+
+        # But never at the cost of results: a raw file this script
+        # could not parse is kept, because that is the only copy.
+        broken = Path(folder) / "b_ffuf_raw.json"
+        broken.write_text("this is not json")
+        subprocess.run(["python3", "-I", str(clean), str(broken),
+                        str(Path(folder) / "b_ffuf.txt")],
+                       capture_output=True, timeout=60)
+        check("an unparseable raw file is kept", broken.exists())
+
+        # And only a file named as an intermediate is ever removed.
+        other = Path(folder) / "schema.json"
+        other.write_text(json.dumps({"results": []}))
+        subprocess.run(["python3", "-I", str(clean), str(other),
+                        str(Path(folder) / "s.txt")],
+                       capture_output=True, timeout=60)
+        check("a JSON that is not a _raw intermediate is never deleted",
+              other.exists())
 
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0

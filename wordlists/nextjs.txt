@@ -1,0 +1,60 @@
+# Next.js / React — content discovery
+#
+# Next.js exposes a predictable build and data surface. _next/ holds the
+# build; /_next/static/ chunk names leak internal route and component
+# names; the API lives under /api/. The classic finding is an exposed
+# source map (.js.map) that reconstructs the whole client source, and a
+# build manifest that lists every route including the unlinked ones.
+
+_next
+_next/
+_next/static
+_next/static/chunks
+_next/static/chunks/pages
+_next/static/development
+_next/data
+_next/image
+_next/webpack-hmr
+_buildManifest.js
+_ssgManifest.js
+_middlewareManifest.js
+__nextjs_original-stack-frame
+BUILD_ID
+
+# The API routes.
+api
+api/
+api/auth
+api/auth/session
+api/auth/signin
+api/auth/signout
+api/auth/providers
+api/auth/callback
+api/auth/csrf
+api/trpc
+api/graphql
+api/health
+api/revalidate
+api/preview
+api/webhook
+api/webhooks
+api/cron
+
+# Source maps — the finding that reconstructs the client.
+_next/static/chunks/main.js.map
+_next/static/chunks/webpack.js.map
+static/js/main.js.map
+
+# App metadata and config.
+.env
+.env.local
+.env.production
+.env.development.local
+next.config.js
+next.config.mjs
+package.json
+manifest.json
+robots.txt
+sitemap.xml
+.vercel
+.netlify

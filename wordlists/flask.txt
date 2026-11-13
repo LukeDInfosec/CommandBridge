@@ -1,0 +1,55 @@
+# Flask / Werkzeug — content discovery
+#
+# The defining Flask finding is the Werkzeug debugger left on: an
+# unhandled error renders an interactive console at the error, and with
+# the PIN bypassed it is direct code execution. /console is its path.
+# After that it is the usual leaked config and the API.
+
+console
+__debug__
+debugger
+?__debug__=1
+
+api
+api/
+api/v1
+api/v2
+admin
+admin/
+login
+logout
+auth
+auth/login
+user
+users
+me
+profile
+health
+healthz
+status
+metrics
+static
+static/
+media
+uploads
+
+# Config and project files.
+.env
+.env.local
+config.py
+settings.py
+app.py
+wsgi.py
+application.py
+requirements.txt
+instance
+instance/config.py
+.flaskenv
+.git/config
+
+# Common Flask-RESTX / Swagger.
+swagger.json
+swaggerui
+api/doc
+api/swagger.json
+openapi.json

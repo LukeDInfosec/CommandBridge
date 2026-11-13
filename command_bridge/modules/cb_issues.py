@@ -35,6 +35,20 @@ import re
 #: others are catch-alls with no fixed meaning of their own.
 TOOL_RATED = {"known_cve", "tls_generic", "scan_information"}
 
+#: Issues the scanners can detect but that this house does not report in an
+#: assessment — low-signal findings a tester would not raise. They are still
+#: DETECTED (the console says so, and nothing about the detection logic
+#: changes), but they are kept out of the findings list by default.
+#:
+#: BREACH is the example that prompted this: it needs HTTP compression, a
+#: secret and attacker-controlled input reflected in the same response, and
+#: no masking — a combination a scanner cannot actually confirm, and most
+#: testers do not flag it. It is suppressed here rather than deleted so the
+#: decision is in one visible place and easy to change.
+DEFAULT_LOW_SIGNAL = frozenset({
+    "breach",
+})
+
 
 def _issue(severity, title, detail, remediation, cwe="", references=()):
     return {"severity": severity, "title": title, "detail": detail,
