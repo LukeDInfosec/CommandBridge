@@ -528,6 +528,47 @@ def main():
         check("a nameless cookie is skipped, not fatal",
               absorbed, 2)
 
+        print("\n\033[1mThe oidc-client token is found in web storage\033[0m")
+        from command_bridge.modules.scanner.session import \
+            bearer_from_web_storage
+        # The exact shape an ASP.NET Core IdentityServer SPA leaves behind:
+        # oidc-client-ts keeps the whole User as a JSON blob under
+        # "oidc.user:<authority>:<client_id>", with the access token nested
+        # inside. The old harvester only read top-level string values, so it
+        # never saw this token and the browser login read as failed.
+        oidc_blob = json.dumps({
+            "id_token": "eyJhbGciOi.id.token",
+            "access_token": "eyJhbGciOiJSUzI1NiIsIntheRealAccessTokenValue",
+            "token_type": "Bearer",
+            "scope": "openid email",
+            "profile": {"name": "pen.tester"},
+            "expires_at": 1799999999,
+        })
+        localstorage = {
+            "oidc.user:https://example.co.uk:test_lms_web": oidc_blob,
+            "ally-supports-cache": "1",
+            "i18nextLng": "en",
+        }
+        check("the nested access_token is extracted",
+              bearer_from_web_storage([localstorage]),
+              "eyJhbGciOiJSUzI1NiIsIntheRealAccessTokenValue")
+        check("   and the id_token is not preferred over it",
+              bearer_from_web_storage([localstorage]).endswith("Value"))
+        # The simple case still works, and sessionStorage is read too.
+        check("a bare token under a token-ish key is still found",
+              bearer_from_web_storage(
+                  [{}, {"authToken": "a" * 40}]), "a" * 40)
+        check("nothing token-shaped means no token, not a crash",
+              bearer_from_web_storage([{"theme": "dark", "count": "3"}]), "")
+        check("a value too short to be a token is ignored",
+              bearer_from_web_storage([{"token": "x"}]), "")
+        check("malformed JSON under a key does not raise",
+              bearer_from_web_storage([{"oidc.user:x": "{not json"}]), "")
+        # Wrapped one level down, as some auth libraries store it.
+        check("an access_token nested under 'tokens' is found",
+              bearer_from_web_storage([{"state": json.dumps(
+                  {"tokens": {"access_token": "b" * 44}})}]), "b" * 44)
+
         print("\n\033[1mA generic default name is not an owner marker\033[0m")
         # The reported false positive: cookies pasted in, username box left
         # empty, so the identity's name defaults to "user". /myaccount
