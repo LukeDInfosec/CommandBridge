@@ -1,7 +1,7 @@
 ================================================================================
  COMMAND BRIDGE v4 — PROJECT REFERENCE & CHANGELOG
  (Reference doc for Claude / future sessions. Keep this updated after changes.)
- Last updated: 2026-11-13
+ Last updated: 2026-11-16
 ================================================================================
 
 HOW TO USE THIS FILE
@@ -18,6 +18,33 @@ HOW TO USE THIS FILE
 ================================================================================
  CHANGELOG (most recent first)
 ================================================================================
+
+## 2026-11-16 — TRAFFIC TRANSPARENCY: VERIFIED, AND HONEST ABOUT NMAP (6.12.1)
+
+The proxy/egress feature (added 6.10.0) was reported as missing. It is
+present and working — verified this build end to end:
+
+  * the card IS on the Target tab, titled "TRAFFIC TRANSPARENCY (PROXY
+    AND EGRESS LOG)", inside the tab's scroll area (it reads missing
+    only if an older copy is installed — it is below Custom Headers);
+  * the application's own requests go through the configured proxy —
+    tested against a real local proxy that recorded the GET; and
+  * every shelled-out tool gets the proxy flag + HTTP(S)_PROXY env at
+    the one launch point (widgets/runner.py), Coffee Break included,
+    since Coffee Break runs its stages through that same CommandRunner.
+
+NEW, for the demo: tools that CANNOT be proxied now say so. nmap is
+Coffee Break's first stage and uses raw sockets, so a proxied run shows
+nothing in Burp for the first couple of minutes — which looks like
+something hidden if it is not explained. egress.UNPROXYABLE_TOOLS +
+proxy_note() name them (nmap, masscan, sslscan, nc, dns tools…), and
+the runner prints "[proxy] nmap does not go through the proxy — it uses
+raw TCP/IP packets… that is expected" to the console and the egress log
+the moment such a stage starts. So a live audience sees the quiet
+stages explained rather than wondering.
+
+CHANGED: modules/egress.py (UNPROXYABLE_TOOLS, proxy_note),
+         widgets/runner.py (emit the note), tests/test_egress.py
 
 ## 2026-11-13 — WORDLISTS AUTO-POPULATE, MODERN SET, BREACH DROPPED (6.12.0)
 
