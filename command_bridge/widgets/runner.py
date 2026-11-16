@@ -5,6 +5,7 @@ from PyQt6 import QtCore
 from PyQt6.QtCore import QProcess, QTimer
 
 from command_bridge.constants import DEFAULT_OUTPUT_DIR
+from command_bridge.modules import egress
 
 
 class CommandRunner(QtCore.QObject):
@@ -87,7 +88,28 @@ class CommandRunner(QtCore.QObject):
                 self.output_file = None
                 self.output_file_handle = None
 
+        # Every shelled-out tool goes through the operator's proxy when
+        # one is configured, and the command line is recorded. Both
+        # happen HERE because this is the one place every tool is
+        # launched from — a per-module version would be a promise that
+        # held until someone added a module.
+        try:
+            note = egress.proxy_note(command)
+            command = egress.proxy_command(command)
+            egress.STATE.record_command(command)
+            if note:
+                # Said out loud, in the console the operator is watching and
+                # in the egress log, so a proxied demo explains its own
+                # quiet stages instead of looking like something is hidden.
+                self.output_ready.emit(f"[proxy] {note}\n")
+                egress.STATE.record_command(f"# {note}",
+                                            component="proxy-note")
+        except Exception:                                   # noqa: BLE001
+            pass
+
         env = QtCore.QProcessEnvironment.systemEnvironment()
+        for name, value in egress.STATE.env_pairs().items():
+            env.insert(name, value)
         is_sqlmap = "sqlmap" in command
         env.insert("PYTHONUNBUFFERED", "1")
         env.insert("PYTHONIOENCODING", "utf-8")

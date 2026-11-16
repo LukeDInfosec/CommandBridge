@@ -127,6 +127,39 @@ class Detector:
     #: evidence arrives from somewhere else is a bug, not a finding.
     evidence_sources: tuple = ()
 
+    #: What KIND of thing this detector observes — one of the constants
+    #: in modules/classification.py. This is the field the decision
+    #: engine turns on: a detector whose observation is a header value
+    #: cannot produce an injection finding, whatever its template is
+    #: named or tagged. Left empty, the engine infers it from the
+    #: evidence present.
+    observation: str = ""
+
+    #: The header this detector is about, when it observes one.
+    header: str = ""
+
+    #: True when reading the observation IS the finding — a header value
+    #: that was returned is not in doubt. False for a signature that
+    #: merely suggests something.
+    observation_is_self_evident: bool = False
+
+    #: Where a finding goes when the detector's class is rejected as
+    #: unsupportable. Left empty, the engine uses the fallback for the
+    #: observation kind.
+    fallback_key: str = ""
+    fallback_name: str = ""
+
+    #: Which explanation rule to use, when it is not the issue key.
+    explain_as: str = ""
+
+    #: What would mean this detector has produced a false positive, or
+    #: that its class does not match its evidence. Written for a reader
+    #: of the registry; the engine's own check is structural.
+    mismatch_when: str = ""
+
+    #: When this detector's result is context rather than a finding.
+    informational_when: str = ""
+
     notes: str = ""
 
 
@@ -137,6 +170,8 @@ class Detector:
 
 NUCLEI = {
     "missing-sri": Detector(
+        observation="extracted_url",
+        observation_is_self_evident=True,
         name="Subresource Integrity missing on external script",
         issue_key="sri_missing",
         vuln_class="misconfiguration",
@@ -152,6 +187,55 @@ NUCLEI = {
               "not test execution, injection or a shell. It was being "
               "classified as OS command injection because its NAME "
               "contains 'Subresou(rce)'.",
+    ),
+    # The template that defeated both earlier guards: the registry had
+    # no entry for it, and the tag backstop passed it because the
+    # template is TAGGED "xss". A tag says what subject a template is
+    # about. This one tests for a HEADER, and its extracted result —
+    # "1; mode=block" — is that header's value, not a payload.
+    "xss-deprecated-header": Detector(
+        name="Deprecated X-XSS-Protection header",
+        issue_key="xss_protection_deprecated",
+        vuln_class="security header observation",
+        severity_if_confirmed="INFO",
+        severity_unconfirmed="INFO",
+        ceiling=CONFIRMED,
+        evidence_kind=OBSERVED,
+        observation="header_value",
+        header="X-XSS-Protection",
+        observation_is_self_evident=True,
+        cwe="CWE-1022",
+        confirm_requires="The response header and its value.",
+        verify="header_value",
+        evidence_sources=("response headers",),
+        explain_as="xss_protection_deprecated",
+        mismatch_when="Any claim of reflected XSS. This detector reads one "
+                      "header; it has no injection point, no payload and no "
+                      "reflection, so it cannot establish XSS.",
+        informational_when="Always. The header being present or absent is a "
+                           "configuration observation.",
+        notes="X-XSS-Protection was the legacy auditor in Chrome and "
+              "WebKit. Chrome removed it in 2019 and no current browser "
+              "acts on it, so neither its presence nor its absence is a "
+              "vulnerability. '1; mode=block' is the value that asks the "
+              "old auditor to block rather than sanitise.",
+    ),
+    "x-frame-options-header": Detector(
+        name="X-Frame-Options header observed",
+        issue_key="cross_site_framing",
+        vuln_class="security header observation",
+        severity_if_confirmed="MEDIUM",
+        severity_unconfirmed="INFO",
+        ceiling=CONFIRMED,
+        evidence_kind=OBSERVED,
+        observation="header_value",
+        header="X-Frame-Options",
+        observation_is_self_evident=True,
+        cwe="CWE-1021",
+        confirm_requires="The response headers, and the CSP, so the "
+                         "effective framing policy can be worked out.",
+        evidence_sources=("response headers",),
+        explain_as="cross_site_framing",
     ),
     "weak-csp-detect": Detector(
         name="Content-Security-Policy is permissive",
@@ -170,6 +254,8 @@ NUCLEI = {
               "of code execution here.",
     ),
     "missing-csp": Detector(
+        observation="header_value",
+        observation_is_self_evident=True,
         name="Content-Security-Policy is missing",
         issue_key="csp_missing",
         vuln_class="misconfiguration",
@@ -535,18 +621,43 @@ def classify_nuclei(template_id, name="", tags=(), severity="",
     return None
 
 
+#: Tags that name a SUBJECT the template is about rather than a
+#: behaviour it tested. "xss" is in both this set and the exploit set,
+#: because nuclei uses it for templates that test for script injection
+#: AND for templates that read an XSS-related header — and
+#: xss-deprecated-header is the second kind. Where a template's tags
+#: include one of these and its severity is info or low, the tag is not
+#: taken as evidence that an exploit was tested for.
+NUCLEI_SUBJECT_TAGS = frozenset({
+    "xss", "injection", "redirect", "traversal", "disclosure", "auth",
+})
+
+
 def exploit_class_admissible(tags=(), severity=""):
     """May a finding from this nuclei template carry an exploit class?
 
-    An INFO or LOW template with no exploit tag has not tested for an
-    exploit. This is the guard that would have stopped both the
-    weak-csp-detect and the missing-sri reports.
+    An INFO or LOW template has not demonstrated an exploit, and an
+    exploit TAG does not change that. nuclei tags
+    ``xss-deprecated-header`` with "xss" because the header has XSS in
+    its name; the template reads a header. The earlier version of this
+    function returned True on that tag alone, which is how a header
+    value reached a reflected-XSS finding.
+
+    Severity is the stronger signal and is checked first. The engine in
+    modules/classification.py is the real guard — it asks what was
+    OBSERVED — and this stays as a cheap pre-filter in front of it.
     """
     tag_set = {str(t).strip().lower() for t in (tags or []) if t}
-    if tag_set.intersection(NUCLEI_EXPLOIT_TAGS):
-        return True
-    if str(severity).upper() in ("INFO", "LOW", "UNKNOWN", ""):
+    level = str(severity).upper()
+
+    if level in ("INFO", "LOW", "UNKNOWN", ""):
         return False
+    if tag_set.intersection(NUCLEI_EXPLOIT_TAGS - NUCLEI_SUBJECT_TAGS):
+        return True
+    if tag_set.intersection(NUCLEI_EXPLOIT_TAGS):
+        # A subject tag at medium or above: allowed, but the engine will
+        # still reject the class if the observation cannot support it.
+        return True
     return True
 
 

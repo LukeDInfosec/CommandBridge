@@ -398,7 +398,7 @@ class WebTestingMixin:
                 f"No remediation was required in respect of the HTTP security header configuration at the "
                 f"time of testing."
             )
-            return f"\n### Penetration Test Report Extract ###\n{para}\n\n"
+            return f"\n{para}\n\n"
 
         joined = " ".join(issues).lower()
 
@@ -554,7 +554,7 @@ class WebTestingMixin:
             "security posture of the application and reduce exposure to client-side attack vectors."
         )
         para = opening + findings_text + " " + closing
-        return f"\n### Penetration Test Report Extract ###\n{para}\n\n"
+        return f"\n{para}\n\n"
 
     def jwt_decode_prompt(self):
         """Prompt for a JWT, decode it locally, print to console, and save to disk."""

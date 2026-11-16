@@ -342,6 +342,50 @@ def shell_history(path="", http_status=0, content_type="", body_bytes=0,
                     "actually exposed is unestablished."))
 
 
+def xss_protection_deprecated(header_value="", url="", present=True,
+                              **_):
+    """The legacy X-XSS-Protection header, said plainly.
+
+    The whole point of this rule is the last sentence: the finding has
+    to say what the header is NOT, because the template that produces it
+    is named and tagged as though it were about cross-site scripting.
+    """
+    if not present:
+        return Explanation(
+            summary=("The legacy X-XSS-Protection header is not set."),
+            reason=("No current browser acts on this header, so its absence "
+                    "is not a weakness."),
+            evidence=[f"  X-XSS-Protection: not present",
+                      f"  observed on: {url}" if url else ""],
+            limitation=("Script execution is restricted by a "
+                        "Content-Security-Policy, not by this header."))
+    value = str(header_value or "").strip()
+    return Explanation(
+        summary=(f"The response sets the legacy X-XSS-Protection header"
+                 + (f" to {value!r}." if value else ".")),
+        reason=("Chrome removed the XSS auditor in 2019 and no current "
+                "browser acts on this header, so its value does not affect "
+                "the application's security."),
+        evidence=[f"  X-XSS-Protection: {value}" if value else "",
+                  f"  observed on: {url}" if url else ""],
+        limitation=("This is a configuration observation. It is not evidence "
+                    "of a cross-site scripting vulnerability — no input, "
+                    "payload or reflection is involved in this check."))
+
+
+def header_observation(header_name="", header_value="", url="", **_):
+    """A header a scanner reported, with nothing claimed about it."""
+    return Explanation(
+        summary=(f"The response returned {header_name or 'a header'}"
+                 + (f" with the value {str(header_value)[:120]!r}."
+                    if header_value else ".")),
+        reason="",
+        evidence=[f"  {header_name}: {header_value}" if header_name else "",
+                  f"  observed on: {url}" if url else ""],
+        limitation=("Recorded as an observation. No vulnerability is "
+                    "claimed from a header value alone."))
+
+
 def sri_missing(scripts=(), url="", **_):
     listed = [str(s) for s in (scripts or []) if s]
     return Explanation(
@@ -507,6 +551,8 @@ RULES = {
     "xfo_missing": cross_site_framing,
     "shell_history_exposed": shell_history,
     "sri_missing": sri_missing,
+    "xss_protection_deprecated": xss_protection_deprecated,
+    "security_header_observation": header_observation,
     "component_admin_exposed": component,
     "component_known_vulnerable": component,
     "xss_reflected": reflected_xss,

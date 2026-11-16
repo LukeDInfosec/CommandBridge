@@ -100,6 +100,18 @@ class CommandBridgeV5(
         super().__init__()
         self.target = ""
 
+        # Wrap the HTTP libraries before anything can use them, so no
+        # request this application makes can bypass the egress log or
+        # the operator's proxy. See modules/egress.py. Nothing is
+        # proxied or logged until the operator turns it on in the
+        # Target tab; what this does is make sure that when they do, it
+        # covers everything.
+        try:
+            from command_bridge.modules import egress
+            egress.install()
+        except Exception:                                   # noqa: BLE001
+            pass
+
         # Default options for testssl summary parser
         self._testssl_summary_min_severity = "LOW"
         self._testssl_summary_include_notes = False

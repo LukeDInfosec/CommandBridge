@@ -294,6 +294,50 @@ class Verifier:
             evidence=evidence,
             reason="the version could not be determined from the response")
 
+    def _verify_header_value(self, detection):
+        """Read the header back and record its value.
+
+        The cheap end of verification: one GET, and the finding then
+        rests on a header this application has seen rather than on a
+        scanner's extracted string. Used by the deprecated-header
+        detectors, where the value IS the whole observation.
+        """
+        header = getattr(detection.detector, "header", "")
+        url = detection.url or ""
+        response = self._get(url)
+        if response is None:
+            extracted = ", ".join(str(x) for x in (detection.extracted or ()))
+            return Outcome(
+                status=registry.POTENTIAL, verified=False,
+                summary=(f"{header or 'The header'} was reported as "
+                         f"{extracted!r} by {detection.scanner or 'a scanner'}"
+                         f"; the response could not be re-read."),
+                evidence=[f"reported value: {extracted}"] if extracted else [],
+                reason="the response could not be re-requested")
+
+        present = {k.lower(): v for k, v in response.headers.items()}
+        value = present.get(header.lower(), "")
+        kind = _kind(response)
+        if not header:
+            return Outcome(status=_ceiling(detection), verified=False,
+                           summary=_signature_summary(detection),
+                           reason="no header name is recorded for this check")
+        if not value:
+            return Outcome(
+                status=registry.INCONCLUSIVE, verified=True,
+                http_status=response.status_code, content_type=kind,
+                summary=(f"{header} was not present in the response when "
+                         f"re-requested."),
+                evidence=[f"GET {url} → HTTP {response.status_code}",
+                          f"{header}: not present"],
+                reason="the header is not there now")
+        return Outcome(
+            status=registry.CONFIRMED, verified=True,
+            http_status=response.status_code, content_type=kind,
+            summary=f"{header} is set to {value!r}.",
+            evidence=[f"GET {url} → HTTP {response.status_code}",
+                      f"{header}: {value}"])
+
     def _verify_header_absent(self, detection):
         """Is the header really not there?"""
         url = detection.url or ""

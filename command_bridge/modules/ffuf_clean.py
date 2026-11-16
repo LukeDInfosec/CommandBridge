@@ -28,6 +28,7 @@ Usage: ffuf_clean.py <raw_json_file> [clean_txt_file]
 Prints the clean lines to stdout (so the caller can see them in the console)
 and, if a second argument is given, also writes them to that file.
 """
+import os
 import sys
 import json
 from collections import Counter
@@ -122,6 +123,34 @@ def main():
                     f.write(line + "\n")
         except Exception as e:
             print(f"[!] Could not write clean output file {out_path}: {e}", file=sys.stderr)
+        else:
+            _discard_raw(raw_path, out_path)
+
+
+def _discard_raw(raw_path, out_path):
+    """Delete the raw ffuf JSON once the readable file exists.
+
+    ffuf's JSON is an intermediate: a metadata dump this script reads
+    once and turns into the "[STATUS] URL" file that is actually
+    opened. Leaving it behind filled the output directory with a second
+    copy of every fuzzing run — target_ffuf.txt beside
+    target_ffuf_raw.json — and the JSON is not the one anybody wants.
+
+    Deleted only after the clean file has been written and is non-empty,
+    so a failure in this script never costs the results. Only a file
+    this script was given as its INPUT is removed, and only when its
+    name marks it as a raw intermediate.
+    """
+    try:
+        if not raw_path or not str(raw_path).endswith("_raw.json"):
+            return
+        if not os.path.isfile(out_path) or os.path.getsize(out_path) == 0:
+            return
+        os.remove(raw_path)
+    except Exception:                                       # noqa: BLE001
+        # A leftover file is a tidiness problem; a traceback here would
+        # look like the scan failed.
+        pass
 
 
 if __name__ == "__main__":

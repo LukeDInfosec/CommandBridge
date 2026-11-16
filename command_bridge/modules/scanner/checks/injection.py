@@ -493,7 +493,7 @@ class CommandInjectionCheck:
                 " This rests on a computed value, reproduced with a second "
                 "unpredictable pair and absent from a control request — not "
                 "on the output of any command. It is reported as potential "
-                "for that reason: confirm it by hand before writing it up.")
+                "for that reason: confirm it by hand before relying on it.")
         finding.add(grading.Signal(
             grading.DIFFERENTIAL if arithmetic_only else grading.EXECUTION,
             f"A marker generated for this test ({expected}) was produced by "

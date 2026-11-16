@@ -2,7 +2,7 @@
 
 import re
 from PyQt6 import QtGui
-from PyQt6.QtCore import QMimeData
+from PyQt6.QtCore import QMimeData, QTimer
 from PyQt6.QtWidgets import QTextEdit
 
 
@@ -109,7 +109,107 @@ class EnhancedConsole(QTextEdit):
     #: not an escape and should not be buffered indefinitely.
     _MAX_ANSI_TAIL = 16
 
+    #: How many lines the console keeps. A QTextEdit lays out its whole
+    #: document, so the cost of an insert grows with the document — and
+    #: nothing here ever removed anything. A long Coffee Break run with a
+    #: directory-fuzzing stage in it emits hundreds of thousands of lines,
+    #: and the application became unresponsive partway through: the clock
+    #: in the status bar stopped, tabs stopped responding, and the only
+    #: way out was to kill it. It degraded rather than hanging outright,
+    #: which is the signature of exactly this.
+    #:
+    #: QPlainTextEdit has setMaximumBlockCount for this; QTextEdit does
+    #: not, so the trimming below is by hand.
+    #: Measured in CHARACTERS, not lines, and this is not a detail. Every
+    #: line goes through _apply_feroxbuster_colors, which returns HTML, so
+    #: lines are inserted with insertHtml and separated by <br>. A <br> is
+    #: a line separator WITHIN a Qt text block, not a block boundary, so
+    #: document().blockCount() reads 1 after a hundred thousand lines. A
+    #: cap written against blockCount — which is what this was at first —
+    #: would never once have fired, and the memory would have grown
+    #: unbounded exactly as before while looking fixed.
+    _MAX_CHARS = 600_000
+
+    #: Trim in chunks, so this is a rare document operation rather than
+    #: one on every insert once the cap is reached.
+    _TRIM_CHUNK = 150_000
+
+    #: Milliseconds to gather output before touching the widget. A fuzzer
+    #: emits thousands of lines a second and every one of them used to
+    #: cause an insert, a setTextCursor and a scroll-to-bottom — three
+    #: relayouts per line. Coalescing turns that into about twenty
+    #: repaints a second whatever the tool does, and the text arrives
+    #: fast enough that nobody can tell.
+    _FLUSH_MS = 50
+
+    #: Flush early if this much text is waiting, so a burst cannot sit in
+    #: memory unbounded while the timer waits.
+    _MAX_PENDING = 256 * 1024
+
+    def _ensure_buffer(self):
+        if not hasattr(self, "_pending"):
+            self._pending = []
+            self._pending_size = 0
+            self._flush_timer = QTimer(self)
+            self._flush_timer.setSingleShot(True)
+            self._flush_timer.setInterval(self._FLUSH_MS)
+            self._flush_timer.timeout.connect(self.flush)
+
     def append_ansi(self, text):
+        """Queue text for the console. Rendered on a short timer.
+
+        Deliberately does NOT touch the widget. Everything that writes to
+        the console goes through here, including per-line output from a
+        running tool, so this is the hot path during a long scan.
+        """
+        if not text:
+            return
+        self._ensure_buffer()
+        self._pending.append(text)
+        self._pending_size += len(text)
+        if self._pending_size >= self._MAX_PENDING:
+            self.flush()
+        elif not self._flush_timer.isActive():
+            self._flush_timer.start()
+
+    def flush(self):
+        """Render everything queued. Safe to call when nothing is queued.
+
+        Call it directly when the console's contents are about to be read
+        or when a run has finished and the last lines must be on screen.
+        """
+        self._ensure_buffer()
+        try:
+            self._flush_timer.stop()
+        except Exception:                                   # noqa: BLE001
+            pass
+        if not self._pending:
+            return
+        text = "".join(self._pending)
+        self._pending = []
+        self._pending_size = 0
+        self._render_ansi(text)
+        self._trim()
+
+    def _trim(self):
+        """Drop the oldest output once the document exceeds the cap."""
+        try:
+            document = self.document()
+            count = document.characterCount()
+            if count <= self._MAX_CHARS:
+                return
+            drop = count - self._MAX_CHARS + self._TRIM_CHUNK
+            drop = min(drop, count - 1)
+            cursor = QtGui.QTextCursor(document)
+            cursor.setPosition(0)
+            cursor.setPosition(drop, QtGui.QTextCursor.MoveMode.KeepAnchor)
+            cursor.removeSelectedText()
+        except Exception:                                   # noqa: BLE001
+            # A console that cannot trim is worse than one that can, and
+            # far better than one that raises into the output path.
+            pass
+
+    def _render_ansi(self, text):
         """Append text with ANSI colour support and carriage-return handling."""
         ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
@@ -139,13 +239,16 @@ class EnhancedConsole(QTextEdit):
             self._append_with_carriage_returns(clean_text)
         else:
             colored_text = self._apply_feroxbuster_colors(clean_text)
-            cursor = self.textCursor()
-            cursor.movePosition(cursor.MoveOperation.End)
+            # A cursor on the document rather than the widget's own: the
+            # old code called setTextCursor on every append, which moves
+            # the visible cursor, scrolls to it and forces a relayout. On
+            # the per-line output path that was pure overhead.
+            cursor = QtGui.QTextCursor(self.document())
+            cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
             if colored_text != clean_text:
                 cursor.insertHtml(colored_text)
             else:
                 cursor.insertText(clean_text.replace('\r\n', '\n'))
-            self.setTextCursor(cursor)
 
         scrollbar = self.verticalScrollBar()
         if getattr(self, "_auto_scroll", True):
@@ -158,8 +261,11 @@ class EnhancedConsole(QTextEdit):
         chunk is appended normally and every later chunk replaces whatever is
         currently on the last line, which is what a terminal does.
         """
-        cursor = self.textCursor()
-        cursor.movePosition(cursor.MoveOperation.End)
+        # Document cursor, not the widget's: same reason as in
+        # _render_ansi. This is the path a progress counter takes, so it
+        # runs for every redraw of "12345/40000" a fuzzer prints.
+        cursor = QtGui.QTextCursor(self.document())
+        cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
 
         chunks = text.replace('\r\n', '\n').split('\r')
         cursor.insertText(chunks[0])
@@ -169,7 +275,6 @@ class EnhancedConsole(QTextEdit):
                                 cursor.MoveMode.KeepAnchor)
             cursor.removeSelectedText()
             cursor.insertText(chunk)
-        self.setTextCursor(cursor)
 
     def _apply_feroxbuster_colors(self, text):
         """Apply color formatting to tool output lines."""
@@ -445,10 +550,13 @@ class EnhancedConsole(QTextEdit):
 
     def append_html(self, html_text: str):
         """Append raw HTML to the console without ANSI stripping."""
-        cursor = self.textCursor()
-        cursor.movePosition(cursor.MoveOperation.End)
+        # Flush first, or this lands AHEAD of text already queued by
+        # append_ansi and the console reads out of order.
+        self.flush()
+        cursor = QtGui.QTextCursor(self.document())
+        cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
         cursor.insertHtml(html_text)
-        self.setTextCursor(cursor)
+        self._trim()
         scrollbar = self.verticalScrollBar()
         if getattr(self, "_auto_scroll", True):
             scrollbar.setValue(scrollbar.maximum())

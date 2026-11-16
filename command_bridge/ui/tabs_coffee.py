@@ -797,8 +797,15 @@ class CoffeeBreakTabMixin:
             SEV_COLOURS.get(group.worst_severity, "#8b9bb4")))
         item.setToolTip(0, f"Worst severity among {group.count} findings — "
                            f"see the distribution beside it")
-        item.setToolTip(1, group.summary())
-        item.setText(2, group.summary())
+        # The names of the worst children go on the parent row itself.
+        # "TLS/SSL — Several Issues Detected [4 findings] · 1 High" does
+        # not tell a tester that this host offers SSLv3; the row has to
+        # say so, or it gets skimmed past and found by hand later.
+        headline = group.headline()
+        item.setToolTip(1, f"{group.summary()}\n\n{headline}"
+                        if headline else group.summary())
+        item.setText(2, f"{group.summary()} · {headline}"
+                     if headline else group.summary())
         # Qt reads the item's text to a screen reader; the summary says
         # the counts, and the expanded state comes from the widget.
         item.setData(1, Qt.ItemDataRole.AccessibleTextRole,

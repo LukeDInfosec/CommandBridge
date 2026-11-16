@@ -330,6 +330,24 @@ class Authenticator:
         step(("Verification: " if ok else "Verification indicates an "
               "unauthenticated session: ") + reason)
         self.logged_in = ok
+        if not ok and self.config.strategy == "browser" and \
+                getattr(self, "_browser_token", False):
+            # The browser logged in and we captured an access token, but the
+            # verification URL still reads as logged-out. For a single-page
+            # app that is expected: fetching an HTML route returns the same
+            # JavaScript shell whether or not you hold a token, because the
+            # auth check runs in the browser, not on that request. The token
+            # is real; the verification target is wrong for this kind of app.
+            reason = (
+                f"{reason}. A bearer token WAS obtained from the browser "
+                f"login, so the credentials are good — but the verification "
+                f"URL could not confirm a session. This application looks "
+                f"like a single-page app that authenticates with a token "
+                f"rather than a cookie: point the session-check URL at an "
+                f"authenticated API endpoint (one that returns 401 without a "
+                f"token and JSON with one), set a signature string that only "
+                f"appears in that JSON, and the scan will use the token on "
+                f"every request.")
         if not ok and self._login_doubt:
             # The verification failed and the login response already told us
             # why. "the signature was not in the response" is true and
@@ -524,19 +542,26 @@ class Authenticator:
                 page.keyboard.press("Enter")
             page.wait_for_load_state("networkidle", timeout=20000)
             self._absorb_browser_cookies(context.cookies())
-            # Tokens kept in web storage rather than a cookie.
-            try:
-                stored = page.evaluate(
-                    "() => JSON.stringify(Object.assign({}, localStorage))")
-                for key, value in json.loads(stored or "{}").items():
-                    if re.search(r"token|jwt|auth", key, re.I) and \
-                            isinstance(value, str) and len(value) > 20:
-                        self.session.headers["Authorization"] = \
-                            value if value.lower().startswith("bearer ") \
-                            else f"Bearer {value}"
-                        break
-            except Exception:                           # noqa: BLE001
-                pass
+            # Tokens kept in web storage rather than a cookie. Both stores
+            # are read: oidc-client-ts, which IdentityServer SPAs use, keeps
+            # the session in localStorage, but plenty of apps use
+            # sessionStorage, and a token missed here is a login that looks
+            # like it failed.
+            self._browser_token = False
+            stores = []
+            for which in ("localStorage", "sessionStorage"):
+                try:
+                    blob = page.evaluate(
+                        f"() => JSON.stringify(Object.assign({{}}, {which}))")
+                    stores.append(json.loads(blob or "{}"))
+                except Exception:                       # noqa: BLE001
+                    pass
+            token = bearer_from_web_storage(stores)
+            if token:
+                self.session.headers["Authorization"] = (
+                    token if token.lower().startswith("bearer ")
+                    else f"Bearer {token}")
+                self._browser_token = True
             browser.close()
 
     def _absorb_browser_cookies(self, cookies):
@@ -818,6 +843,67 @@ class Authenticator:
         """True for anything that would end the session or the client's day."""
         lowered = url.lower()
         return any(word in lowered for word in self.config.avoid)
+
+
+def _access_token_in_json(text):
+    """An ``access_token`` nested inside a JSON blob, or ""."""
+    try:
+        data = json.loads(text)
+    except Exception:                                   # noqa: BLE001
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    # oidc-client-ts and oidc-client keep the whole User here: access_token,
+    # id_token, token_type, profile, expires_at. The access token is the one
+    # an API accepts, so it is preferred over the id token.
+    for field in ("access_token", "accessToken"):
+        token = data.get(field)
+        if isinstance(token, str) and len(token) > 20:
+            return token
+    # Some wrappers nest it one level down under "tokens" or "auth".
+    for holder in ("tokens", "auth", "session", "user"):
+        inner = data.get(holder)
+        if isinstance(inner, dict):
+            for field in ("access_token", "accessToken"):
+                token = inner.get(field)
+                if isinstance(token, str) and len(token) > 20:
+                    return token
+    return ""
+
+
+def bearer_from_web_storage(stores):
+    """Find an access token across browser storage dumps.
+
+    ``stores`` is a list of ``{key: value}`` dicts — typically localStorage
+    and sessionStorage. Two shapes are handled, because both occur in the
+    wild and the simpler scanner only ever saw the first:
+
+      * a token kept directly under a key whose name mentions token / jwt /
+        auth, the value being the token string; and
+
+      * oidc-client / oidc-client-ts, which an ASP.NET Core IdentityServer
+        single-page app uses — the whole session is a JSON blob under a key
+        like ``oidc.user:https://idp:client_id`` with the real
+        ``access_token`` nested inside. A scanner that only read top-level
+        string values never found it, so a browser login that had in fact
+        logged in was reported as a failure.
+
+    A nested ``access_token`` is preferred over a bare token-ish string,
+    because it is unambiguous; the bare-string path is the fallback.
+    """
+    direct = ""
+    for store in stores or []:
+        if not isinstance(store, dict):
+            continue
+        for key, value in store.items():
+            if not isinstance(value, str) or len(value) < 20:
+                continue
+            nested = _access_token_in_json(value)
+            if nested:
+                return nested
+            if not direct and re.search(r"token|jwt|auth|bearer", key, re.I):
+                direct = value.strip()
+    return direct
 
 
 def _read_login_form(html, base_url):
