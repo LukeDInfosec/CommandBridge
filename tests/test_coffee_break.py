@@ -498,6 +498,42 @@ def main():
             check(f"{text!r} is named", cb_issues.for_text(text)[0], expected)
         check("a line the library does not know is left alone",
               cb_issues.for_text("the quick brown fox")[0], None)
+
+        print("\n\033[1mAn anti-CSRF token is a defence, not a CSRF "
+              "finding\033[0m")
+        # Reported from a live scan: Nikto flagged an uncommon header
+        # 'x-csrf-token' and Coffee Break called it Confirmed CSRF. The
+        # presence of an anti-CSRF token is the countermeasure — the exact
+        # opposite of the vulnerability — so it must never map to csrf.
+        for present in (
+                "Uncommon header(s) 'x-csrf-token' found, with contents: AAgz",
+                "Uncommon header 'csrf-token' found",
+                "anti-CSRF token present in form",
+                "CSRF token found in response",
+                "__RequestVerificationToken hidden field found",
+                "csrfmiddlewaretoken present"):
+            check(f"token present is not CSRF: {present[:40]!r}",
+                  cb_issues.for_text(present)[0], None)
+        # But a token that is ABSENT is the real thing, and must still map.
+        for absent in (
+                "Form submits with no anti-CSRF token",
+                "Missing CSRF protection on state-changing request",
+                "CSRF token not present on the login form",
+                "Cross-Site Request Forgery possible in /transfer"):
+            check(f"absence IS CSRF: {absent[:40]!r}",
+                  cb_issues.for_text(absent)[0], "csrf")
+        # End to end through the Nikto parser: the reported line produces
+        # no CSRF finding.
+        csrf_fp = Engine(base)
+        csrf_fp._cb_parse_nikto(
+            {"key": "nikto"},
+            "+ [999100] /: Uncommon header(s) 'x-csrf-token' found, with "
+            "contents: AAgzKF93J9n18QjW/omCyeOf9DlhMj23H4FwvyKe.")
+        check("no CSRF finding comes from a token-present header line",
+              [f for f in csrf_fp._cb_findings if (f.key or "") == "csrf"], [])
+        check("   and nothing is reported as a Confirmed CSRF",
+              any((f.key or "") == "csrf" for f in csrf_fp._cb_findings),
+              False)
         check("a CVE template with no bug class falls back to the CVE entry",
               cb_issues.for_nuclei("CVE-2024-9999", "Some product flaw")[0],
               "known_cve")
@@ -3254,7 +3290,12 @@ back-end DBMS: MySQL >= 5.6
           "no longer considered secure" in body.lower(), False)
     check("the AEAD suites are shown as NOT part of the finding",
           "not part of this finding" in body)
-    check("key sizes are given", "256-bit AES" in body)
+    # The suite listing is names only — the key size and cipher are
+    # already in the IANA name, so the trailing "256-bit AES" was noise.
+    check("the suite names stand alone, without a redundant bit/cipher tag",
+          "256-bit AES" in body, False)
+    check("   but the suite name itself (which carries the key size) is kept",
+          "TLS_RSA_WITH_AES_256_CBC_SHA" in body)
 
     # ── 2. Weak ciphers separate problematic from AEAD ──────────────────
     print("\n\033[1m2 — weak ciphers: problematic vs AEAD\033[0m")

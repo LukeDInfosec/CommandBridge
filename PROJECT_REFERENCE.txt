@@ -19,6 +19,59 @@ HOW TO USE THIS FILE
  CHANGELOG (most recent first)
 ================================================================================
 
+## 2026-11-23 — CIPHER LISTINGS: NAMES ONLY (6.12.3)
+
+The suite listing under Lucky 13 / BEAST / weak-cipher findings appended
+"256-bit AES" to every row. That is redundant — the key size and the
+cipher are already in the IANA name (TLS_..._AES_256_CBC_SHA) — so it
+was noise in the one place a tester copies verbatim into a report.
+
+cipher_properties.listing() now defaults to names only:
+
+    TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA
+    TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384
+    TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA
+    TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384
+
+The note_bits=True argument still exists for any caller that genuinely
+needs the key size broken out; nothing currently does.
+
+CHANGED: modules/cipher_properties.py, tests/test_coffee_break.py
+
+## 2026-11-23 — AN ANTI-CSRF TOKEN IS NOT A CSRF FINDING (6.12.2)
+
+Reported from a live scan:
+
+    Cross-site request forgery   MEDIUM   Confirmed
+    [999100] /: Uncommon header(s) 'x-csrf-token' found, with contents: AAgz…
+
+Inverted logic. CSRF is the ABSENCE of protection on a state-changing
+request; an x-csrf-token header is the DEFENCE. cb_issues._TEXT_ISSUES
+mapped the bare letters "csrf" to the vulnerability, and "csrf" sits
+inside the header name, so Nikto reporting the token's PRESENCE became
+a Confirmed CSRF.
+
+Fix, in cb_issues.py:
+  * the csrf text rule now matches only ABSENCE wording (missing / no /
+    without / "not present" anti-CSRF token) or the full phrase
+    "cross-site request forgery" — never the bare token name;
+  * _indicates_csrf_defence() is the backstop: a line naming a token
+    that is PRESENT (x-csrf-token, csrfmiddlewaretoken,
+    __RequestVerificationToken, "CSRF token found", …) never maps to
+    csrf — unless a negation is in the line, which flips it back to the
+    genuine "token missing" case.
+  The reported Nikto line now falls through to an INFO observation, not
+  a finding. A passive header read cannot confirm CSRF, and the house
+  would rather miss it than invert it.
+
+Also folded in (delivered earlier as 6.12.2 but never reaching GitHub,
+which was still 6.12.1): removal of the ssrfmap and sstimap installers
+and their entries in core/status.py — their Web-tab cards went in
+6.10.4 and the operator has no use for cross-server tooling.
+
+CHANGED: modules/cb_issues.py, modules/install_tools.sh,
+         core/status.py, tests/test_coffee_break.py
+
 ## 2026-11-16 — TRAFFIC TRANSPARENCY: VERIFIED, AND HONEST ABOUT NMAP (6.12.1)
 
 The proxy/egress feature (added 6.10.0) was reported as missing. It is

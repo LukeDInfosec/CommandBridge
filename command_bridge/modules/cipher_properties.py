@@ -329,11 +329,17 @@ def with_weakness(suites, weakness):
     return [s for s in suites if weakness in s.weaknesses]
 
 
-def listing(suites, note_bits=True, indent="  "):
-    """Suites one per line, aligned, with what each one is.
+def listing(suites, note_bits=False, indent="  "):
+    """Suites one per line.
 
     Plain text with real newlines, so selecting it out of the findings
     pane and pasting it into a report gives what is on screen.
+
+    The suite NAME is the whole line by default. The trailing "256-bit
+    AES" the listing used to append was redundant — the key size and the
+    cipher are already in the IANA name (TLS_..._AES_256_CBC_SHA), so it
+    just added noise to every row. A caller that genuinely needs the key
+    size broken out can still pass note_bits=True.
     """
     suites = [s for s in suites if s]
     if not suites:

@@ -268,7 +268,7 @@ pipx_install() {
 #
 # For the handful of tools this app calls that have no apt package, no PyPI
 # release and no Go module — they are just a repo you clone and run a script
-# out of (Corsy, SSRFmap, SSTImap). The repo is cloned once into TOOLS_DIR and
+# out of (Corsy). The repo is cloned once into TOOLS_DIR and
 # a tiny wrapper goes into ~/.local/bin so the button's command can call the
 # tool by plain name (`corsy -u ...`) exactly like any packaged tool.
 git_script_install() {
@@ -513,20 +513,6 @@ _i_corsy() {
     git_script_install corsy https://github.com/s0md3v/Corsy.git corsy.py requests
 }
 
-_i_ssrfmap() {
-    git_script_install ssrfmap https://github.com/swisskyrepo/SSRFmap.git ssrfmap.py
-}
-
-# tplmap has been unmaintained for years, is Python 2 era and is in no
-# repository, so installing it would hand you a tool that cannot run.
-# SSTImap is the actively maintained Python 3 successor built on tplmap's
-# codebase and takes the same -u URL form, so that is what gets installed;
-# the SSTI button prefers it and still falls back to tplmap if you already
-# have a working copy.
-_i_sstimap() {
-    git_script_install sstimap https://github.com/vladko312/SSTImap.git sstimap.py
-}
-
 # ProjectDiscovery's httpx binary collides in name with an unrelated Python
 # "httpx" package, so Kali ships it as "httpx-toolkit" (this app already
 # calls it that in commands.py). If installed via `go install`, the binary
@@ -652,8 +638,6 @@ handle_tool "graphw00f"   graphw00f   _i_graphw00f
 handle_tool "nikto"       nikto       _i_nikto       -Version
 handle_tool "wafw00f"     wafw00f     _i_wafw00f
 handle_tool "corsy"       corsy       _i_corsy
-handle_tool "ssrfmap"     ssrfmap     _i_ssrfmap
-handle_tool "sstimap"     sstimap     _i_sstimap
 handle_tool "lfimap"      lfimap      _i_lfimap
 handle_tool "dotdotpwn"   dotdotpwn   _i_dotdotpwn
 hr

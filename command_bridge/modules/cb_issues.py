@@ -1372,7 +1372,20 @@ _TEXT_ISSUES = (
     (r"stored (xss|cross.site scripting)", "xss_stored"),
     (r"dom.based (xss|cross.site scripting)", "xss_dom"),
     (r"(xss|cross.site scripting)", "xss_reflected"),
-    (r"\bcsrf\b|cross.site request forgery", "csrf"),
+    # CSRF is the ABSENCE of protection on a state-changing request, so it
+    # is matched only on wording that says a defence is MISSING — never on
+    # the bare letters "csrf", which also appear in the NAME of the defence.
+    # Nikto's "Uncommon header 'x-csrf-token' found" reported a token being
+    # PRESENT (the opposite of the vulnerability) and the old `\bcsrf\b`
+    # pattern turned it into a Confirmed CSRF finding. A real CSRF cannot be
+    # confirmed from a passive header read anyway; the house would rather
+    # miss it than invert it. See _indicates_csrf_defence below, which is
+    # the backstop for any "csrf" match that is really a token sighting.
+    (r"\b(missing|no|absent|lacks?|lacking|without|disabled)\b[^.]{0,30}"
+     r"(anti.?csrf|csrf|xsrf)[^.]{0,20}(token|protection|header|defen[cs]e)?"
+     r"|(anti.?csrf|csrf|xsrf)[^.]{0,24}"
+     r"\b(missing|absent|not (present|set|found|implemented|used|enforced))\b"
+     r"|cross.site request forgery", "csrf"),
     (r"jwt.*(none|alg)|none algorithm", "jwt_none"),
     (r"jwt.*(weak|brute|secret)", "jwt_weak_secret"),
     (r"jwt.*(jku|x5u|jwk)", "jwt_key_injection"),
@@ -1440,6 +1453,45 @@ def _has_version(text):
     return bool(_VERSION_IN_TEXT.search(str(text or "")))
 
 
+#: A word that negates whatever follows — "no anti-CSRF token", "token not
+#: present". Its presence means the line describes a MISSING defence, i.e.
+#: the genuine vulnerability, so the defence guard must stand down.
+_CSRF_ABSENCE = re.compile(
+    r"\b(missing|absent|no|not|without|lacks?|lacking|disabled|"
+    r"unprotected)\b", re.I)
+
+#: The NAME of an anti-CSRF token, in its common framework spellings.
+_CSRF_TOKEN_NAME = re.compile(
+    r"\b(x-?csrf-?token|csrf-?token|xsrf-?token|x-?xsrf-?token|"
+    r"__requestverificationtoken|anti.?csrf|_csrf|csrfmiddlewaretoken|"
+    r"authenticity_token|csrf[_-]?param)\b", re.I)
+
+#: Words that say a thing is present.
+_CSRF_PRESENT = re.compile(
+    r"\b(found|present|set|detected|observed|seen|returned|exists|"
+    r"enabled|contains)\b", re.I)
+
+
+def _indicates_csrf_defence(text):
+    """True when the text shows an anti-CSRF token/defence is PRESENT.
+
+    The distinction the CSRF false positive turned on: a token that EXISTS
+    is a countermeasure, not the vulnerability — Nikto's "Uncommon header
+    'x-csrf-token' found" is exactly this. But "no anti-CSRF token" names
+    the same token while reporting its ABSENCE, which IS the vulnerability,
+    so a negation anywhere in the line stands the guard down.
+    """
+    blob = str(text or "")
+    if _CSRF_ABSENCE.search(blob):
+        return False
+    if _CSRF_TOKEN_NAME.search(blob):
+        return True
+    if re.search(r"csrf[^.]{0,20}token", blob, re.I) and \
+            _CSRF_PRESENT.search(blob):
+        return True
+    return False
+
+
 def for_text(text, default=None):
     """Map a tool's own wording onto a library entry.
 
@@ -1456,6 +1508,12 @@ def for_text(text, default=None):
             # header cannot tell the two apart, so the text decides.
             if key == "version_disclosure" and not _has_version(blob):
                 key = "software_disclosed"
+            # A line that names a CSRF token being PRESENT describes the
+            # defence, not the vulnerability — the backstop for any csrf
+            # match that is really a token sighting. An anti-CSRF token is
+            # a good sign; it is not a finding, so it is dropped here.
+            if key == "csrf" and _indicates_csrf_defence(blob):
+                return None, None
             return key, ISSUES[key]
     if default and default in ISSUES:
         return default, ISSUES[default]
