@@ -47,7 +47,7 @@ class EnhancedConsole(QTextEdit):
     # Sensible defaults so the widget is usable before a theme is applied.
     _DEFAULT_COLORS = {
         "ok": "#22c55e",        # 200 / open / safe / low severity
-        "redirect": "#facc15",  # 3xx
+        "redirect": "#f59e0b",  # 3xx (orange)
         "client": "#f97316",    # 4xx / medium severity
         "server": "#ef4444",    # 5xx / high severity / dangerous
         "info": "#38bdf8",      # informational headers
@@ -96,6 +96,43 @@ class EnhancedConsole(QTextEdit):
         if code.startswith("4"):
             return self._colors["client"]
         return self._colors["server"]
+
+    #: A URL anywhere on the clicked line — used so a double-click grabs the
+    #: whole endpoint, not just the word under the cursor. Qt's default
+    #: double-click stops at punctuation, so "https://host/a-b/c" comes out
+    #: as a fragment; an operator wants the full thing to paste in a browser.
+    _URL_IN_LINE = re.compile(r'https?://[^\s<>"\']+')
+
+    def mouseDoubleClickEvent(self, event):
+        """Select the whole URL on the double-clicked line, if there is one."""
+        try:
+            cursor = self.cursorForPosition(event.pos())
+            cursor.select(QtGui.QTextCursor.SelectionType.BlockUnderCursor)
+            block_text = cursor.selectedText()
+            # Where in the block did the click land?
+            click_cursor = self.cursorForPosition(event.pos())
+            click_cursor.select(QtGui.QTextCursor.SelectionType.LineUnderCursor)
+            line_text = click_cursor.selectedText()
+            matches = list(self._URL_IN_LINE.finditer(line_text))
+            if matches:
+                line_cursor = self.cursorForPosition(event.pos())
+                line_start = line_cursor.block().position()
+                click_pos = self.cursorForPosition(event.pos()).position()
+                col = click_pos - line_start
+                # Prefer a URL the click actually landed on; else the first.
+                chosen = next(
+                    (m for m in matches if m.start() <= col <= m.end()),
+                    matches[0],
+                )
+                sel = self.textCursor()
+                sel.setPosition(line_start + chosen.start())
+                sel.setPosition(line_start + chosen.end(),
+                                QtGui.QTextCursor.MoveMode.KeepAnchor)
+                self.setTextCursor(sel)
+                return
+        except Exception:
+            pass
+        super().mouseDoubleClickEvent(event)
 
     def _on_scrollbar_value_changed(self, value: int):
         sb = self.verticalScrollBar()
@@ -294,6 +331,10 @@ class EnhancedConsole(QTextEdit):
         url_status_pattern = re.compile(
             r'^(https?://\S+)\s+\(Status:\s*(\d+)\)(.*)',
         )
+        # SmartFuzz: "[200]  https://host/path" — a bracketed status then the
+        # full URL. Nothing coloured these before, so SmartFuzz results came
+        # out as plain text while every other tool's did not.
+        smartfuzz_pattern = re.compile(r'^\[(\d{3})\]\s+(https?://\S+)\s*$')
 
         dirsearch_progress_pattern = re.compile(r'^\[[\s\=\-\>\|#]+\]\s*\d+%')
         dirsearch_target_pattern = re.compile(r'^Target:\s+(https?://\S+)', re.IGNORECASE)
@@ -407,6 +448,18 @@ class EnhancedConsole(QTextEdit):
                 escaped = _keep_spacing(html.escape(line.expandtabs(4)))
                 formatted_lines.append(
                     f'<span style="color: {self._colors["ok"]};">{escaped}</span><br>'
+                )
+                changed = True
+                continue
+
+            sf_m = smartfuzz_pattern.match(stripped)
+            if sf_m:
+                status_code = sf_m.group(1)
+                url = sf_m.group(2)
+                c = self._status_color(status_code)
+                formatted_lines.append(
+                    f'<span style="color: {c}; font-weight: bold;">[{status_code}]</span> '
+                    f'<span style="color: {c};">{html.escape(url)}</span><br>'
                 )
                 changed = True
                 continue
