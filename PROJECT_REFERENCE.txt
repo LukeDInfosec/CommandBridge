@@ -1,7 +1,7 @@
 ================================================================================
  COMMAND BRIDGE v4 — PROJECT REFERENCE & CHANGELOG
  (Reference doc for Claude / future sessions. Keep this updated after changes.)
- Last updated: 2026-11-16
+ Last updated: 2026-11-26
 ================================================================================
 
 HOW TO USE THIS FILE
@@ -18,6 +18,38 @@ HOW TO USE THIS FILE
 ================================================================================
  CHANGELOG (most recent first)
 ================================================================================
+
+## 2026-11-26 — SMARTFUZZ DUAL DEEP SCAN + CONSOLE COLOUR/URL SELECT (6.12.7)
+
+Three fixes from a live Umbraco-on-IIS scan:
+
+1. Dual deep scan. The Server header named Microsoft-IIS and the
+   discovered paths inferred Umbraco; the old code overwrote the header
+   guess with the inferred CMS and ran ONE deep scan, so IIS (the .NET
+   server surface — web.config, trace.axd, aspnet_client) was never
+   fuzzed. smartfuzz.py run() now keeps header_tech alongside the
+   inferred detected_tech and runs a Phase 2 deep scan for BOTH,
+   inferred-first, de-duplicated (scan_order). New _deep_scan(tech)
+   helper returns False only when no wordlist exists anywhere; a single
+   broad fallback runs at most once across all techs. _print_summary now
+   prints "UMBRACO on IIS" when the two differ.
+
+2. Console colouring for SmartFuzz output. console.py
+   _apply_feroxbuster_colors had no pattern for SmartFuzz's "[200]  URL"
+   lines, so they rendered plain. Added smartfuzz_pattern +
+   _status_color handler: 2xx green, 3xx orange, 4xx orange-red, 5xx
+   red. The 3xx "redirect" default moved #facc15 (yellow) → #f59e0b
+   (orange) per request, kept distinct from 4xx #f97316.
+
+3. Double-click to select a whole endpoint URL. New
+   EnhancedConsole.mouseDoubleClickEvent selects the full http(s) URL on
+   the clicked line (Qt's default stops at punctuation) so an operator
+   can double-click a 200 OK line and paste the endpoint straight into a
+   browser.
+
+Tests: test_smartfuzz.py now 34 passing (added dual-scan order, IIS
+signature, "UMBRACO on IIS" summary). GUI smoke 377, coffee-break 920,
+coffee-chain 13 all green.
 
 ## 2026-11-26 — SMARTFUZZ: CASE-INSENSITIVE WORDLIST MATCH (6.12.6)
 

@@ -487,6 +487,8 @@ class SmartFuzz:
         print(sep)
 
         detected_tech, server_str = self.detect_from_headers()
+        header_tech = detected_tech     # kept: the server is still the server
+                                        # even after the paths name a CMS on it
 
         if detected_tech:
             print(
@@ -539,55 +541,85 @@ class SmartFuzz:
         elif not detected_tech:
             print(f"\n  {C.YELLOW}[!] No endpoints found in generic scan{C.END}")
 
-        # ── Phase 2: Technology-specific deep scan ─────────────────────────────
-        if detected_tech:
+        # ── Phase 2: Technology-specific deep scan(s) ─────────────────────────
+        #
+        # Both the thing the PATHS inferred and the thing the HEADERS named get
+        # a deep scan, because they are different and both matter: a target can
+        # be an Umbraco SITE (inferred from /umbraco) running on an IIS SERVER
+        # (from the Server header), and the IIS wordlist finds .NET surface
+        # (web.config, trace.axd, aspnet_client) that a CMS list does not. The
+        # old code overwrote the header guess with the inferred one and ran a
+        # single scan, so the IIS pass never happened.
+        #
+        # Inferred first (more specific), header second, de-duplicated. A
+        # fallback broad scan runs only once, and only if a deep scan was
+        # wanted but no wordlist for it existed anywhere.
+        scan_order = [t for t in (detected_tech, header_tech) if t]
+        done, want_fallback = set(), False
+        for tech in scan_order:
+            if tech in done:
+                continue
+            done.add(tech)
             print(sep)
-            print(f"{C.BOLD}  PHASE 2 — Adaptive Deep Scan  [{detected_tech.upper()}]{C.END}")
+            print(f"{C.BOLD}  PHASE 2 — Adaptive Deep Scan  "
+                  f"[{tech.upper()}]{C.END}")
             print(sep)
+            if self._deep_scan(tech) is False:
+                want_fallback = True
 
-            wordlist, tried = self._resolve_wordlist(detected_tech)
-
-            if wordlist and wordlist not in self.scanned_with:
-                where = ("bundled with Command Bridge"
-                         if str(_BUNDLED) in wordlist else "found on this system")
-                print(f"  {C.GREEN}[✓] Using {detected_tech.upper()} "
-                      f"wordlist ({where}): {Path(wordlist).name}{C.END}")
-                self._run_ffuf(
-                    wordlist,
-                    f"{detected_tech.upper()}-specific deep scan",
-                    stop_on_detect=False,
-                )
-                self.scanned_with.add(wordlist)
-            elif wordlist in self.scanned_with:
-                print(f"  {C.CYAN}[*] {detected_tech.upper()} wordlist already "
-                      f"run in an earlier phase — not repeating it.{C.END}")
-            else:
-                # No tech-specific list exists anywhere we looked. Say where
-                # we looked, so the operator can drop one in, then fall back.
-                print(f"\n  {C.YELLOW}[!] No {detected_tech.upper()} wordlist "
-                      f"found. Looked in:{C.END}")
-                for cand in tried:
-                    print(f"        {cand}")
-                print(f"  {C.YELLOW}    Add one at any of those paths (or "
-                      f"{_BUNDLED}/{detected_tech}.txt) for a specialised "
-                      f"scan next time.{C.END}")
-                fallback = FALLBACK_WORDLIST
-                if fallback not in self.scanned_with and Path(fallback).exists():
-                    print(f"  {C.CYAN}[*] Falling back to a broad scan: "
-                          f"{Path(fallback).name}{C.END}")
-                    self._run_ffuf(fallback, "Broad fallback scan", stop_on_detect=False)
-                    self.scanned_with.add(fallback)
+        if want_fallback:
+            fallback = FALLBACK_WORDLIST
+            if fallback not in self.scanned_with and Path(fallback).exists():
+                print(f"  {C.CYAN}[*] Falling back to a broad scan: "
+                      f"{Path(fallback).name}{C.END}")
+                self._run_ffuf(fallback, "Broad fallback scan",
+                               stop_on_detect=False)
+                self.scanned_with.add(fallback)
 
         # ── Summary ────────────────────────────────────────────────────────────
-        self._print_summary(detected_tech)
+        self._print_summary(detected_tech, header_tech)
 
-    def _print_summary(self, detected_tech):
+    def _deep_scan(self, tech: str):
+        """Run one technology's deep scan. Returns False if no wordlist exists.
+
+        A False return tells run() a broad fallback is wanted — but only once,
+        however many techs come up empty.
+        """
+        wordlist, tried = self._resolve_wordlist(tech)
+        if wordlist and wordlist not in self.scanned_with:
+            where = ("bundled with Command Bridge"
+                     if str(_BUNDLED) in wordlist else "found on this system")
+            print(f"  {C.GREEN}[✓] Using {tech.upper()} wordlist "
+                  f"({where}): {Path(wordlist).name}{C.END}")
+            self._run_ffuf(wordlist, f"{tech.upper()}-specific deep scan",
+                           stop_on_detect=False)
+            self.scanned_with.add(wordlist)
+            return True
+        if wordlist in self.scanned_with:
+            print(f"  {C.CYAN}[*] {tech.upper()} wordlist already run in an "
+                  f"earlier phase — not repeating it.{C.END}")
+            return True
+        print(f"\n  {C.YELLOW}[!] No {tech.upper()} wordlist found. "
+              f"Looked in:{C.END}")
+        for cand in tried:
+            print(f"        {cand}")
+        print(f"  {C.YELLOW}    Add one at any of those paths (or "
+              f"{_BUNDLED}/{tech}.txt) for a specialised scan next time.{C.END}")
+        return False
+
+    def _print_summary(self, detected_tech, header_tech=None):
         sep = f"{C.GREEN}{'═' * 68}{C.END}"
+        # Name both when they differ — "UMBRACO on IIS" is the useful line.
+        if detected_tech and header_tech and detected_tech != header_tech:
+            tech_line = f"{detected_tech.upper()} on {header_tech.upper()}"
+        else:
+            tech_line = (detected_tech or header_tech or "Unknown")
+            tech_line = tech_line.upper() if tech_line != "Unknown" else tech_line
         print(f"\n{sep}")
         print(f"{C.BOLD}  SCAN COMPLETE{C.END}")
         print(sep)
         print(f"  {C.BOLD}Total endpoints found  :{C.END}  {len(self.discovered_paths)}")
-        print(f"  {C.BOLD}Technology detected    :{C.END}  {detected_tech.upper() if detected_tech else 'Unknown'}")
+        print(f"  {C.BOLD}Technology detected    :{C.END}  {tech_line}")
         print(f"  {C.BOLD}Wordlists used         :{C.END}  {len(self.scanned_with)}")
         print(f"{sep}\n")
 

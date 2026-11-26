@@ -156,6 +156,52 @@ def main():
         sf.SIGNATURES["umbraco"]["wordlist"], \
             sf.SIGNATURES["umbraco"]["wordlists"] = saved
 
+    print("\n\033[1mBoth the header server AND the inferred CMS get a deep scan\033[0m")
+    # The reported failure: /umbraco on a Microsoft-IIS server ran an Umbraco
+    # deep scan and NO IIS scan — the header fingerprint was thrown away once
+    # the paths named a CMS. Both must be scanned, de-duplicated, order
+    # inferred-first.
+    check("IIS is in the signature table", "iis" in sf.SIGNATURES)
+    check("   and matches the Microsoft-IIS server header",
+          any("microsoft-iis" in h.lower()
+              for h in sf.SIGNATURES["iis"].get("headers", [])))
+    check("   with its own wordlist candidates",
+          len(sf.SIGNATURES["iis"].get("wordlists", [])) >= 1)
+
+    def scan_order(detected, header):
+        order = [t for t in (detected, header) if t]
+        seen, out = set(), []
+        for t in order:
+            if t not in seen:
+                seen.add(t)
+                out.append(t)
+        return out
+
+    check("Umbraco (inferred) on IIS (header) scans both, inferred first",
+          scan_order("umbraco", "iis"), ["umbraco", "iis"])
+    check("   when header and inference agree, the tech is scanned once",
+          scan_order("iis", "iis"), ["iis"])
+    check("   a header-only hit (nothing inferred) still scans it",
+          scan_order("iis", "iis"), ["iis"])
+
+    import io
+    import contextlib
+
+    def summary_for(detected, header):
+        s = _Stub()
+        s.discovered_paths = []
+        s.scanned_with = set()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            s._print_summary(detected, header)
+        return buf.getvalue()
+
+    check("the summary names both: 'UMBRACO on IIS'",
+          "UMBRACO on IIS" in summary_for("umbraco", "iis"))
+    same = summary_for("iis", "iis")
+    check("   and names it once when they are the same",
+          "IIS on IIS" not in same and "IIS" in same)
+
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 
