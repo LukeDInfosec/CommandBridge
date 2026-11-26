@@ -6,6 +6,7 @@ exercise the real request path — redirect handling, header parsing, traversal
 payloads, bypass tricks — without touching anybody's infrastructure.
 """
 
+import datetime
 import json
 import re
 import sys
@@ -26,7 +27,7 @@ from command_bridge.modules import cb_issues                 # noqa: E402
 from command_bridge.modules.cb_evidence import Evidence      # noqa: E402
 from command_bridge.modules.coffee_break import (          # noqa: E402
     CBFinding, SEVERITIES, SEV_ORDER, CoffeeBreakMixin, finding_from_scan,
-    _session,
+    _session, _same_location,
     probe_headers, probe_redirects, probe_traversal, probe_403_bypass,
     BYPASS_TRICKS, TRAVERSAL_PAYLOADS,
 )
@@ -317,12 +318,59 @@ def main():
                 "6379/tcp open  redis   Redis 7.0\n"
                 "23/tcp   open  telnet\n")
         produced = engine._cb_parse_nmap({"key": "nmap_quick"}, nmap)
-        check("risky services are reported", produced, 2)
+        # Two risky services, plus the infrastructure observation the
+        # banners now produce — counted by key rather than by total, so
+        # this assertion keeps saying what it means.
+        # Telnet, Redis and SSH. SSH is here too now — the tester asked
+        # for it: an open SSH port with a version banner is something
+        # they would flag, and the old table reported nothing for it.
+        check("risky services are reported",
+              sorted(f.key for f in engine._cb_findings
+                     if f.key in ("exposed_datastore", "cleartext_service",
+                                  "remote_access_exposed")),
+              ["cleartext_service", "exposed_datastore",
+               "remote_access_exposed"])
+        check("telnet is High wherever it runs",
+              [f.severity for f in engine._cb_findings
+               if f.key == "cleartext_service"][0], "HIGH")
+        check("SSH with no known reachability is rated as internal",
+              [f.severity for f in engine._cb_findings
+               if f.key == "remote_access_exposed"][0], "INFO")
+        # And when reachability genuinely cannot be decided, the finding
+        # says which assumption it made rather than quietly picking the
+        # flattering one. Asserted on the assessment directly, because
+        # whether a name resolves depends on the machine running this.
+        from command_bridge.modules import port_risk as _pr
+        unknown = _pr.assess(22, "tcp", "ssh", "OpenSSH 8.9", public=None)
+        check("an undecidable host is rated as internal",
+              unknown.severity, "INFO")
+        check("   and says so, with what the public rating would be",
+              "rated as an internal exposure" in " ".join(unknown.notes)
+              and "MEDIUM" in " ".join(unknown.notes))
+        check("four open ports is not yet excessive",
+              any(f.key == "excessive_ports" for f in engine._cb_findings),
+              False)
+        # Every open port is now assessed, not only the ones in a short
+        # table, so the count is ports + version banners + the
+        # infrastructure observation rather than "the risky two".
+        check("every open port produced a finding",
+              len([f for f in engine._cb_findings
+                   if (f.variant or "").count("/") == 1
+                   and not f.variant.startswith("version-")]), 4)
+        check("and each version banner one of its own",
+              len([f for f in engine._cb_findings
+                   if (f.variant or "").startswith("version-")]), 3)
         check("every open port is banked",
               len(engine._cb_artifacts["open_ports"]), 4)
-        check("redis is high",
+        # By KEY, not by a word in the title: the version banner now
+        # produces its own finding whose title also says "redis", and
+        # that one is correctly Low.
+        check("redis exposure is serious",
               [f.severity for f in engine._cb_findings
-               if "redis" in f.title][0], "HIGH")
+               if f.key == "exposed_datastore"][0], "CRITICAL")
+        check("   while its version banner is reported separately, and low",
+              [f.severity for f in engine._cb_findings
+               if (f.variant or "") == "version-6379/tcp"][0], "LOW")
 
         engine = Engine(base)
         nuclei = "\n".join(json.dumps(row) for row in [
@@ -386,9 +434,16 @@ def main():
                  "+ OSVDB-3233: /icons/README: Apache default file found.\n")
         produced = engine._cb_parse_nikto({"key": "nikto"}, nikto)
         check("banner lines are not counted as findings", produced, 2)
+        # "Server: nginx" names the software and no release, so it is
+        # software identification rather than a version leak — the
+        # distinction that stopped "server: cloudflare" being reported
+        # as a disclosed VERSION.
         check("the server banner is kept as information, not a finding",
               [f.severity for f in engine._cb_findings
-               if f.key == "version_disclosure"], ["INFO"])
+               if f.key == "software_disclosed"], ["INFO"])
+        check("   and is not called a version disclosure",
+              any(f.key == "version_disclosure"
+                  for f in engine._cb_findings), False)
         # Nikto pattern-matches; it does not reproduce anything. On the
         # evidence scale that is a long way from confirmed, whatever Nikto
         # itself says.
@@ -408,11 +463,22 @@ def main():
               [])
         check("every entry explains itself",
               [k for k, i in library.items() if len(i["detail"]) < 40], [])
-        check("every entry says how to fix it",
-              [k for k, i in library.items() if len(i["remediation"]) < 15], [])
-        check("every entry carries a classification",
+        # Observation keys are exempt from both, and the exemption is
+        # declared in the library itself (cb_issues.OBSERVATION_KEYS).
+        # They exist so a finding can say what was SEEN without
+        # borrowing a vulnerability class; there is nothing to fix and
+        # nothing to classify because no weakness is claimed.
+        observations = cb_issues.OBSERVATION_KEYS
+        check("every issue entry says how to fix it",
               [k for k, i in library.items()
-               if not str(i["cwe"]).startswith("CWE-")], [])
+               if k not in observations and len(i["remediation"]) < 15], [])
+        check("every issue entry carries a classification",
+              [k for k, i in library.items()
+               if k not in observations
+               and not str(i["cwe"]).startswith("CWE-")], [])
+        check("and the observation keys really are observations",
+              [k for k in observations
+               if library[k]["severity"] != "INFO"], [])
         check("no two entries share a title",
               len({i["title"] for i in library.values()}), len(library))
 
@@ -432,6 +498,42 @@ def main():
             check(f"{text!r} is named", cb_issues.for_text(text)[0], expected)
         check("a line the library does not know is left alone",
               cb_issues.for_text("the quick brown fox")[0], None)
+
+        print("\n\033[1mAn anti-CSRF token is a defence, not a CSRF "
+              "finding\033[0m")
+        # Reported from a live scan: Nikto flagged an uncommon header
+        # 'x-csrf-token' and Coffee Break called it Confirmed CSRF. The
+        # presence of an anti-CSRF token is the countermeasure — the exact
+        # opposite of the vulnerability — so it must never map to csrf.
+        for present in (
+                "Uncommon header(s) 'x-csrf-token' found, with contents: AAgz",
+                "Uncommon header 'csrf-token' found",
+                "anti-CSRF token present in form",
+                "CSRF token found in response",
+                "__RequestVerificationToken hidden field found",
+                "csrfmiddlewaretoken present"):
+            check(f"token present is not CSRF: {present[:40]!r}",
+                  cb_issues.for_text(present)[0], None)
+        # But a token that is ABSENT is the real thing, and must still map.
+        for absent in (
+                "Form submits with no anti-CSRF token",
+                "Missing CSRF protection on state-changing request",
+                "CSRF token not present on the login form",
+                "Cross-Site Request Forgery possible in /transfer"):
+            check(f"absence IS CSRF: {absent[:40]!r}",
+                  cb_issues.for_text(absent)[0], "csrf")
+        # End to end through the Nikto parser: the reported line produces
+        # no CSRF finding.
+        csrf_fp = Engine(base)
+        csrf_fp._cb_parse_nikto(
+            {"key": "nikto"},
+            "+ [999100] /: Uncommon header(s) 'x-csrf-token' found, with "
+            "contents: AAgzKF93J9n18QjW/omCyeOf9DlhMj23H4FwvyKe.")
+        check("no CSRF finding comes from a token-present header line",
+              [f for f in csrf_fp._cb_findings if (f.key or "") == "csrf"], [])
+        check("   and nothing is reported as a Confirmed CSRF",
+              any((f.key or "") == "csrf" for f in csrf_fp._cb_findings),
+              False)
         check("a CVE template with no bug class falls back to the CVE entry",
               cb_issues.for_nuclei("CVE-2024-9999", "Some product flaw")[0],
               "known_cve")
@@ -443,6 +545,403 @@ def main():
                cb_issues.NMAP_SERVICES.get("ms-wbt-server")),
               ("exposed_datastore", "cleartext_service",
                "remote_access_exposed"))
+
+        print("\n\033[1mIdentification is not a version leak\033[0m")
+        # "Software version disclosed" whose evidence was
+        # "server: cloudflare". No version was disclosed — the pattern
+        # that catches a Server header could not tell the two apart.
+        check("a Server header with no release is software identification",
+              cb_issues.for_text("server: cloudflare")[0],
+              "software_disclosed")
+        check("   rated Informational",
+              cb_issues.ISSUES["software_disclosed"]["severity"], "INFO")
+        check("   and titled as identification, not as a version leak",
+              "version" in
+              cb_issues.ISSUES["software_disclosed"]["title"].lower(), False)
+        check("a Server header WITH a release still is a version leak",
+              cb_issues.for_text("Server: nginx 1.18.0")[0],
+              "version_disclosure")
+        check("   as is an x-powered-by carrying one",
+              cb_issues.for_text(
+                  "Retrieved x-powered-by header: PHP/8.1.2")[0],
+              "version_disclosure")
+
+        print("\n\033[1mOne product, one row\033[0m")
+        # "server: cloudflare" and "Cloudflare detected via cf-ray
+        # header" are one fact reported twice.
+        dupe = Engine(base)
+        first = dupe._cb_issue("software_disclosed", base,
+                               "server: cloudflare", "nikto")
+        dupe._cb_record(first)
+        second = dupe._cb_issue("software_disclosed", base,
+                                "Cloudflare detected via cf-ray header",
+                                "nuclei")
+        dupe._cb_record(second)
+        identified = [f for f in dupe._cb_findings
+                      if f.key == "software_disclosed"]
+        check("the same product is not reported twice", len(identified), 1)
+        check("   and the second sighting's wording is kept",
+              "cf-ray" in identified[0].evidence)
+        check("   with both tools credited",
+              sorted(identified[0].sources), ["nikto", "nuclei"])
+        # A different product is a different finding.
+        dupe._cb_record(dupe._cb_issue("software_disclosed", base,
+                                       "server: nginx", "nikto"))
+        check("a different product still gets its own row",
+              len([f for f in dupe._cb_findings
+                   if f.key == "software_disclosed"]), 2)
+
+        print("\n\033[1mNamed findings, and the scanner's own "
+              "complaints\033[0m")
+        check("a wildcard certificate is a named finding",
+              cb_issues.for_text(
+                  "Server is using a wildcard certificate: *.example.com")[0],
+              "wildcard_certificate")
+        check("   titled the way the house words it",
+              cb_issues.ISSUES["wildcard_certificate"]["title"],
+              "Wildcard certificate in use")
+        # The scanner telling us ITS scan failed is not a finding about
+        # the client. These were going into the findings list.
+        for line in (
+                "ERROR: *** Error limit (20) reached for host, giving up. "
+                "Last error: opening stream: ssl connect failed. ***",
+                "ERROR: *** Consider using mitmproxy to avoid TLS "
+                "fingerprinting. ***",
+                "+ ERROR: Cannot resolve hostname",
+                "+ Connection timed out"):
+            check(f"'{line[:38]}…' is the scan talking about itself",
+                  cb_issues.is_statement(line))
+        errors = Engine(base)
+        errors._cb_parse_nikto({"key": "nikto"}, "\n".join([
+            "+ ERROR: *** Error limit (20) reached for host, giving up. ***",
+            "+ ERROR: *** Consider using mitmproxy to avoid TLS "
+            "fingerprinting. ***",
+        ]))
+        check("so no finding is produced from them",
+              len(errors._cb_findings), 0)
+
+        print("\n\033[1mrobots.txt: the contents, not an instruction to "
+              "go and look\033[0m")
+        # "contains 27 entries which should be manually viewed" is the
+        # scanner telling the operator to do the work. The entries were
+        # already fetched to decide whether this was worth reporting.
+        robots = Engine(base)
+        robots._cb_artifacts["robots_checked"] = True
+        robots._cb_artifacts["robots_entries"] = [
+            "Disallow: /admin/", "Disallow: /backup/",
+            "Disallow: /internal-api/", "Allow: /public/"]
+        robots._cb_parse_nikto({"key": "nikto"}, (
+            "+ /robots.txt: contains 27 entries which should be manually "
+            "viewed. See: https://developer.mozilla.org/"))
+        found_robots = [f for f in robots._cb_findings
+                        if f.key == "robots_disclosure"]
+        check("the finding is produced", len(found_robots), 1)
+        entry_text = found_robots[0].summary + found_robots[0].evidence
+        check("   and lists the actual entries",
+              all(path in entry_text for path in
+                  ("/admin/", "/backup/", "/internal-api/")))
+        check("   counted from the file, not from nikto's sentence",
+              "4 path rule(s)" in found_robots[0].summary)
+        check("   and does not tell the reader to go and view it manually",
+              "manually viewed" in found_robots[0].summary, False)
+        check("   while saying what the file is and is not",
+              "not an access control" in found_robots[0].summary)
+
+        print("\n\033[1mEvery open port is judged, not just a listed "
+              "few\033[0m")
+        # The ask: Coffee Break's first stage is nmap, and a chain of
+        # standard checks that runs the checks and reports nothing is
+        # worse than no chain. SSH open with a version banner, FTP, an
+        # admin console — all produced nothing before this.
+        from command_bridge.modules import port_risk
+        public = Engine(base)
+        PUBLIC_OUT = "\n".join([
+            "Nmap scan report for host.example.io (93.184.216.34)",
+            "21/tcp    open  ftp           vsftpd 3.0.3",
+            "22/tcp    open  ssh           OpenSSH 8.9p1 Ubuntu",
+            "23/tcp    open  telnet",
+            "80/tcp    open  http          nginx 1.18.0 (Ubuntu)",
+            "445/tcp   open  microsoft-ds",
+            "2375/tcp  open  docker",
+            "3389/tcp  open  ms-wbt-server",
+            "6379/tcp  open  redis         Redis key-value store 5.0.7",
+            "11211/tcp open  memcached",
+            "9999/tcp  open  unknown-thing",
+        ])
+        public._cb_parse_nmap({"key": "nmap"}, PUBLIC_OUT)
+        by_port = {f.variant: f for f in public._cb_findings if f.variant}
+        check("the public address is recognised as public",
+              port_risk.is_public_address("93.184.216.34"))
+        check("   and an RFC1918 one is not",
+              port_risk.is_public_address("10.0.0.5"), False)
+        check("   and an unresolvable one is unknown, not assumed",
+              port_risk.is_public_address("not-an-address"), None)
+        for port, expected in (("21/tcp", "HIGH"), ("22/tcp", "MEDIUM"),
+                               ("23/tcp", "HIGH"), ("445/tcp", "CRITICAL"),
+                               ("3389/tcp", "HIGH"),
+                               ("6379/tcp", "CRITICAL"),
+                               ("11211/tcp", "CRITICAL")):
+            check(f"{port} on a public host is {expected}",
+                  by_port[port].severity, expected)
+        print("\n\033[1mA guessed service is confirmed before it is "
+              "stated\033[0m")
+        # Reported from a live engagement: "Jenkins reachable from the
+        # internet on 8080" at CRITICAL, with no endpoint, no status
+        # code and no evidence — nmap had guessed from the port number.
+        # That is a finding that has to be withdrawn in front of a
+        # client, so the identification is probed first.
+        docker = by_port["2375/tcp"]
+        check("an unconfirmed admin/API service is capped",
+              docker.severity, "MEDIUM")
+        check("   and says plainly that it is not confirmed",
+              "NOT CONFIRMED" in docker.summary)
+        check("   with the title saying nmap reported it, not that it is so",
+              "not confirmed" in docker.title)
+        check("   it names what would settle it",
+              "request the port directly" in docker.summary)
+        check("   and what the rating would be if it were confirmed",
+              "CRITICAL" in docker.summary)
+        check("   reported as Potential, not Confirmed",
+              docker.status_label, "Potential")
+        check("the categories that need confirming are the guessable ones",
+              sorted(port_risk.NEEDS_CONFIRMATION),
+              sorted({port_risk.ADMIN_SERVICE, port_risk.MANAGEMENT,
+                      port_risk.ORCHESTRATION, port_risk.BROKER,
+                      port_risk.MONITORING}))
+        check("a service with a real version banner is not 'guessed'",
+              port_risk.needs_confirmation(
+                  port_risk.assess(8080, "tcp", "jenkins",
+                                   "Jetty 9.4.43.v20210629")), False)
+        check("   but one named from the port alone is",
+              port_risk.needs_confirmation(
+                  port_risk.assess(8080, "tcp", "jenkins", "")))
+        check("a datastore is NOT held back — nothing is guessed about it",
+              by_port["6379/tcp"].status_label, "Confirmed")
+
+        # And when the service IS what nmap said, the probe confirms it
+        # and the full rating stands — the guard must not bury real
+        # findings.
+        class _Jenkins(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = (b"<html><head><title>Dashboard [Jenkins]</title>"
+                        b"</head><body>Welcome to Jenkins!</body></html>")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("X-Jenkins", "2.414.1")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        jenkins_srv = ThreadingHTTPServer(("127.0.0.1", 0), _Jenkins)
+        threading.Thread(target=jenkins_srv.serve_forever,
+                         daemon=True).start()
+        jenkins_base = f"http://127.0.0.1:{jenkins_srv.server_address[1]}"
+        jenkins_port = urllib.parse.urlparse(jenkins_base).port
+        real = Engine(jenkins_base)
+        real._cb_parse_nmap({"key": "nmap"}, "\n".join([
+            f"Nmap scan report for 127.0.0.1",
+            f"{jenkins_port}/tcp open  jenkins"]))
+        confirmed = next(f for f in real._cb_findings
+                         if f.key == "admin_service_exposed")
+        check("a service the probe recognises IS confirmed",
+              confirmed.status_label, "Confirmed")
+        # HIGH, not CRITICAL: the test server is on loopback, so this
+        # is an internal exposure — which is the reachability rule
+        # working, not the confirmation cap. The cap would have made it
+        # MEDIUM.
+        check("   keeps the full rating for where it is",
+              confirmed.severity, "HIGH")
+        check("   and is not capped as unconfirmed",
+              "NOT CONFIRMED" in confirmed.summary, False)
+        check("   and carries the request as evidence",
+              "HTTP 200" in confirmed.evidence)
+        check("   naming what identified it",
+              "jenkins" in confirmed.summary.lower())
+        check("   with the page title, which is what a tester screenshots",
+              "Jenkins" in confirmed.evidence)
+        jenkins_srv.shutdown()
+
+        check("SSH is flagged at all, which it was not before",
+              "22/tcp" in by_port)
+        check("   and the finding says the exposure is the issue, not a bug "
+              "in sshd",
+              "makes no claim about a vulnerability in the service" in
+              by_port["22/tcp"].summary)
+        check("   with the fix a tester would recommend",
+              "VPN" in by_port["22/tcp"].summary)
+        check("a web port is recorded but not alarming",
+              by_port["80/tcp"].severity, "INFO")
+        check("an unrecognised service is recorded, not guessed at",
+              by_port["9999/tcp"].severity, "INFO")
+        check("   and says plainly that it was not recognised",
+              "does not recognise the service" in
+              by_port["9999/tcp"].summary)
+
+        print("\n\033[1mThe same ports on an internal host read "
+              "differently\033[0m")
+        internal = Engine(base)
+        internal._cb_parse_nmap({"key": "nmap"}, "\n".join([
+            "Nmap scan report for box.internal (10.0.0.5)",
+            "22/tcp    open  ssh           OpenSSH 8.9p1",
+            "23/tcp    open  telnet",
+            "3389/tcp  open  ms-wbt-server",
+            "445/tcp   open  microsoft-ds",
+        ]))
+        inside = {f.variant: f for f in internal._cb_findings if f.variant}
+        check("SSH on an internal host is informational",
+              inside["22/tcp"].severity, "INFO")
+        check("RDP internally is low, not high",
+              inside["3389/tcp"].severity, "LOW")
+        check("but telnet is High wherever it is",
+              inside["23/tcp"].severity, "HIGH")
+        check("   because the weakness is the protocol, and it says so",
+              "the weakness is in the protocol" in inside["23/tcp"].summary)
+        check("the title reflects where it is reachable from",
+              "open internally" in inside["445/tcp"].title)
+
+        print("\n\033[1mA version banner is a finding in its own "
+              "right\033[0m")
+        # Asked for explicitly: if SSH answers with a version, say so,
+        # whether or not the release is old.
+        versions = {f.variant: f for f in public._cb_findings
+                    if (f.variant or "").startswith("version-")}
+        check("SSH's banner is reported", "version-22/tcp" in versions)
+        ssh_version = versions["version-22/tcp"]
+        check("   with the product named as a person writes it",
+              "OpenSSH 8.9p1" in ssh_version.title)
+        check("   and the raw banner kept as evidence",
+              "OpenSSH 8.9p1 Ubuntu" in ssh_version.summary)
+        check("   rated Low on its own: it is a disclosure",
+              ssh_version.severity, "LOW")
+        # The contradiction: "Service version disclosed — http on 80"
+        # whose evidence held no version, because nmap's version column
+        # had "http" or "ssl/http" in it rather than a release.
+        check("a column holding 'http' is not a version",
+              port_risk.version_token("http"), "")
+        check("nor 'ssl/http'", port_risk.version_token("ssl/http"), "")
+        check("nor an empty column", port_risk.version_token(""), "")
+        check("nor a bare product name",
+              port_risk.version_token("Apache httpd"), "")
+        check("a real release is", port_risk.version_token("nginx 1.18.0"),
+              "1.18.0")
+        check("   including OpenSSH's own form",
+              port_risk.version_token("OpenSSH 8.9p1 Ubuntu"), "8.9p1")
+        bare = Engine(base)
+        bare._cb_parse_nmap({"key": "nmap"}, "\n".join([
+            "Nmap scan report for host.example.io (93.184.216.34)",
+            "80/tcp  open  http",
+            "443/tcp open  ssl/http",
+            "8443/tcp open https      Apache httpd",
+        ]))
+        check("no version finding is produced when no version was returned",
+              [f.variant for f in bare._cb_findings
+               if (f.variant or "").startswith("version-")], [])
+        check("   and the port itself is still reported",
+              len([f for f in bare._cb_findings
+                   if (f.variant or "") in ("80/tcp", "443/tcp",
+                                            "8443/tcp")]), 3)
+        check("   saying no version was returned",
+              "No version was returned" in
+              [f.summary for f in bare._cb_findings
+               if f.variant == "80/tcp"][0])
+
+        check("every service that returned a version has one",
+              sorted(versions),
+              ["version-21/tcp", "version-22/tcp", "version-6379/tcp",
+               "version-80/tcp"])
+        check("a service with no banner produces no version finding",
+              "version-23/tcp" in versions, False)
+        check("the banner parser reads product and version",
+              port_risk.product_in_banner("OpenSSH 8.9p1 Ubuntu 3ubuntu0.4"),
+              ("openssh", "8.9p1"))
+        check("   and nginx", port_risk.product_in_banner("nginx 1.18.0"),
+              ("nginx", "1.18.0"))
+        check("   and says nothing for a banner it cannot parse",
+              port_risk.product_in_banner("some-daemon"), ("", ""))
+        # With no catalogue, it must say it does not know rather than
+        # repeat a scanner's idea of "current".
+        check("the currency check never guesses",
+              any(phrase in ssh_version.summary for phrase in
+                  ("catalogue has nothing recorded",
+                   "catalogue does not track",
+                   "behind the current one", "is current")))
+        check("   and never repeats another scanner's figure",
+              "current is at least" in ssh_version.summary, False)
+
+        print("\n\033[1mThe nmap table as a tester reads it\033[0m")
+        # Two findings that come from the TABLE, not from any one line,
+        # which is why neither existed: the parser looked at one line at
+        # a time and reported only the services named individually in
+        # the library. A manual scan showed nginx; the findings list did
+        # not mention it anywhere, and a host with six open ports was
+        # not flagged for having six open ports.
+        nm = Engine(base)
+        NMAP_OUT = "\n".join([
+            "22/tcp   open  ssh      OpenSSH 8.9p1 Ubuntu 3ubuntu0.4",
+            "80/tcp   open  http     nginx 1.18.0 (Ubuntu)",
+            "443/tcp  open  ssl/http nginx 1.18.0 (Ubuntu)",
+            "3306/tcp open  mysql    MySQL 8.0.32",
+            "8080/tcp open  http-proxy",
+            "9090/tcp open  zeus-admin",
+            "12345/tcp closed  netbus",
+        ])
+        nm._cb_parse_nmap({"key": "nmap"}, NMAP_OUT)
+        found = {f.key: f for f in nm._cb_findings}
+        check("six open ports is flagged as potentially excessive",
+              "excessive_ports" in found)
+        excess = found["excessive_ports"]
+        check("   the count is in the title", "6 reachable" in excess.title)
+        check("   a closed port is not counted",
+              "12345" in excess.summary, False)
+        check("   every open port is listed for the report",
+              all(port in excess.summary for port in
+                  ("22/tcp", "80/tcp", "443/tcp", "3306/tcp", "8080/tcp",
+                   "9090/tcp")))
+        check("   rated Low — exposure, not a flaw in any one service",
+              excess.severity, "LOW")
+        check("   and it says so, rather than implying each port is a bug",
+              "not about any one service" in excess.summary)
+        check("   Confirmed, because the ports answered",
+              excess.status_label, "Confirmed")
+
+        check("nginx is reported as the underlying infrastructure",
+              "infrastructure_disclosed" in found)
+        infra = found["infrastructure_disclosed"]
+        check("   named in the title", "nginx" in infra.title)
+        check("   alongside the other products",
+              all(name in infra.title for name in ("OpenSSH", "MySQL")))
+        check("   spelled as a human would write them, not title-cased",
+              any(bad in infra.title for bad in ("Openssh", "Mysql",
+                                                 "Nginx")), False)
+        check("   with the banners as evidence",
+              "nginx 1.18.0" in infra.summary)
+        check("   rated Informational — it is an observation",
+              infra.severity, "INFO")
+        check("   and it does not claim the version is out of date",
+              "does not answer" in infra.summary)
+        check("the datastore on 3306 is still its own finding",
+              "exposed_datastore" in found)
+
+        # Below the threshold, neither finding is forced.
+        small = Engine(base)
+        small._cb_parse_nmap({"key": "nmap"}, "\n".join([
+            "80/tcp  open  http   nginx 1.18.0",
+            "443/tcp open  ssl/http nginx 1.18.0"]))
+        keys = {f.key for f in small._cb_findings}
+        check("two open ports is not excessive", "excessive_ports" in keys,
+              False)
+        check("   but the infrastructure is still named",
+              "infrastructure_disclosed" in keys)
+        check("the threshold is the one a tester uses",
+              cb_issues.EXCESSIVE_PORT_THRESHOLD, 4)
+        check("a banner naming nothing known produces no claim",
+              cb_issues.infrastructure_in("some-unknown-daemon 1.0"), [])
+        check("and a product is recognised inside a longer banner",
+              cb_issues.infrastructure_in(
+                  "nginx 1.18.0 (Ubuntu)"), ["nginx"])
 
         print("\n\033[1mThe TLS stage survives a second run\033[0m")
         # The bug: --jsonfile REFUSES to overwrite. The first scan of a target
@@ -527,22 +1026,352 @@ def main():
                            ("beast", "BEAST"),
                            ("weak_cipher", "3DES / weak ciphers")):
             check(f"{label} is reported", key in by_key)
-        check("the protocol finding names the versions",
-              by_key["obsolete_protocol"].title,
-              "Obsolete TLS protocol versions enabled: SSLv3, TLS 1.0, TLS 1.1")
-        check("and carries each one as evidence",
-              all(v in by_key["obsolete_protocol"].evidence
-                  for v in ("SSLv3", "TLS1", "TLS1_1")))
+        # One finding PER PROTOCOL. The merged row — "Obsolete TLS
+        # protocol versions enabled: SSLv3, TLS 1.0, TLS 1.1" at the
+        # library's MEDIUM — is how a live engagement missed SSLv3: the
+        # HIGH fact was averaged into the deprecated ones and the title
+        # had to be opened to find it.
+        protocols = {f.variant: f for f in engine._cb_findings
+                     if f.key == "obsolete_protocol"}
+        check("each obsolete protocol is its own finding",
+              sorted(protocols), ["sslv3", "tls1", "tls1_1"])
+        check("SSLv3 is named in the title",
+              "SSLv3" in protocols["sslv3"].title)
+        check("   and rated High, because it is a broken protocol",
+              protocols["sslv3"].severity, "HIGH")
+        check("   and said to be broken, not merely deprecated",
+              "broken" in protocols["sslv3"].title.lower())
+        check("TLS 1.0 is named in its own title",
+              "TLS 1.0" in protocols["tls1"].title)
+        check("   and rated Medium, because it is deprecated not broken",
+              protocols["tls1"].severity, "MEDIUM")
+        check("   and says deprecated", "deprecated" in
+              protocols["tls1"].title.lower())
+        check("SSLv3 and TLS 1.0 are never merged into one row",
+              protocols["sslv3"] is protocols["tls1"], False)
+        check("each carries its own scanner line as evidence",
+              all(v.lower() in protocols[k].evidence.lower()
+                  for k, v in (("sslv3", "SSLv3"), ("tls1", "TLS1"))))
         check("a protocol that is not offered is not reported",
-              "SSLv2" in by_key["obsolete_protocol"].evidence, False)
-        check("and neither is one that is fine",
-              "TLS1_2" in by_key["obsolete_protocol"].evidence, False)
+              "sslv2" in protocols, False)
+        check("and neither is one that is fine", "tls1_2" in protocols, False)
         check("a clean Heartbleed result is not a finding",
               "heartbleed" in by_key, False)
         check("a certificate expiring in 17 days is not called expired",
               "cert_expiring" in by_key)
         check("Lucky 13 carries the CVE",
               "CVE-2013-0169" in by_key["lucky13"].references)
+
+        print("\n\033[1mtestssl's bookkeeping is not a Critical "
+              "finding\033[0m")
+        # Reported from a live engagement:
+        #
+        #     TLS configuration weakness            CRITICAL   Confirmed
+        #       cert_notAfter: 2026-12-12 23:59
+        #       security_headers:
+        #       overall_grade: M
+        #
+        # A certificate's expiry DATE, an empty header list and a letter
+        # grade, rated Critical and titled as a weakness. Two faults:
+        # these records are not checks at all, and the bucket took the
+        # LAST record's severity instead of the worst justified one.
+        meta = Engine(base)
+        meta_path = meta.output_dir / "meta.json"
+        meta_path.write_text(json.dumps([
+            {"id": "cert_notAfter", "severity": "CRITICAL",
+             "finding": "2026-12-12 23:59"},
+            {"id": "security_headers", "severity": "HIGH", "finding": ""},
+            {"id": "overall_grade", "severity": "CRITICAL", "finding": "M"},
+        ]))
+        meta._cb_parse_testssl(
+            {"key": "testssl", "artefact_file": str(meta_path)}, "")
+        check("none of it is reported as a finding",
+              len(meta._cb_findings), 0)
+        check("and certainly not as Critical",
+              any(f.severity == "CRITICAL" for f in meta._cb_findings), False)
+        for identifier in ("cert_notAfter", "security_headers",
+                           "overall_grade", "final_score"):
+            check(f"   {identifier} is bookkeeping, not a check",
+                  bool(cb_issues.TESTSSL_INFORMATIONAL.match(identifier)))
+
+        # The severity of a tls_generic bucket is the worst JUSTIFIED
+        # rating in it, and tls_generic itself cannot reach High: it
+        # names no attack, has no CVE and has demonstrated no impact.
+        capped = Engine(base)
+        capped_path = capped.output_dir / "capped.json"
+        capped_path.write_text(json.dumps([
+            {"id": "cipher_order", "severity": "CRITICAL",
+             "finding": "server does not honour its own cipher order"},
+            {"id": "LOGJAM-common_primes", "severity": "LOW",
+             "finding": "no DH EXPORT ciphers"},
+        ]))
+        capped._cb_parse_testssl(
+            {"key": "testssl", "artefact_file": str(capped_path)}, "")
+        generic = [f for f in capped._cb_findings if f.key == "tls_generic"]
+        if generic:
+            check("an unclassified TLS check cannot be Critical",
+                  generic[0].severity in ("INFO", "LOW", "MEDIUM"))
+            check("   and its title names the checks it is about",
+                  "cipher_order" in generic[0].title)
+
+        print("\n\033[1mCipher findings come from the suites "
+              "themselves\033[0m")
+        # Why: the cipher findings used to exist only if testssl emitted
+        # its own SWEET32 / LUCKY13 / BEAST records. On a run whose JSON
+        # held only the rating section they were absent, so a host
+        # offering 3DES and CBC suites produced no Sweet32 finding, no
+        # BEAST finding and no CBC finding at all.
+        ciphers = Engine(base)
+        safe_name = ciphers.sanitize_target_for_filename(ciphers.target)
+        (ciphers.output_dir / f"{safe_name}_ssl_ciphers.json").write_text(
+            json.dumps({
+                "protocols": {
+                    "TLSv1.0": [
+                        {"name": "TLS_RSA_WITH_3DES_EDE_CBC_SHA",
+                         "bits": 112},
+                        {"name": "TLS_RSA_WITH_AES_128_CBC_SHA",
+                         "bits": 128}],
+                    "TLSv1.2": [
+                        {"name": "TLS_RSA_WITH_AES_128_GCM_SHA256",
+                         "bits": 128}]},
+                "deprecated_protocols": {"TLSv1.0": 1}}))
+        empty = ciphers.output_dir / "ratings-only.json"
+        empty.write_text(json.dumps([
+            {"id": "overall_grade", "severity": "CRITICAL", "finding": "M"}]))
+        ciphers._cb_parse_testssl(
+            {"key": "testssl", "artefact_file": str(empty)}, "")
+        found = {f.key: f for f in ciphers._cb_findings}
+        # Protocols had the same dependency as the ciphers: no testssl
+        # record meant no finding, so a host offering TLS 1.0 and 1.1
+        # was reported as offering neither.
+        check("TLS 1.0 is reported from the enumeration alone",
+              any(f.variant == "tls1" for f in ciphers._cb_findings))
+        tls10 = next(f for f in ciphers._cb_findings if f.variant == "tls1")
+        check("   rated Medium", tls10.severity, "MEDIUM")
+        check("   named in its title", "TLS 1.0" in tls10.title)
+        check("   and Confirmed, because it was negotiated",
+              tls10.status_label, "Confirmed")
+        check("TLS 1.2 is not reported as obsolete",
+              any("1.2" in f.title for f in ciphers._cb_findings), False)
+        check("every spelling of a version normalises to one token",
+              [cb_issues.protocol_token(s) for s in
+               ("TLS 1.0", "TLSv1.0", "TLS1", "SSL 3.0", "SSLv3", "TLS 1.2")],
+              ["tls1", "tls1", "tls1", "sslv3", "sslv3", ""])
+
+        print("\n\033[1mAnd never twice for the same version\033[0m")
+        both = Engine(base)
+        both_safe = both.sanitize_target_for_filename(both.target)
+        (both.output_dir / f"{both_safe}_ssl_ciphers.json").write_text(
+            json.dumps({
+                "protocols": {"TLS 1.0": [
+                    {"name": "TLS_RSA_WITH_AES_128_CBC_SHA", "bits": 128}]},
+                "deprecated_protocols": {"TLS 1.0": {}}}))
+        both_path = both.output_dir / "tls1.json"
+        both_path.write_text(json.dumps([
+            {"id": "TLS1", "severity": "LOW",
+             "finding": "offered (deprecated)"}]))
+        both._cb_parse_testssl(
+            {"key": "testssl", "artefact_file": str(both_path)}, "")
+        check("testssl's record and the enumeration make ONE finding",
+              len([f for f in both._cb_findings
+                   if f.key == "obsolete_protocol"]), 1)
+
+        check("Sweet32 is reported from the 3DES suite alone",
+              "sweet32" in found)
+        check("   rated Medium", found["sweet32"].severity, "MEDIUM")
+        check("   and it NAMES the affected suite, for the report",
+              "TLS_RSA_WITH_3DES_EDE_CBC_SHA" in found["sweet32"].summary)
+        check("the CBC finding is reported", "lucky13" in found)
+        check("   and lists every CBC suite, not just one",
+              all(name in found["lucky13"].summary for name in
+                  ("TLS_RSA_WITH_3DES_EDE_CBC_SHA",
+                   "TLS_RSA_WITH_AES_128_CBC_SHA")))
+        check("BEAST is reported, because TLS 1.0 is offered too",
+              "beast" in found)
+        check("   and names its suites as well",
+              "TLS_RSA_WITH_AES_128_CBC_SHA" in found["beast"].summary)
+        # The phrase "AES-GCM" does appear — in the sentence saying AEAD
+        # suites do NOT have this construction. What must not happen is
+        # the GCM suite appearing in the list of affected suites.
+        check("the GCM suite is not listed as an affected suite",
+              "TLS_RSA_WITH_AES_128_GCM_SHA256" in found["lucky13"].summary,
+              False)
+        check("each is Potential — the suites are proved, the attack "
+              "was not attempted",
+              {found[k].status_label for k in ("sweet32", "lucky13", "beast")},
+              {"Potential"})
+        check("the suites are plain text with real newlines, so a paste "
+              "into a report keeps one per line",
+              found["lucky13"].summary.count("\n") >= 2)
+        # And nothing is invented where there is nothing to report.
+        clean = Engine(base)
+        clean_safe = clean.sanitize_target_for_filename(clean.target)
+        (clean.output_dir / f"{clean_safe}_ssl_ciphers.json").write_text(
+            json.dumps({"protocols": {"TLSv1.3": [
+                {"name": "TLS_AES_256_GCM_SHA384", "bits": 256}]}}))
+        clean_path = clean.output_dir / "none.json"
+        clean_path.write_text("[]")
+        clean._cb_parse_testssl(
+            {"key": "testssl", "artefact_file": str(clean_path)}, "")
+        check("a modern cipher list produces no cipher findings",
+              [f.key for f in clean._cb_findings], [])
+
+        print("\n\033[1mtestssl's cipher inventory is evidence, not a "
+              "finding\033[0m")
+        # Reported from a live engagement: twelve of testssl's per-suite
+        # inventory records, plus two Set-Cookie values, published as
+        # one finding —
+        #
+        #     TLS configuration weakness            MEDIUM   Confirmed
+        #       cipher-tls1_2_xc009: TLSv1.2 xc009 ECDHE-ECDSA-AES128-SHA …
+        #       ipv4_in_header: set-cookie: __cf_bm=…
+        #
+        # — with no statement of what was wrong with any of it. The
+        # inventory is the list of suites the host offers, which is
+        # precisely what the cipher findings need.
+        inv = Engine(base)
+        inv_records = [
+            {"id": "cipher-tls1_2_xc009", "severity": "MEDIUM",
+             "finding": "TLSv1.2 xc009 ECDHE-ECDSA-AES128-SHA ECDH 253 "
+                        "AES 128 TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA"},
+            {"id": "cipher-tls1_2_x2f", "severity": "MEDIUM",
+             "finding": "TLSv1.2 x2f AES128-SHA RSA AES 128 "
+                        "TLS_RSA_WITH_AES_128_CBC_SHA"},
+            {"id": "cipher-tls1_2_xa", "severity": "MEDIUM",
+             "finding": "TLSv1.2 xa DES-CBC3-SHA RSA 3DES 168 "
+                        "TLS_RSA_WITH_3DES_EDE_CBC_SHA"},
+            {"id": "cipher-tls1_2_xc02f", "severity": "INFO",
+             "finding": "TLSv1.2 xc02f ECDHE-RSA-AES128-GCM-SHA256 ECDH "
+                        "253 AESGCM 128 "
+                        "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"},
+            {"id": "ipv4_in_header", "severity": "MEDIUM",
+             "finding": "set-cookie: __cf_bm=SECRETVALUE; HttpOnly; Secure"},
+        ]
+        inv_path = inv.output_dir / "inventory.json"
+        inv_path.write_text(json.dumps(inv_records))
+        inv._cb_parse_testssl(
+            {"key": "testssl", "artefact_file": str(inv_path)}, "")
+        titles = [f.title for f in inv._cb_findings]
+        check("the inventory is not published as a weakness",
+              any("TLS configuration weakness" in t for t in titles), False)
+        check("nor as an unclassified checks row",
+              any("Unclassified TLS" in t for t in titles), False)
+        for identifier in ("cipher-tls1_2_xc009", "cipher-tls1_2_x2f",
+                           "ipv4_in_header"):
+            check(f"   {identifier} is not a check",
+                  bool(cb_issues.TESTSSL_INFORMATIONAL.match(identifier)))
+        # The cookie must not reach the report at all.
+        everything = " ".join(
+            f.evidence + str(getattr(f, "summary", "") or "")
+            for f in inv._cb_findings)
+        check("no Set-Cookie value is pasted into a finding",
+              "__cf_bm" in everything, False)
+        check("and no cookie value is echoed either",
+              "SECRETVALUE" in everything, False)
+
+        # What the inventory DOES produce: named findings with suites.
+        by_inv = {f.key: f for f in inv._cb_findings}
+        check("the 3DES suite becomes a Sweet32 finding",
+              "sweet32" in by_inv)
+        check("   naming the suite it was established from",
+              "TLS_RSA_WITH_3DES_EDE_CBC_SHA" in by_inv["sweet32"].summary)
+        check("   and rated Medium", by_inv["sweet32"].severity, "MEDIUM")
+        check("the CBC suites become a Lucky 13 finding",
+              "lucky13" in by_inv)
+        check("   listing the CBC suites",
+              all(name in by_inv["lucky13"].summary for name in
+                  ("TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA",
+                   "TLS_RSA_WITH_AES_128_CBC_SHA")))
+        check("   and not the GCM suite",
+              "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
+              in by_inv["lucky13"].summary, False)
+        # The parse itself, checked directly: the symmetric key size is
+        # read, not the curve size that precedes it in the same line.
+        parsed = inv._cb_testssl_cipher_inventory(inv_records)
+        check("the inventory parses per protocol", list(parsed), ["TLSv1.2"])
+        check("   with the IANA names",
+              sorted(s["name"] for s in parsed["TLSv1.2"])[:2],
+              ["TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA",
+               "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"])
+        check("   and the symmetric key size, not the curve size",
+              {s["name"]: s["bits"] for s in parsed["TLSv1.2"]}[
+                  "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA"], 128)
+        check("   3DES at 168 bits, read from its own line",
+              {s["name"]: s["bits"] for s in parsed["TLSv1.2"]}[
+                  "TLS_RSA_WITH_3DES_EDE_CBC_SHA"], 168)
+        check("TLS 1.2 in the inventory is not called obsolete",
+              any(f.key == "obsolete_protocol" for f in inv._cb_findings),
+              False)
+
+        print("\n\033[1mNo JSON: testssl's console output is read "
+              "properly\033[0m")
+        # The silent failure. The old fallback looked for the words HIGH
+        # / MEDIUM / LOW in each line — which testssl writes into its
+        # JSON and its logfile, never into the console output. A host
+        # offering SSLv3 printed "SSLv3   offered (NOT ok)", matched
+        # nothing, and produced no finding at all, while the standalone
+        # testssl button showed it plainly.
+        console = Engine(base)
+        CONSOLE = "\n".join([
+            " SSLv2      not offered (OK)",
+            " SSLv3      offered (NOT ok)",
+            " TLS 1      offered (deprecated)",
+            " TLS 1.2    offered (OK)",
+            " BEAST (CVE-2011-3389)      VULNERABLE -- but also supports "
+            "higher protocols TLSv1.2 (likely mitigated)",
+            " SWEET32 (CVE-2016-2183)    VULNERABLE, uses 64 bit block "
+            "ciphers",
+            " LUCKY13 (CVE-2013-0169)    potentially VULNERABLE, uses "
+            "cipher block chaining (CBC) ciphers with TLS",
+            " Heartbleed (CVE-2014-0160) not vulnerable (OK)",
+            " POODLE, SSL (CVE-2014-3566)  VULNERABLE (NOT ok), uses "
+            "SSLv3+CBC",
+        ])
+        rows = console._cb_testssl_from_console(CONSOLE)
+        ids = [r["id"] for r in rows]
+        check("SSLv3 is recovered from the console", "SSLv3" in ids)
+        check("Sweet32 too", "SWEET32" in ids)
+        check("and BEAST", "BEAST" in ids)
+        check("and Lucky 13", "LUCKY13" in ids)
+        check("'POODLE, SSL' is normalised to testssl's own id",
+              "POODLE_SSL" in ids)
+        check("a protocol that is not offered is not a record",
+              "SSLv2" in ids, False)
+        check("nor one that is fine", any(i.startswith("TLS1.2")
+                                          for i in ids), False)
+        check("'not vulnerable (OK)' is not read as vulnerable",
+              any("heartbleed" in i.lower() for i in ids), False)
+        check("severity is left to the library, not scraped from the line",
+              {r["severity"] for r in rows}, {""})
+        check("the CVE is kept", any("CVE-2016-2183" in r["cve"]
+                                     for r in rows))
+        # End to end, with no JSON file anywhere.
+        console._cb_parse_testssl({"key": "testssl",
+                                   "artefact_file": str(
+                                       console.output_dir / "absent.json")},
+                                  CONSOLE)
+        recovered = {f.key: f for f in console._cb_findings}
+        check("the stage now produces findings with no JSON at all",
+              len(console._cb_findings) >= 4)
+        check("including SSLv3, rated High",
+              any(f.key == "obsolete_protocol" and f.severity == "HIGH"
+                  and "SSLv3" in f.title for f in console._cb_findings))
+        for key in ("sweet32", "beast", "lucky13", "poodle"):
+            check(f"   and {key}", key in recovered)
+
+        print("\n\033[1mA TLS stage that reads nothing says so\033[0m")
+        mute = Engine(base)
+        mute._cb_parse_testssl(
+            {"key": "testssl",
+             "artefact_file": str(mute.output_dir / "nothing.json")},
+            "Start 2026-11-02 testssl.sh\nsome output with no verdicts\n")
+        printed = "".join(mute.printed)
+        check("silence is not reported as a clean result",
+              "NO TLS findings were assessed" in printed)
+        check("and the operator is told where to look",
+              "SSL/TLS Analysis" in printed)
+        check("no findings are invented to fill the gap",
+              len(mute._cb_findings), 0)
 
         print("\n\033[1mThe library is the scoring policy\033[0m")
         # A tool's rating no longer overrides the library's, in either
@@ -554,6 +1383,13 @@ def main():
               "LOW")
         check("deprecated protocols are Medium",
               cb_issues.ISSUES["obsolete_protocol"]["severity"], "MEDIUM")
+        # The one place the protocol version, not the tool, decides.
+        check("but SSLv2 and SSLv3 are rated High by version",
+              [cb_issues.OBSOLETE_PROTOCOL_SEVERITY[v]
+               for v in ("sslv2", "sslv3")], ["HIGH", "HIGH"])
+        check("while TLS 1.0 and 1.1 stay Medium",
+              [cb_issues.OBSOLETE_PROTOCOL_SEVERITY[v]
+               for v in ("tls1", "tls1_1")], ["MEDIUM", "MEDIUM"])
         check("RC4 is Medium", cb_issues.ISSUES["rc4"]["severity"], "MEDIUM")
         check("a tool cannot escalate a named issue",
               severity_for("obsolete_protocol", "HIGH"), "MEDIUM")
@@ -725,6 +1561,9 @@ def main():
 
         print("\n\033[1mA scanner's bookkeeping is not a finding\033[0m")
         engine = Engine(base)
+        # BREACH is on the default low-signal list; this block tests the
+        # consolidation of one issue across tools, so opt it back in.
+        engine._cb_force_report = {"breach"}
         nikto = "\n".join("+ " + line for line in [
             "Target IP: 127.0.0.1",
             "Server: nginx/1.24",
@@ -759,9 +1598,14 @@ def main():
         check("observations are collected as Info, not Low",
               [f.severity for f in engine._cb_findings
                if "inventory" in f.title.lower()], ["INFO"])
-        check("two tools' wording for the same banner is one finding",
-              len([f for f in engine._cb_findings
-                   if f.key == "version_disclosure"]), 1)
+        # One row PER PRODUCT. nginx/1.24 and PHP/8.1 are two products
+        # with two disclosed versions; they used to fold into one row
+        # because they share an issue key, which lost one of them.
+        # Repeated sightings of the SAME product still merge — see
+        # "One product, one row" above.
+        check("each product's disclosed version is its own finding",
+              sorted(f.variant for f in engine._cb_findings
+                     if f.key == "version_disclosure"), ["nginx", "php"])
         check("nothing was reported at Low that is only an observation",
               [f.title for f in engine._cb_findings
                if f.severity == "LOW" and "Server:" in f.evidence], [])
@@ -770,6 +1614,11 @@ def main():
         # Nikto words BREACH as a Content-Encoding observation; testssl names
         # it. Two tools, two vocabularies, one problem — and previously two
         # findings that a human had to work out were the same.
+        #
+        # BREACH is suppressed by default (the house does not flag it; see
+        # the suppression test below). This engine opted it back in above,
+        # since the point of this block is the CONSOLIDATION logic — which
+        # applies to every multi-tool issue and only uses breach as example.
         breach = [f for f in engine._cb_findings if f.key == "breach"]
         check("Nikto's deflate line is recognised as BREACH", len(breach), 1)
         records = [{"id": "BREACH", "severity": "LOW", "cve": "CVE-2013-3587",
@@ -789,13 +1638,42 @@ def main():
         check("and never past the ceiling for something nobody exploited",
               breach[0].confidence != cb_evidence.CONFIRMED_C)
 
+        print("\n\033[1mLow-signal issues this house does not flag\033[0m")
+        # The operator does not flag BREACH, so it is detected but kept out
+        # of the findings list — not deleted, so it can be turned back on.
+        low = Engine(base)
+        low._cb_record(low._cb_issue("breach", base, "gzip + reflected",
+                                     "testssl"))
+        check("BREACH is on the default low-signal list",
+              "breach" in cb_issues.DEFAULT_LOW_SIGNAL)
+        check("so it is not added to the findings", low._cb_findings, [])
+        check("   and the operator is told it was detected, not silently "
+              "dropped",
+              any("low-signal" in line for line in low.printed))
+        # A real finding alongside it is unaffected.
+        low._cb_record(low._cb_issue("hsts_missing", base, "no HSTS",
+                                     "testssl"))
+        check("an issue that IS flagged still lands",
+              [f.key for f in low._cb_findings], ["hsts_missing"])
+        # Opt-in brings it back, which is how the consolidation block above
+        # tests it at all.
+        back = Engine(base)
+        back._cb_force_report = {"breach"}
+        back._cb_record(back._cb_issue("breach", base, "x", "testssl"))
+        check("forcing it on reports it again", len(back._cb_findings), 1)
+
         print("\n\033[1mMuting an issue type\033[0m")
+        # Uses hsts_missing rather than breach: breach is now suppressed by
+        # the low-signal list regardless of muting, which would mask what
+        # this test is about.
         engine = Engine(base)
-        engine._cb_muted = {"breach"}
-        engine._cb_record(engine._cb_issue("breach", base, "x", "testssl"))
+        engine._cb_muted = {"hsts_missing"}
+        engine._cb_record(engine._cb_issue("hsts_missing", base, "x",
+                                           "testssl"))
         check("a muted issue is never recorded", engine._cb_findings, [])
         engine._cb_muted = set()
-        engine._cb_record(engine._cb_issue("breach", base, "x", "testssl"))
+        engine._cb_record(engine._cb_issue("hsts_missing", base, "x",
+                                           "testssl"))
         check("and is recorded again once unmuted",
               len(engine._cb_findings), 1)
 
@@ -929,9 +1807,15 @@ def main():
         check("a missing base-uri is caught",
               "csp_missing_object_base" in analyse_csp(
                   sound.replace("base-uri 'self'; ", "")))
-        check("a missing frame-ancestors is caught",
-              "csp_clickjacking" in analyse_csp(
-                  sound.replace("frame-ancestors 'none'; ", "")))
+        # frame-ancestors moved OUT of analyse_csp. A missing directive
+        # is only a finding once X-Frame-Options has also been looked
+        # at, so framing is assessed from the response as a whole —
+        # csp_analysis.assess_framing — and analyse_csp no longer
+        # returns a verdict on it. The framing cases are covered in
+        # their own section below.
+        check("analyse_csp no longer judges framing on its own",
+              any(k.startswith("csp_clickjack") for k in analyse_csp(
+                  sound.replace("frame-ancestors \'none\'; ", ""))), False)
         check("script-src falls back to default-src when absent",
               "csp_unsafe_script" in analyse_csp(
                   "default-src 'self' 'unsafe-inline'; object-src 'none'; "
@@ -996,7 +1880,12 @@ def main():
         engine = Engine(base)
         engine._cb_parse_nuclei({"key": "nuclei"}, nuclei_line())
         csp = engine._cb_findings[0]
-        check("the finding is about CSP", csp.key, "csp_missing")
+        # weak-csp-detect EXTRACTS the policy, so the header is present
+        # and permissive rather than absent. The detector registry
+        # classifies it on the template's identity; the old expectation
+        # of csp_missing came from keyword matching and contradicted the
+        # policy string the same finding carried as its evidence.
+        check("the finding is about CSP", csp.key, "csp_unsafe_script")
         check("it is not OS command injection",
               "command injection" not in csp.title.lower())
         check("it is not CRITICAL", csp.severity != "CRITICAL")
@@ -1008,7 +1897,7 @@ def main():
         # defence-in-depth header is not a Medium beside things that
         # actually do something. nuclei's own rating stays separate.
         check("and nuclei's own severity is kept apart from ours",
-              (csp.scanner_severity, csp.severity), ("INFO", "LOW"))
+              (csp.scanner_severity, csp.severity), ("INFO", "MEDIUM"))
         check("the raw detection is still available",
               "weak-csp-detect" in csp.proof.raw_detection())
 
@@ -1120,23 +2009,29 @@ def main():
         engine._cb_record(real)
         engine._cb_parse_nuclei({"key": "nuclei"}, nuclei_line())
         by_key = {f.key: f for f in engine._cb_findings}
+        # weak-csp-detect reports a policy that IS present and
+        # permissive — it extracts the policy string itself — so the
+        # detector registry classifies it as a permissive CSP, not a
+        # missing one. The old expectation here was csp_missing, which
+        # came from keyword matching and contradicted the evidence the
+        # same finding carried.
         check("both findings are present", sorted(by_key), sorted(
-            ["command_injection", "csp_missing"]))
+            ["command_injection", "csp_unsafe_script"]))
         check("the injection keeps its own proof",
               "uid=33(www-data)" in by_key["command_injection"].proof.response)
         check("and did not acquire the CSP header",
               "object-src" not in
               by_key["command_injection"].proof.evidence_text())
         check("the CSP finding kept its own proof",
-              "object-src" in by_key["csp_missing"].proof.evidence_text())
+              "object-src" in by_key["csp_unsafe_script"].proof.evidence_text())
         check("and did not acquire the shell output",
-              "uid=33" not in by_key["csp_missing"].proof.evidence_text())
+              "uid=33" not in by_key["csp_unsafe_script"].proof.evidence_text())
         check("their evidence objects are not the same object",
               by_key["command_injection"].proof is not
-              by_key["csp_missing"].proof)
+              by_key["csp_unsafe_script"].proof)
         check("nor do they share a correlation id",
               by_key["command_injection"].proof.correlation_id !=
-              by_key["csp_missing"].proof.correlation_id)
+              by_key["csp_unsafe_script"].proof.correlation_id)
 
         # Mutating one must not reach the other, and must not reach whatever
         # built it either.
@@ -1232,11 +2127,11 @@ def main():
         clean = True
         for index, local in engines:
             found = {f.key: f for f in local._cb_findings}
-            if sorted(found) != ["command_injection", "csp_missing"]:
+            if sorted(found) != ["command_injection", "csp_unsafe_script"]:
                 clean = False
                 break
             injection = found["command_injection"]
-            csp_finding = found["csp_missing"]
+            csp_finding = found["csp_unsafe_script"]
             if f"uid={index}(user{index})" not in injection.proof.response:
                 clean = False
             if "object-src" in injection.proof.evidence_text():
@@ -1729,9 +2624,27 @@ back-end DBMS: MySQL >= 5.6
         "+ [002743] /.bash_history: A user's home directory may be set to "
         "the web root, the shell history was retrieved. This should not be "
         "accessible via the web.\n"))
-    check("so the finding never reaches the report", reported._cb_findings, [])
-    check("and the console says why it was dropped",
-          any("not reported" in line for line in reported.printed))
+    # BEHAVIOUR CHANGE, 6.9.2. This used to assert the finding was
+    # dropped outright. It is now RETAINED and marked Inconclusive,
+    # because silently discarding every unconfirmed detection loses the
+    # distinction between "we checked and it is not there" and "we never
+    # looked" — and a tester deciding what to probe by hand needs the
+    # lead even when the automated check could not settle it.
+    #
+    # What must not happen is the old failure: it reaching the report as
+    # a confirmed high-risk exposure.
+    check("the finding is retained rather than discarded",
+          len(reported._cb_findings), 1)
+    kept = reported._cb_findings[0]
+    check("but marked Inconclusive",
+          getattr(kept, "status_label", ""), "Inconclusive")
+    check("and rated LOW, not HIGH", kept.severity, "LOW")
+    check("with the impact it would carry if real still recorded",
+          getattr(kept, "impact_if_real", ""), "HIGH")
+    check("and the reason stated in what was found",
+          "catch-all" in getattr(kept, "summary", ""))
+    check("the name does not claim the file was exposed",
+          kept.title, "Shell history file is readable")
 
     # A real host, where the same signature IS worth reporting.
     class _RealFile(BaseHTTPRequestHandler):
@@ -1825,6 +2738,1320 @@ back-end DBMS: MySQL >= 5.6
           any("earlier Coffee Break run" in line for line in stale.printed))
     check("and the operator is told it will be overwritten",
           any("overwrites" in line for line in stale.printed))
+
+
+    # ── "rce" inside "Subresource" ───────────────────────────────────────
+    #
+    # Reported from an engagement: nuclei's missing-sri template (INFO,
+    # CWE-353) was published as a CRITICAL CWE-78 OS command injection
+    # with an SRI-less script URL as its proof. for_nuclei already
+    # refuses to classify on a template's description — this came in
+    # through its NAME, "Missing Subresource Integrity", because the
+    # command_injection pattern had `rce\b` with no LEADING word
+    # boundary. "Subresou(rce)" matches. So does "sou(rce)" and
+    # "resou(rce)": any finding mentioning a source or a resource became
+    # a critical.
+    print("\n\033[1mPatterns match words, not fragments of words\033[0m")
+    for benign in ("Missing Subresource Integrity",
+                   "Source map file exposed",
+                   "Cross-origin resource sharing misconfiguration",
+                   "Email addresses disclosed in page source",
+                   "Subresource integrity attribute absent"):
+        check(f"{benign[:38]!r} is not command injection",
+              cb_issues.for_text(benign)[0] == "command_injection", False)
+    for real in ("RCE in the upload handler",
+                 "Remote code execution via deserialisation",
+                 "OS command injection on the host parameter"):
+        check(f"{real[:34]!r} still is",
+              cb_issues.for_text(real)[0], "command_injection")
+    check("and the nuclei template itself no longer maps to an exploit",
+          cb_issues.for_nuclei("missing-sri", "Missing Subresource Integrity",
+                               "Checks if external script tags are missing "
+                               "the Subresource Integrity attribute.")[0]
+          == "command_injection", False)
+
+    # ── Nikto findings get titles, not truncated sentences ──────────────
+    print("\n\033[1mNikto titles name the problem and the file\033[0m")
+    check("a shell history file is named as one",
+          cb_issues.nikto_title(
+              "[002743] /.bash_history: A user's home directory may be set "
+              "to the web root, the shell history was retrieved. This should "
+              "not be accessible via the web."),
+          "Shell history file is readable (/.bash_history)")
+    check("and so is the other one Nikto reports",
+          cb_issues.nikto_title("[002756] /.sh_history: A user's home "
+                                "directory may be set to the web root."),
+          "Shell history file is readable (/.sh_history)")
+    check("an env file too",
+          cb_issues.nikto_title("/.env: may contain secrets."),
+          "Environment file is readable (/.env)")
+    check("an unknown path keeps Nikto's sentence but gains the path",
+          cb_issues.nikto_title("/odd.aspx: Server may leak inodes via ETags")
+          .endswith("(/odd.aspx)"))
+    check("the boilerplate is not in the title",
+          "accessible via the web" in cb_issues.nikto_title(
+              "/x.txt: Something. This should not be accessible via the "
+              "web."), False)
+    check("a line that is not in Nikto's path form returns nothing",
+          cb_issues.nikto_title("Retrieved x-powered-by header: PHP/8.1"), "")
+    check("no title is a truncated raw line any more",
+          "…" in cb_issues.nikto_title(
+              "[002743] /.bash_history: A user's home directory may be set "
+              "to the web root, the shell history was retrieved."), False)
+
+    # ── A header cannot be absent and misconfigured at once ─────────────
+    #
+    # Reported: "CSP allows clickjacking", "CSP does not restrict
+    # object-src or base-uri", "CSP allows form hijacking" AND
+    # "Content-Security-Policy is missing", on the same target. The last
+    # contradicts the first three. probe_headers cannot produce that
+    # pair on its own, so the "missing" one came from a signature tool.
+    # Parsing the header is first-hand evidence that it is there.
+    print("\n\033[1mPresent and missing are mutually exclusive\033[0m")
+    csp = Engine("https://example.bike")
+    for parsed_key in ("csp_clickjacking", "csp_missing_object_base",
+                       "csp_form_hijack"):
+        csp._cb_record(csp._cb_issue(
+            parsed_key, "https://example.bike/",
+            "Content-Security-Policy: default-src 'self'", "headers"))
+    csp._cb_record(csp._cb_issue("csp_missing", "https://example.bike",
+                                 "no CSP header seen", "nuclei"))
+    titles = [f.title for f in csp._cb_findings]
+    check("the three analyses of the policy are kept", len(titles), 3)
+    # By KEY, not by searching titles for "missing" — the framing
+    # finding's own title legitimately contains that word now.
+    check("and 'CSP is missing' is not reported alongside them",
+          "csp_missing" in [f.key for f in csp._cb_findings], False)
+    check("with the reason said out loud",
+          any("contradicts" in line for line in csp.printed))
+
+    # The stages do not run in a fixed order, so the other direction too.
+    rev = Engine("https://example.bike")
+    rev._cb_record(rev._cb_issue("csp_missing", "https://example.bike",
+                                 "no CSP header seen", "nuclei"))
+    rev._cb_record(rev._cb_issue(
+        "csp_clickjacking", "https://example.bike/",
+        "Content-Security-Policy: default-src 'self'", "headers"))
+    check("a 'missing' already recorded is withdrawn when the header is read",
+          [f.key for f in rev._cb_findings], ["csp_clickjacking"])
+
+    only = Engine("https://example.bike")
+    only._cb_record(only._cb_issue("csp_missing", "https://example.bike",
+                                   "no CSP header seen", "headers"))
+    check("a genuinely missing header is still reported",
+          [f.key for f in only._cb_findings], ["csp_missing"])
+
+    print("\n\033[1mA trailing slash is the same location\033[0m")
+    check("root with and without a slash", 
+          _same_location("https://x", "https://x/"))
+    check("but two different paths are not",
+          _same_location("https://x/a", "https://x/b"), False)
+    check("and a sub-path's slash is left alone",
+          _same_location("https://x/a", "https://x/a/"), False)
+
+    # ── Lucky 13 names the suites ───────────────────────────────────────
+    #
+    # Reported: the finding's entire proof was testssl's own sentence,
+    # "LUCKY13: potentially vulnerable, uses obsolete TLS CBC ciphers",
+    # which cannot be written up — a report has to say which suites.
+    print("\n\033[1mLucky 13 lists the cipher suites\033[0m")
+    from command_bridge.modules import cbc_suites
+
+    sample = [("TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA", 256, "ECDHE-RSA-AES256-SHA"),
+              ("TLS_RSA_WITH_AES_128_CBC_SHA", 128, "AES128-SHA")]
+    block = cbc_suites.as_evidence(sample, "example.bike:443")
+    check("each suite is on its own line", block.count("\n"), 2)
+    check("the IANA name is used, not OpenSSL's short name",
+          "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA" in block)
+    check("the key size is given", block.rstrip().endswith("128"))
+    check("and nothing was invented when there is nothing to list",
+          cbc_suites.as_evidence([], "x"), "")
+    check("every suite in the table has an IANA name and a size",
+          all(iana.startswith("TLS_") and bits > 0
+              for _, iana, bits in cbc_suites.SUITES))
+    check("TLS 1.3 is excluded, since it has no CBC suites at all",
+          "TLSv1_2" in Path(cbc_suites.__file__).read_text())
+
+    print("\n\033[1mCopying a finding keeps its line breaks\033[0m")
+    from command_bridge.widgets.plain_copy import as_plain_text
+    check("Qt's paragraph separator becomes a newline",
+          as_plain_text("a b"), "a\nb")
+    check("and its line separator does too, which is what <br> gives",
+          as_plain_text("a b"), "a\nb")
+    check("non-breaking spaces become ordinary ones",
+          as_plain_text("a b"), "a b")
+    check("a cipher list survives a round trip",
+          as_plain_text("Lucky13   TLS_RSA_WITH_AES_128_CBC_SHA "
+                        "  TLS_RSA_WITH_AES_256_CBC_SHA").count("\n"), 2)
+
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  The validation pipeline: detector registry, verification, risk
+    # ═══════════════════════════════════════════════════════════════════
+    #
+    # Named A-G after the failure cases they were written from. Each one
+    # reproduces a report that was actually produced and published.
+    from command_bridge.modules import detector_registry as dreg
+    from command_bridge.modules import risk as riskmod
+    from command_bridge.modules import verification as vmod
+
+    SHELL_HISTORY = (b"cd /var/www/html\nmysql -u root -pSuperSecret1 shop\n"
+                     b"ssh deploy@10.0.0.5\nexit\n")
+    JAMON_PAGE = (b"<html><head><title>JAMon Admin</title></head><body>"
+                  b"<h1>JAMon - Java Application Monitor</h1>"
+                  b"<p>JAMon version 2.81</p></body></html>")
+    SPA_SHELL = (b"<!doctype html><html><head><title>Shop</title></head>"
+                 b"<body><div id=\"root\"></div></body></html>")
+
+    class _RealFiles(BaseHTTPRequestHandler):
+        """A host where the files genuinely are, and 404s otherwise."""
+
+        def do_GET(self):
+            if self.path in ("/.bash_history", "/.sh_history"):
+                body, kind, code = SHELL_HISTORY, "text/plain", 200
+            elif self.path == "/JAMonAdmin.jsp":
+                body, kind, code = JAMON_PAGE, "text/html", 200
+            else:
+                body, kind, code = b"<h1>404</h1>", "text/html", 404
+            self.send_response(code)
+            self.send_header("Content-Type", kind)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    class _CatchAll(BaseHTTPRequestHandler):
+        """A single-page app behind a cache: 200 + shell for every path."""
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(SPA_SHELL)))
+            self.end_headers()
+            self.wfile.write(SPA_SHELL)
+
+        def log_message(self, *a):
+            pass
+
+    def _serve(handler):
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv, f"http://127.0.0.1:{srv.server_address[1]}"
+
+    real_srv, real_base = _serve(_RealFiles)
+    spa_srv, spa_base = _serve(_CatchAll)
+
+    NIKTO_HISTORY = ("+ [002743] /.bash_history: A user's home directory may "
+                     "be set to the web root, the shell history was "
+                     "retrieved. This should not be accessible via the "
+                     "web.\n")
+    NIKTO_SH = ("+ [002756] /.sh_history: A user's home directory may be set "
+                "to the web root, the shell history was retrieved.\n")
+    NIKTO_JAMON = ("+ [007303] /JAMonAdmin.jsp: JAMon - Java Application "
+                   "Monitor Admin interface identified. Versions 2.7 and "
+                   "earlier contain XSS vulnerabilities. See: "
+                   "CVE-2013-6235\n")
+    SRI_ROW = {
+        "template-id": "missing-sri",
+        "matched-at": "https://example.co.uk/",
+        "info": {"name": "Missing Subresource Integrity", "severity": "info",
+                 "tags": ["compliance", "js", "css", "sri", "misconfig",
+                          "vuln"],
+                 "description": "Checks if external script and stylesheet "
+                                "tags in the HTML response are missing the "
+                                "Subresource Integrity (SRI) attribute.",
+                 "classification": {"cwe-id": ["cwe-353"]}},
+        "extracted-results": ["https://7385347281937593344.csidetm.com/"
+                              "script.js"],
+    }
+
+    # ── Test A — nuclei misclassification ───────────────────────────────
+    print("\n\033[1mA — nuclei missing-sri is not command injection\033[0m")
+    a = Engine(real_base)
+    a._cb_parse_nuclei({"key": "nuclei"}, json.dumps(SRI_ROW))
+    check("one finding is produced", len(a._cb_findings), 1)
+    sri = a._cb_findings[0]
+    check("classified as Subresource Integrity",
+          sri.key, "sri_missing")
+    check("not as command injection",
+          "command" in (sri.title + sri.key).lower(), False)
+    check("CWE is the SRI one, not CWE-78", sri.cwe, "CWE-353")
+    check("risk rating is Informational, not Critical",
+          sri.severity, "INFO")
+    check("nuclei's own severity is kept as metadata",
+          sri.scanner_severity, "INFO")
+    check("the extracted script URL is the observation",
+          "csidetm.com" in getattr(sri, "summary", ""))
+    rendered = cb_evidence.summary_html(sri)
+    for forbidden in ("shell", "command injection", "control of the "
+                                                    "application server"):
+        check(f"the finding does not mention {forbidden!r}",
+              forbidden in rendered.lower(), False)
+    check("and the raw template metadata survives in the detail view",
+          "missing-sri" in cb_evidence.detail_html(sri))
+
+    # ── Test B — shell history exposure ─────────────────────────────────
+    print("\n\033[1mB — a shell history signature is not an exposure\033[0m")
+    b_real = Engine(real_base)
+    b_real._cb_parse_nikto({"key": "nikto"}, NIKTO_HISTORY + NIKTO_SH)
+    # One finding, two locations. /.bash_history and /.sh_history are the
+    # same issue, and the consolidation that already groups a missing
+    # header seen on two hundred pages groups these as well.
+    check("the two paths consolidate into one finding",
+          len(b_real._cb_findings), 1)
+    check("with the second path kept as an instance",
+          len(b_real._cb_findings[0].instances), 1)
+    check("and the instance is the other history file",
+          any(".sh_history" in str(i)
+              for i in b_real._cb_findings[0].instances))
+    exposed = b_real._cb_findings[0]
+    check("the name is normalised, not Nikto's sentence",
+          exposed.title, "Exposed shell history file")
+    check("no bracketed plugin id in the name",
+          "[002743]" in exposed.title, False)
+    check("confirmed, because the contents came back",
+          getattr(exposed, "status_label", ""), "Confirmed")
+    check("and rated on that evidence", exposed.severity, "HIGH")
+    check("what was found says the file is readable",
+          "readable" in getattr(exposed, "summary", "").lower())
+    check("the raw Nikto message is kept in the evidence record",
+          "002743" in cb_evidence.detail_html(exposed))
+
+    b_spa = Engine(spa_base)
+    b_spa._cb_parse_nikto({"key": "nikto"}, NIKTO_HISTORY)
+    check("on a catch-all host the same signature still appears",
+          len(b_spa._cb_findings), 1)
+    unproven = b_spa._cb_findings[0]
+    check("but as Inconclusive",
+          getattr(unproven, "status_label", ""), "Inconclusive")
+    check("rated LOW rather than HIGH", unproven.severity, "LOW")
+    check("while recording what it would be worth if real",
+          getattr(unproven, "impact_if_real", ""), "HIGH")
+    check("and saying why it is not confirmed",
+          "catch-all" in getattr(unproven, "summary", ""))
+    check("the name does not claim exposure",
+          unproven.title, "Shell history file is readable")
+
+    # ── Test C — JAMon XSS signature ────────────────────────────────────
+    print("\n\033[1mC — a component signature is not reflected XSS\033[0m")
+    c = Engine(real_base)
+    c._cb_parse_nikto({"key": "nikto"}, NIKTO_JAMON)
+    check("a finding is produced", len(c._cb_findings), 1)
+    jamon = c._cb_findings[0]
+    check("it is not classified as XSS",
+          "xss" in (jamon.key + jamon.title).lower(), False)
+    check("nor carries CWE-79", jamon.cwe == "CWE-79", False)
+    check("it is a component finding",
+          jamon.key, "component_admin_exposed")
+    check("the CVE is kept as context",
+          "CVE-2013-6235" in jamon.references)
+    check("the version was read from the response",
+          "2.81" in getattr(jamon, "summary", ""))
+    check("and it is not called a JavaScript package",
+          "javascript" in cb_evidence.summary_html(jamon).lower(), False)
+    check("Java is what it is",
+          "JAMon" in jamon.title or "JAMon" in
+          cb_evidence.detail_html(jamon))
+
+    c_spa = Engine(spa_base)
+    c_spa._cb_parse_nikto({"key": "nikto"}, NIKTO_JAMON)
+    check("with no reachable interface it is inconclusive",
+          getattr(c_spa._cb_findings[0], "status_label", ""),
+          "Inconclusive")
+
+    # ── Test D — Lucky13 cipher details ─────────────────────────────────
+    print("\n\033[1mD — Lucky 13 lists the suites testssl found\033[0m")
+    d = Engine("https://example.bike")
+    artefact = {
+        "tool": "ssl_cipher_check", "host": "example.bike", "port": 443,
+        "suite_count": 6,
+        "protocols": {"TLS 1.2": [
+            {"name": "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA", "bits": 256},
+            {"name": "TLS_RSA_WITH_AES_256_CBC_SHA", "bits": 256},
+            {"name": "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA", "bits": 128},
+            {"name": "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256", "bits": 128},
+            {"name": "TLS_RSA_WITH_AES_128_CBC_SHA", "bits": 128}]},
+        "deprecated_protocols": {},
+        "vulnerabilities": {"Lucky13": {
+            "name": "Lucky13",
+            "description": "Timing side-channel on CBC-mode HMAC padding "
+                           "— CVE-2013-0169",
+            "suites": [
+                {"name": "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA", "bits": 256},
+                {"name": "TLS_RSA_WITH_AES_256_CBC_SHA", "bits": 256},
+                {"name": "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA", "bits": 128},
+                {"name": "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
+                 "bits": 128},
+                {"name": "TLS_RSA_WITH_AES_128_CBC_SHA", "bits": 128}]}},
+    }
+    safe_name = d.sanitize_target_for_filename(d.target)
+    (Path(d.output_dir) / f"{safe_name}_ssl_ciphers.json").write_text(
+        json.dumps(artefact))
+    listing = d._cb_tls_evidence("lucky13")
+    for suite, bits in (("TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA", "256"),
+                        ("TLS_RSA_WITH_AES_256_CBC_SHA", "256"),
+                        ("TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA", "128"),
+                        ("TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256", "128"),
+                        ("TLS_RSA_WITH_AES_128_CBC_SHA", "128")):
+        check(f"{suite} is listed", suite in listing)
+    check("each suite carries its key size", listing.count("256") >= 2)
+    check("each on its own line", listing.count("\n") >= 5)
+    check("the host is named, so evidence is tied to the target",
+          "example.bike:443" in listing)
+    check("and it was reused rather than re-scanned",
+          any("reusing the SSL/TLS Analysis" in line for line in d.printed))
+    check("nothing is hardcoded — an empty artefact yields nothing",
+          Engine("https://nowhere.test")._cb_tls_evidence("lucky13"), "")
+
+    # ── Test E — other TLS findings keep their evidence ─────────────────
+    print("\n\033[1mE — other TLS findings keep their evidence too\033[0m")
+    e_eng = Engine("https://example.bike")
+    rich = dict(artefact)
+    rich["deprecated_protocols"] = {
+        "TLS 1.0": {"severity": "HIGH",
+                    "reason": "BEAST risk + deprecated by RFC 8996"}}
+    rich["protocols"] = dict(artefact["protocols"])
+    rich["protocols"]["TLS 1.0"] = [
+        {"name": "TLS_RSA_WITH_AES_128_CBC_SHA", "bits": 128}]
+    rich["vulnerabilities"] = dict(artefact["vulnerabilities"])
+    rich["vulnerabilities"]["ROBOT (static RSA)"] = {
+        "name": "ROBOT (static RSA)",
+        "description": "RSA PKCS#1 v1.5 key exchange",
+        "suites": [{"name": "TLS_RSA_WITH_AES_256_CBC_SHA", "bits": 256}]}
+    (Path(e_eng.output_dir)
+     / f"{safe_name}_ssl_ciphers.json").write_text(json.dumps(rich))
+    check("a protocol finding names the version and its suites",
+          "TLS 1.0" in e_eng._cb_tls_evidence("obsolete_protocol"))
+    check("and gives the reason",
+          "RFC 8996" in e_eng._cb_tls_evidence("obsolete_protocol"))
+    check("ROBOT gets its own matching suites",
+          "TLS_RSA_WITH_AES_256_CBC_SHA"
+          in e_eng._cb_tls_evidence("robot"))
+    check("a weak-cipher finding lists the accepted suites by version",
+          "TLS 1.2" in e_eng._cb_tls_evidence("weak_cipher"))
+    check("a vulnerability with no matching suites gets no invented list",
+          e_eng._cb_tls_evidence("sweet32"), "")
+
+    # Section 6's technical correctness: CBC support is the attack's
+    # precondition, not the attack. Lucky 13 reports as Potential with
+    # the suites as evidence; a certificate or protocol fact, which IS
+    # directly observed, reports as Confirmed.
+    tls_eng = Engine("https://example.bike")
+    (Path(tls_eng.output_dir)
+     / f"{safe_name}_ssl_ciphers.json").write_text(json.dumps(rich))
+    (Path(tls_eng.output_dir) / f"{safe_name}_testssl.json").write_text(
+        json.dumps([
+            {"id": "LUCKY13", "severity": "LOW", "cve": "CVE-2013-0169",
+             "finding": "potentially vulnerable, uses obsolete TLS CBC "
+                        "ciphers"},
+            {"id": "cert_signatureAlgorithm", "severity": "MEDIUM",
+             "finding": "SHA1 with RSA"},
+        ]))
+    tls_eng._cb_parse_testssl(
+        {"key": "testssl",
+         "artefact_file": str(Path(tls_eng.output_dir)
+                              / f"{safe_name}_testssl.json")}, "")
+    tls_by_key = {f.key: f for f in tls_eng._cb_findings}
+    check("Lucky 13 is reported", "lucky13" in tls_by_key)
+    l13 = tls_by_key["lucky13"]
+    check("as Potential, not Confirmed",
+          getattr(l13, "status_label", ""), "Potential")
+    check("with the suites still in what was found",
+          "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA" in getattr(l13, "summary", ""))
+    check("and the precondition/attack distinction stated",
+          "not attempted" in getattr(l13, "summary", ""))
+    cert = tls_by_key.get("cert_weak_signature")
+    if cert is not None:
+        check("a directly observed certificate fact is Confirmed",
+              getattr(cert, "status_label", ""), "Confirmed")
+
+    # ── Test F — no unsupported severity escalation ─────────────────────
+    print("\n\033[1mF — impact is capped by confirmation\033[0m")
+    for cls, impact, status, wanted in (
+            ("command_injection", "CRITICAL", dreg.INCONCLUSIVE, "INFO"),
+            ("command_injection", "CRITICAL", dreg.POTENTIAL, "LOW"),
+            ("command_injection", "CRITICAL", dreg.CONFIRMED, "CRITICAL"),
+            ("sensitive data exposure", "HIGH", dreg.CONFIRMED, "HIGH"),
+            ("sensitive data exposure", "HIGH", dreg.POTENTIAL, "MEDIUM"),
+            ("misconfiguration", "LOW", dreg.INFORMATIONAL, "INFO")):
+        got, got_impact, _ = riskmod.assess(impact, status, vuln_class=cls)
+        check(f"{cls} / {impact} / {status} → {wanted}", got, wanted)
+        check("  and the impact is preserved alongside it",
+              got_impact, impact)
+    check("an INFO template cannot carry an exploit class",
+          dreg.exploit_class_admissible(["misconfig", "sri"], "info"), False)
+    check("but a template that tests for one can",
+          dreg.exploit_class_admissible(["rce", "injection"], "high"))
+    check("and a HIGH template with no tags is allowed through",
+          dreg.exploit_class_admissible([], "high"))
+
+    # ── Test G — evidence isolation and deduplication ───────────────────
+    print("\n\033[1mG — evidence is not mixed between targets\033[0m")
+    g_one = Engine(real_base)
+    g_one._cb_parse_nikto({"key": "nikto"}, NIKTO_HISTORY)
+    g_two = Engine(spa_base)
+    g_two.output_dir = g_one.output_dir       # same output directory
+    g_two._cb_parse_nikto({"key": "nikto"}, NIKTO_HISTORY)
+    check("each target keeps its own verdict",
+          (getattr(g_one._cb_findings[0], "status_label", ""),
+           getattr(g_two._cb_findings[0], "status_label", "")),
+          ("Confirmed", "Inconclusive"))
+    check("and its own affected URL",
+          g_one._cb_findings[0].where != g_two._cb_findings[0].where)
+    check("the confirmed one's evidence mentions its own host",
+          real_base.split("//")[1].split(":")[0]
+          in g_one._cb_findings[0].where)
+
+    wrong_host = Engine("https://example.bike")
+    (Path(wrong_host.output_dir)
+     / f"{safe_name}_ssl_ciphers.json").write_text(json.dumps(
+         {"host": "someone-else.test", "port": 443, "suite_count": 1,
+          "protocols": {"TLS 1.2": [{"name": "TLS_RSA_WITH_AES_128_CBC_SHA",
+                                     "bits": 128}]},
+          "vulnerabilities": {"Lucky13": {
+              "name": "Lucky13", "description": "x",
+              "suites": [{"name": "TLS_RSA_WITH_AES_128_CBC_SHA",
+                          "bits": 128}]}}}))
+    check("an artefact from another host is refused",
+          wrong_host._cb_tls_evidence("lucky13"), "")
+    check("and the refusal says why",
+          any("not using it" in line for line in wrong_host.printed))
+
+    dedup = Engine(real_base)
+    dedup._cb_parse_nikto({"key": "nikto"}, NIKTO_HISTORY)
+    before = len(dedup._cb_findings)
+    dedup._cb_parse_nikto({"key": "nikto"}, NIKTO_HISTORY)
+    check("re-scanning does not duplicate the finding",
+          len(dedup._cb_findings), before)
+
+    real_srv.shutdown()
+    spa_srv.shutdown()
+
+    # ── the Findings section shows four fields ──────────────────────────
+    print("\n\033[1mThe Findings section shows four fields\033[0m")
+    shown = cb_evidence.summary_html(b_real._cb_findings[0])
+    check("the finding name is there", "Exposed shell history file" in shown)
+    check("the risk rating is there", "High" in shown)
+    check("the confirmation status is there", "Confirmed" in shown)
+    check("and what was found", "What was found" in shown)
+    for absent in ("Recommended remediation", "What could explain this",
+                   "Proof of concept", "Reproduction"):
+        check(f"{absent!r} is not in the summary", absent in shown, False)
+    full = cb_evidence.detail_html(b_real._cb_findings[0])
+    check("but the technical view still has the raw detection",
+          "RAW DETECTION" in full or "Raw detection" in full)
+    check("and the remediation is still recorded on the finding",
+          bool(b_real._cb_findings[0].remediation))
+
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  Explanations: why was this raised, and which evidence says so
+    # ═══════════════════════════════════════════════════════════════════
+    from command_bridge.modules import cipher_properties as cprops
+    from command_bridge.modules import csp_analysis as cspmod
+    from command_bridge.modules import explanations as expl
+
+    # The twelve suites from the report: five CBC, three static-RSA, and
+    # four AEAD including the TLS 1.3 ones. All twelve were being listed
+    # under one "weak cipher suites offered" heading.
+    OFFERED = [
+        ("TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA", 256),
+        ("TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384", 256),
+        ("TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256", 256),
+        ("TLS_RSA_WITH_AES_256_CBC_SHA", 256),
+        ("TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA", 128),
+        ("TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256", 128),
+        ("TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", 128),
+        ("TLS_RSA_WITH_AES_128_CBC_SHA", 128),
+        ("TLS_RSA_WITH_AES_128_GCM_SHA256", 128),
+        ("TLS_AES_256_GCM_SHA384", 256),
+        ("TLS_CHACHA20_POLY1305_SHA256", 256),
+        ("TLS_AES_128_GCM_SHA256", 128),
+    ]
+    SUITES = cprops.parse_all(OFFERED)
+
+    # ── 1. Lucky 13 keeps the suites and claims no exploit ──────────────
+    print("\n\033[1m1 — Lucky 13 names the suites, claims no exploit\033[0m")
+    l13 = expl.explain("lucky13", suites=SUITES, host="example.bike:443")
+    body = l13.text()
+    for suite, _ in OFFERED[:1] + [("TLS_RSA_WITH_AES_256_CBC_SHA", 0),
+                                   ("TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA", 0),
+                                   ("TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
+                                    0),
+                                   ("TLS_RSA_WITH_AES_128_CBC_SHA", 0)]:
+        check(f"{suite} is listed", suite in body)
+    check("the CBC construction is explained, not just named",
+          "MAC-then-encrypt" in body)
+    check("exploitability is explicitly not claimed",
+          "not attempted" in body and "unestablished" in body)
+    check("no claim that CBC is simply broken",
+          "no longer considered secure" in body.lower(), False)
+    check("the AEAD suites are shown as NOT part of the finding",
+          "not part of this finding" in body)
+    # The suite listing is names only — the key size and cipher are
+    # already in the IANA name, so the trailing "256-bit AES" was noise.
+    check("the suite names stand alone, without a redundant bit/cipher tag",
+          "256-bit AES" in body, False)
+    check("   but the suite name itself (which carries the key size) is kept",
+          "TLS_RSA_WITH_AES_256_CBC_SHA" in body)
+
+    # ── 2. Weak ciphers separate problematic from AEAD ──────────────────
+    print("\n\033[1m2 — weak ciphers: problematic vs AEAD\033[0m")
+    weak = expl.explain("weak_cipher", suites=SUITES,
+                        host="example.bike:443").text()
+    problem_half, _, other_half = weak.partition("Other suites observed")
+    check("the AEAD suites are not in the problematic half",
+          "TLS_AES_256_GCM_SHA384" in problem_half, False)
+    check("and they are in the other half",
+          "TLS_AES_256_GCM_SHA384" in other_half)
+    check("the CBC suites ARE in the problematic half",
+          "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA" in problem_half)
+    check("each group states its own reason",
+          "static RSA key exchange" in problem_half
+          and "CBC mode" in problem_half)
+    check("the count is of problematic suites, not all of them",
+          weak.startswith("6 of the 12"))
+    check("and a 128-bit key is explicitly not the reason",
+          "128-bit key is not itself a weakness" in weak)
+
+    # ── 3. static RSA distinguished from ECDHE ──────────────────────────
+    print("\n\033[1m3 — static RSA is not ECDHE\033[0m")
+    static = cprops.with_weakness(SUITES, cprops.STATIC_RSA)
+    check("three static-RSA suites are identified", len(static), 3)
+    check("ECDHE suites are not among them",
+          any("ECDHE" in s.name for s in static), False)
+    for suite in SUITES:
+        if suite.key_exchange == "ECDHE":
+            check(f"{suite.name[:42]} has forward secrecy",
+                  suite.forward_secrecy)
+    check("TLS_RSA_WITH_AES_128_GCM_SHA256 is flagged for key exchange "
+          "only, not its cipher",
+          cprops.parse("TLS_RSA_WITH_AES_128_GCM_SHA256").weaknesses,
+          (cprops.STATIC_RSA,))
+    rsa_text = expl.explain("robot", suites=SUITES,
+                            host="example.bike:443").text()
+    check("the explanation says why it matters",
+          "forward secrecy" in rsa_text)
+    check("and shows the ECDHE suites for comparison",
+          "WITH forward secrecy" in rsa_text)
+
+    # ── 4. TLS 1.3 suites are not weak ──────────────────────────────────
+    print("\n\033[1m4 — TLS 1.3 suites are not weak\033[0m")
+    for name in ("TLS_AES_256_GCM_SHA384", "TLS_AES_128_GCM_SHA256",
+                 "TLS_CHACHA20_POLY1305_SHA256"):
+        suite = cprops.parse(name)
+        check(f"{name} parses as TLS 1.3", suite.tls13)
+        check("  as AEAD", suite.aead)
+        check("  with forward secrecy", suite.forward_secrecy)
+        check("  and no weaknesses", suite.weaknesses, ())
+    check("AES-128 alone is not a weakness",
+          cprops.parse("TLS_AES_128_GCM_SHA256").weaknesses, ())
+    check("an unrecognised suite name claims nothing",
+          cprops.parse("TLS_SOMETHING_INVENTED").weaknesses, ())
+    check("and is marked unparsed rather than judged",
+          cprops.parse("TLS_SOMETHING_INVENTED").parsed, False)
+
+    # ── 5. Certificate expiry uses the scan date ────────────────────────
+    print("\n\033[1m5 — certificate expiry against the scan date\033[0m")
+    scan_day = datetime.datetime(2026, 10, 22)
+    gone = expl.explain("cert_expired", not_after="2026-09-12",
+                        scanned_at=scan_day, not_before="2025-09-12",
+                        host="example.bike")
+    check("an expired certificate says how long ago",
+          "40 day(s) before this scan" in gone.text())
+    check("and shows both dates",
+          "2026-09-12" in gone.text() and "2026-10-22" in gone.text())
+    soon = expl.explain("cert_expiring", not_after="2026-11-03",
+                        scanned_at=scan_day, host="example.bike")
+    check("one near expiry is a deadline, not a vulnerability",
+          "Not a vulnerability" in soon.text())
+    check("a certificate valid for months is no finding at all",
+          expl.explain("cert_expired", not_after="2027-05-10",
+                       scanned_at=scan_day), None)
+    check("an unparseable date draws no conclusion",
+          "No conclusion" in expl.explain(
+              "cert_expired", not_after="not a date",
+              scanned_at=scan_day).text())
+
+    # ── 6-13. Cross-Site Framing ────────────────────────────────────────
+    print("\n\033[1m6-13 — Cross-Site Framing, from parsed directives\033[0m")
+    LONG_CSP = ("base-uri 'self'; connect-src 'self' https://api.example.com "
+                "https://sentry.io; default-src 'self'; font-src 'self' "
+                "https://fonts.gstatic.com; img-src 'self' data:")
+
+    def framing(**headers):
+        return cspmod.assess_framing(headers=headers)
+
+    # 6 — missing frame-ancestors, no alternative protection
+    policy = framing(**{"Content-Security-Policy": LONG_CSP})
+    check("6. a missing frame-ancestors with no XFO is a finding",
+          policy.vulnerable)
+    said = expl.explain("cross_site_framing", policy=policy,
+                        url="https://example.bike/").text()
+    check("   the explanation names the missing directive",
+          "no frame-ancestors directive" in said)
+    check("   and says X-Frame-Options was absent",
+          "No X-Frame-Options header was returned" in said)
+    check("   and says default-src is not a fallback",
+          "not a fallback for frame-ancestors" in said)
+    check("   the actual header is preserved",
+          "connect-src 'self' https://api.example.com" in said)
+    check("   and it does not claim a successful exploit",
+          "was not tested" in said)
+
+    # 7 — frame-ancestors 'none'
+    policy = framing(**{"Content-Security-Policy":
+                        "default-src 'self'; frame-ancestors 'none'"})
+    check("7. frame-ancestors 'none' is not a finding", policy.vulnerable,
+          False)
+    check("   and is read as 'none'", policy.verdict, cspmod.NONE)
+
+    # 8 — frame-ancestors 'self'
+    policy = framing(**{"Content-Security-Policy": "frame-ancestors 'self'"})
+    check("8. frame-ancestors 'self' is not a finding", policy.vulnerable,
+          False)
+    check("   and is read as same-origin only", policy.verdict,
+          cspmod.SELF_ONLY)
+
+    # 9 — a specific permitted origin
+    policy = framing(**{"Content-Security-Policy":
+                        "frame-ancestors 'self' https://partner.example.com"})
+    check("9. an allow-list is not reported as missing protection",
+          policy.vulnerable, False)
+    check("   it is reported as an allow-list", policy.verdict,
+          cspmod.SPECIFIC_ORIGINS)
+    check("   and the permitted origin is named",
+          "https://partner.example.com" in policy.permitted_origins)
+    check("   with the judgement left to the reader",
+          "whether they are trusted" in expl.explain(
+              "cross_site_framing", policy=policy).text())
+
+    # 10 — default-src without frame-ancestors
+    policy = framing(**{"Content-Security-Policy": "default-src 'self'"})
+    check("10. default-src alone does not protect against framing",
+          policy.vulnerable)
+    check("    and the explanation says exactly that",
+          "not a fallback for frame-ancestors" in expl.explain(
+              "cross_site_framing", policy=policy).text())
+
+    # 11 — frame-src without frame-ancestors
+    policy = framing(**{"Content-Security-Policy": "frame-src 'self'"})
+    check("11. frame-src is not frame-ancestors", policy.vulnerable)
+    check("    and the difference is explained",
+          "not who may embed this page" in expl.explain(
+              "cross_site_framing", policy=policy).text())
+
+    # 12 — X-Frame-Options present / absent / obsolete
+    check("12a. XFO DENY with no CSP is not a finding",
+          framing(**{"X-Frame-Options": "DENY"}).vulnerable, False)
+    check("12b. XFO SAMEORIGIN covers a CSP with no frame-ancestors",
+          framing(**{"Content-Security-Policy": LONG_CSP,
+                     "X-Frame-Options": "SAMEORIGIN"}).vulnerable, False)
+    obsolete = framing(**{"Content-Security-Policy": LONG_CSP,
+                          "X-Frame-Options": "ALLOW-FROM https://x.test"})
+    check("12c. XFO ALLOW-FROM is not protection", obsolete.vulnerable)
+    check("     and is reported as obsolete",
+          any("obsolete" in note for note in obsolete.notes))
+    check("12d. nothing is claimed about XFO when nothing was inspected",
+          cspmod.assess_framing(csp=LONG_CSP, inspected=False).vulnerable,
+          False)
+    check("     and the explanation says so",
+          "No response was examined" in expl.explain(
+              "cross_site_framing",
+              policy=cspmod.assess_framing(csp=LONG_CSP,
+                                           inspected=False)).text())
+
+    # 13 — unrelated third-party origins
+    policy = framing(**{"Content-Security-Policy":
+                        "connect-src * https://third.party.test; "
+                        "frame-ancestors 'none'"})
+    check("13. an unrestricted connect-src is not Cross-Site Framing",
+          policy.vulnerable, False)
+    check("    a long header with third-party origins is not either",
+          framing(**{"Content-Security-Policy":
+                     LONG_CSP + "; frame-ancestors 'self'"}).vulnerable,
+          False)
+
+    # wildcard frame-ancestors IS a finding, and a different one
+    wild = framing(**{"Content-Security-Policy": "frame-ancestors *"})
+    check("a wildcard frame-ancestors is a finding", wild.vulnerable)
+    check("reported as permissive rather than missing",
+          "rather than a missing protection" in expl.explain(
+              "cross_site_framing", policy=wild).text())
+
+    check("the canonical name is ours",
+          cb_issues.ISSUES["cross_site_framing"]["title"],
+          "Cross-Site Framing")
+    check("and the word clickjacking is not the finding's name",
+          "clickjack" in
+          cb_issues.ISSUES["cross_site_framing"]["title"].lower(), False)
+
+    # ── 14. Missing SRI is not command injection ────────────────────────
+    print("\n\033[1m14 — missing SRI explains SRI\033[0m")
+    sri = expl.explain("sri_missing",
+                       scripts=["https://cdn.example.test/a.js"],
+                       url="https://example.bike/").text()
+    check("the explanation is about integrity verification",
+          "integrity" in sri)
+    check("it names the external resource",
+          "https://cdn.example.test/a.js" in sri)
+    check("it says what the browser cannot do",
+          "cannot tell whether" in sri)
+    check("and mentions no shell or command execution",
+          any(word in sri.lower()
+              for word in ("shell", "command injection")), False)
+
+    # ── 15. Raw evidence retained behind the concise view ──────────────
+    print("\n\033[1m15 — concise view, raw evidence retained\033[0m")
+    srv_real, base_real = _serve(_RealFiles)
+    keeper = Engine(base_real)
+    keeper._cb_parse_nikto({"key": "nikto"}, NIKTO_HISTORY)
+    kept_finding = keeper._cb_findings[0]
+    concise = cb_evidence.summary_html(kept_finding)
+    for field_name in ("Risk rating", "Confirmation", "Affected",
+                       "Detected By", "What was found"):
+        check(f"the summary has {field_name}", field_name in concise)
+    check("the explanation is in the summary",
+          "credentials passed on the command line" in concise)
+    check("so is the specific evidence", "HTTP 200" in concise)
+    check("remediation is NOT in the summary",
+          "Remove the file from the web root" in concise, False)
+    technical = cb_evidence.detail_html(kept_finding)
+    check("the raw Nikto line is still in the technical view",
+          "002743" in technical)
+    check("and the remediation is still on the finding",
+          "Remove the file from the web root" in kept_finding.remediation)
+    check("the explanation is kept as structure too",
+          bool(getattr(kept_finding, "explanation", None)))
+    srv_real.shutdown()
+
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  The decision engine: classified by what was detected
+    # ═══════════════════════════════════════════════════════════════════
+    #
+    # The rule under test is one sentence: a class that needs a
+    # demonstrated behaviour cannot be carried by an observation that is
+    # only a header value, a cipher, a path or a banner. It is checked
+    # for every finding from every scanner, so it needs no entry per
+    # detector — which is what the four reported misclassifications
+    # each needed before.
+    from command_bridge.modules import classification as engine
+    from command_bridge.modules import verification as vfy
+
+    print("\n\033[1mStage 3 — can the observation support the class?\033[0m")
+    for key, kind, allowed in (
+            ("command_injection", engine.HEADER_VALUE, False),
+            ("command_injection", engine.PATH_EXISTS, False),
+            ("command_injection", engine.COMPONENT, False),
+            ("command_injection", engine.CIPHER_CONFIG, False),
+            ("command_injection", engine.DEMONSTRATED, True),
+            ("xss_reflected", engine.HEADER_VALUE, False),
+            ("xss_reflected", engine.EXTRACTED_URL, False),
+            ("xss_reflected", engine.PARAMETER_ECHO, True),
+            ("xss_reflected", engine.DEMONSTRATED, True),
+            ("sqli", engine.PATH_EXISTS, False),
+            ("sqli", engine.DEMONSTRATED, True),
+            ("traversal", engine.RESPONSE_BODY, True),
+            # Non-behavioural classes are unaffected: a header finding
+            # from a header observation is exactly right.
+            ("csp_missing", engine.HEADER_VALUE, True),
+            ("weak_cipher", engine.CIPHER_CONFIG, True),
+            ("sri_missing", engine.EXTRACTED_URL, True)):
+        ok, _ = engine.consistent(key, engine.Observation(kind=kind))
+        check(f"{key} from {kind}", ok, allowed)
+
+    print("\n\033[1mA — an XSS template that only reads a header\033[0m")
+    XSS_HEADER_ROW = {
+        "template-id": "xss-deprecated-header",
+        "matched-at": "https://example.bike/",
+        "info": {"name": "X-XSS-Protection Header - Deprecated",
+                 "severity": "info",
+                 "tags": ["xss", "misconfig", "headers"],
+                 "description": "The X-XSS-Protection header is deprecated."},
+        "extracted-results": ["1; mode=block"],
+        "request": "GET / HTTP/1.1",
+    }
+
+    class _XssHeader(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"<html><body>ok</body></html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("X-XSS-Protection", "1; mode=block")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    hdr_srv, hdr_base = _serve(_XssHeader)
+    hdr = Engine(hdr_base)
+    row = dict(XSS_HEADER_ROW, **{"matched-at": hdr_base + "/"})
+    hdr._cb_parse_nuclei({"key": "nuclei"}, json.dumps(row))
+    check("one finding is produced", len(hdr._cb_findings), 1)
+    deprecated = hdr._cb_findings[0]
+    check("named as the header it is about",
+          deprecated.title, "Deprecated X-XSS-Protection header")
+    check("not as cross-site scripting",
+          "scripting" in deprecated.title.lower(), False)
+    check("the issue key is the header observation",
+          deprecated.key, "xss_protection_deprecated")
+    check("rated Informational", deprecated.severity, "INFO")
+    check("confirmed, because the header was read back",
+          getattr(deprecated, "status_label", ""), "Confirmed")
+    summary = getattr(deprecated, "summary", "")
+    check("the value is preserved", "1; mode=block" in summary)
+    check("the affected URL is preserved",
+          hdr_base in deprecated.where)
+    check("it says the header is legacy",
+          "legacy" in summary.lower() or "deprecated" in summary.lower())
+    check("the title says deprecated", "Deprecated" in deprecated.title)
+    check("and says explicitly that it is not XSS evidence",
+          "not evidence of a cross-site scripting" in summary.lower())
+    # The word "payload" DOES appear — in the sentence denying there is
+    # one ("no input, payload or reflection is involved in this check").
+    # What must not happen is the header's value being presented AS a
+    # payload, which is what the misclassification did.
+    check("the header value is not presented as a payload",
+          "payload: 1; mode=block" in summary.lower(), False)
+    check("nor as an injected string",
+          "injected" in summary.lower(), False)
+    check("nuclei's own severity is kept",
+          deprecated.scanner_severity, "INFO")
+    check("the raw template id survives in the technical view",
+          "xss-deprecated-header" in cb_evidence.detail_html(deprecated))
+    hdr_srv.shutdown()
+
+    print("\n\033[1mA1 — the same row with nowhere to read the header "
+          "back\033[0m")
+    # The live sighting: nuclei claiming HIGH, against a host this
+    # process cannot reach. Nothing about the rating may come from the
+    # scanner's claim or from "xss" in the template id.
+    unreachable = Engine("https://rider-web.basis-development.bike")
+    live_row = {
+        "template-id": "xss-deprecated-header",
+        "matched-at": "https://rider-web.basis-development.bike",
+        "info": {"name": "X-XSS-Protection Header - Deprecated",
+                 "severity": "high", "tags": ["xss", "misconfig"],
+                 "description": "The X-XSS-Protection header is deprecated."},
+        "extracted-results": ["1; mode=block"],
+        "request": "GET / HTTP/1.1",
+    }
+    unreachable._cb_parse_nuclei({"key": "nuclei"}, json.dumps(live_row))
+    check("1. one finding, and it is not XSS",
+          len(unreachable._cb_findings), 1)
+    live = unreachable._cb_findings[0]
+    check("   not reflected cross-site scripting",
+          "scripting" in live.title.lower(), False)
+    check("   named as the header", live.key, "xss_protection_deprecated")
+    check("2. Informational, not the scanner's HIGH", live.severity, "INFO")
+    check("3. inconclusive, because nothing read the header back",
+          getattr(live, "status_label", ""), "Inconclusive")
+    check("   and not 'Potential', which would read as a potential "
+          "vulnerability",
+          getattr(live, "status_label", "") == "Potential", False)
+    check("   the affected URL is the scan's own target",
+          "rider-web.basis-development.bike" in live.where)
+    check("   nuclei keeps the attribution",
+          getattr(live, "scanner_severity", ""), "HIGH")
+
+    # 4. through export.
+    blob = unreachable._cb_findings_json()
+    exported = json.loads(blob)["findings"][0]
+    check("4. the export never says reflected XSS",
+          "reflected" in blob.lower(), False)
+    check("   and carries the corrected title",
+          "Deprecated X-XSS-Protection header" in blob)
+    check("   with the rating it was given", exported["severity"], "INFO")
+    check("   and the template id, for audit",
+          exported["template_id"], "xss-deprecated-header")
+    check("   attributed to nuclei", exported["detected_by"], "nuclei")
+    check("   the exported state agrees with the table, not the raw "
+          "verification",
+          exported["state"], "INCONCLUSIVE")
+    check("   and the exported status reads the same",
+          exported["status"], "Inconclusive")
+
+    # 7. reprocessing the same scanner output.
+    before = len(unreachable._cb_findings)
+    unreachable._cb_parse_nuclei({"key": "nuclei"}, json.dumps(live_row))
+    check("7. reprocessing the same row adds no duplicate",
+          len(unreachable._cb_findings), before)
+
+    print("\n\033[1mA2 — a genuine XSS template is untouched\033[0m")
+    # 5/6. The guard is one template, not the word "xss". A template
+    # that demonstrates reflection with a payload still reports as XSS.
+    class _Reflects(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"<html>search: <script>alert(1)</script></html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    xss_srv, xss_base = _serve(_Reflects)
+    real = Engine(xss_base)
+    real._cb_parse_nuclei({"key": "nuclei"}, json.dumps({
+        "template-id": "reflected-xss",
+        "matched-at": xss_base + "/?q=%3Cscript%3Ealert(1)%3C/script%3E",
+        "info": {"name": "Reflected Cross-Site Scripting",
+                 "severity": "high", "tags": ["xss", "cve"],
+                 "description": "Payload reflected into the response body."},
+        "extracted-results": ["<script>alert(1)</script>"],
+        "request": "GET /?q=<script>alert(1)</script> HTTP/1.1",
+    }))
+    check("5. the genuine template still produces a finding",
+          len(real._cb_findings), 1)
+    genuine = real._cb_findings[0]
+    check("   and is not forced down to the header observation",
+          genuine.key == "xss_protection_deprecated", False)
+    check("6. nor flattened to Informational by a blanket xss rule",
+          genuine.severity in ("LOW", "MEDIUM", "HIGH", "CRITICAL"))
+    xss_srv.shutdown()
+
+    print("\n\033[1mThe rule generalises to detectors with no entry\033[0m")
+    invented = dreg.Detection(
+        detector=dreg.Detector(
+            name="Some Injection Check", issue_key="command_injection",
+            vuln_class="injection", severity_if_confirmed="CRITICAL",
+            severity_unconfirmed="INFO", observation=engine.HEADER_VALUE,
+            header="X-Powered-By", observation_is_self_evident=True),
+        detector_name="invented", scanner="nuclei",
+        detector_id="never-seen-before", scanner_severity="CRITICAL",
+        url="https://example.bike/", extracted=("PHP/8.1",))
+    outcome = vfy.Outcome(status=dreg.CONFIRMED, summary="header read",
+                          evidence=["X-Powered-By: PHP/8.1"], verified=True,
+                          http_status=200)
+    verdict = engine.decide(invented, outcome,
+                            issue_library=cb_issues.ISSUES, verified=True)
+    check("a CRITICAL injection class on a header observation is rejected",
+          verdict.issue_key, "security_header_observation")
+    check("and rated Informational, not CRITICAL", verdict.severity, "INFO")
+    check("the rejection is recorded with its reason",
+          "cannot establish command_injection" in verdict.mismatch)
+    check("the scanner's own severity is still kept",
+          verdict.scanner_severity, "CRITICAL")
+    check("the observation itself is confirmed — it was read",
+          verdict.status_label, "Confirmed")
+
+    print("\n\033[1mA genuine high-impact finding is NOT suppressed\033[0m")
+    genuine = dreg.Detection(
+        detector=dreg.Detector(
+            name="OS command injection", issue_key="command_injection",
+            vuln_class="injection", severity_if_confirmed="CRITICAL",
+            observation=engine.DEMONSTRATED),
+        detector_name="real", scanner="active-scan", detector_id="cmdi",
+        url="https://example.bike/ping?host=1")
+    proved = vfy.Outcome(status=dreg.CONFIRMED,
+                         summary="uid=33(www-data) returned",
+                         evidence=["uid=33(www-data) in the response"],
+                         verified=True)
+    kept = engine.decide(genuine, proved, issue_library=cb_issues.ISSUES,
+                         verified=True)
+    check("it keeps its class", kept.issue_key, "command_injection")
+    check("at CRITICAL", kept.severity, "CRITICAL")
+    check("Confirmed", kept.status_label, "Confirmed")
+    check("with no mismatch recorded", kept.mismatch, "")
+    check("and it is displayed, not filed as context", kept.display, "report")
+
+    print("\n\033[1mAn informational result is not promoted\033[0m")
+    for impact, status, wanted in (("CRITICAL", dreg.INFORMATIONAL, "INFO"),
+                                   ("HIGH", dreg.INFORMATIONAL, "INFO"),
+                                   ("CRITICAL", dreg.INCONCLUSIVE, "INFO")):
+        got, _, _ = riskmod.assess(impact, status,
+                                   vuln_class="command_injection")
+        check(f"{impact} + {status} → {wanted}", got, wanted)
+    check("a missing security header does not become High",
+          riskmod.assess(cb_issues.ISSUES["hsts_missing"]["severity"],
+                         dreg.CONFIRMED, vuln_class="hsts_missing")[0]
+          in ("INFO", "LOW", "MEDIUM"))
+
+    print("\n\033[1mReflection: harmless versus unsafe\033[0m")
+    harmless = expl.explain("xss_reflected", parameter="q",
+                            payload="cbtest123", reflected=False,
+                            url="https://example.bike/search")
+    check("no recorded reflection means no XSS claim",
+          "does not establish XSS" in harmless.text())
+    reflected = expl.explain("xss_reflected", parameter="q",
+                             payload="<cb>test</cb>", reflected=True,
+                             context="HTML body")
+    check("reflection alone is described as reflection",
+          "reflected into the response" in reflected.text())
+    check("and execution is explicitly not claimed",
+          "not demonstrated" in reflected.text())
+    executed = expl.explain("xss_reflected", parameter="q",
+                            payload="<script>alert(document.domain)</script>",
+                            reflected=True, executed=True,
+                            context="HTML body")
+    check("only a browser-confirmed case claims execution",
+          "executed by a browser" in executed.text())
+    check("and it carries no 'not demonstrated' caveat",
+          "not demonstrated" in executed.text(), False)
+
+    print("\n\033[1mSQL injection needs more than a 500\033[0m")
+    thin = expl.explain("sqli", parameter="id", payload="1'")
+    check("no differential or DB error means no claim",
+          "does not establish injection" in thin.text())
+    check("and it says a generic error is not enough",
+          "generic server error is not enough" in thin.text())
+    solid = expl.explain("sqli", parameter="id", payload="1 AND 1=1",
+                         differential=True)
+    check("a differential does establish it",
+          "reaches a SQL query" in solid.text())
+    check("while saying what was not done",
+          "Data was not extracted" in solid.text())
+
+    print("\n\033[1mCommand injection needs observed execution\033[0m")
+    no_proof = expl.explain("command_injection", parameter="host",
+                            payload="127.0.0.1;id")
+    check("a template match alone claims nothing",
+          "Nothing here shows input reaching a shell" in no_proof.text())
+    with_proof = expl.explain("command_injection", parameter="host",
+                              payload="127.0.0.1;id",
+                              command_output="uid=33(www-data)")
+    check("observed output does establish it",
+          "reaches a shell" in with_proof.text())
+
+    print("\n\033[1mHistorical findings can be re-measured\033[0m")
+    import importlib.util as _ilu
+    report_script = Path(__file__).resolve().parent.parent \
+        / "reclassify_report.py"
+    check("the measurement tool is present", report_script.is_file())
+    if report_script.is_file():
+        spec = _ilu.spec_from_file_location("_reclassify", report_script)
+        module = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        saved = [
+            {"key": "command_injection", "severity": "CRITICAL",
+             "state": "DETECTED", "where": "https://x/",
+             "evidence": "nuclei template 'missing-sri' matched. "
+                         "Extracted: https://cdn.test/a.js"},
+            {"key": "xss_reflected", "severity": "HIGH",
+             "state": "DETECTED", "where": "https://x/",
+             "evidence": "X-XSS-Protection header: 1; mode=block"},
+            {"key": "command_injection", "severity": "CRITICAL",
+             "state": "CONFIRMED", "where": "https://x/ping?host=1",
+             "evidence": "parameter: host\\npayload: 1;id\\n"
+                         "uid=33(www-data) in the response"},
+        ]
+        verdicts = [module.assess(row)[0] for row in saved]
+        check("the two misclassifications are reclassified",
+              verdicts[:2], ["reclassified", "reclassified"])
+        check("the genuine confirmed injection is retained",
+              verdicts[2], "retained")
+        check("and the tool reads findings without writing them",
+              "writes nothing" in report_script.read_text())
+
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  Grouped findings — presentation only
+    # ═══════════════════════════════════════════════════════════════════
+    #
+    # The rule the whole feature rests on: grouping changes what is
+    # DRAWN and nothing else. Every assertion below either checks the
+    # arrangement or checks that a child is untouched by it.
+    print("\n\033[1mFinding groups\033[0m")
+    from command_bridge.modules import finding_groups as groups_mod
+
+    def made(key, severity, title, stage="", status="Confirmed"):
+        finding = CBFinding(severity, title, "https://example.bike/",
+                            "detail", "evidence", "", stage)
+        finding.key = key
+        finding.status_label = status
+        return finding
+
+    TLS = [made("lucky13", "LOW", "Lucky 13 (CBC ciphers supported)",
+                "testssl", "Potential"),
+           made("weak_cipher", "MEDIUM", "Weak cipher suites offered",
+                "testssl"),
+           made("obsolete_protocol", "MEDIUM", "Obsolete TLS protocol",
+                "testssl"),
+           made("cert_expiring", "INFO", "Certificate nearing expiry",
+                "testssl")]
+    CSP = [made("cross_site_framing", "MEDIUM", "Cross-Site Framing",
+                "headers"),
+           made("csp_unsafe_script", "MEDIUM", "CSP allows untrusted script",
+                "headers"),
+           made("csp_form_hijack", "LOW", "CSP allows form hijacking",
+                "headers", "Potential")]
+    HEADERS = [made("nosniff_missing", "LOW", "X-Content-Type-Options "
+                                              "missing", "headers"),
+               made("referrer_policy", "LOW", "Referrer-Policy not set",
+                    "headers"),
+               made("xss_protection_deprecated", "INFO",
+                    "Deprecated X-XSS-Protection header", "nuclei")]
+    ALONE = [made("command_injection", "CRITICAL", "OS command injection",
+                  "active-scan"),
+             made("shell_history_exposed", "HIGH",
+                  "Exposed shell history file", "nikto")]
+
+    everything = TLS + CSP + HEADERS + ALONE
+    grouped, loose = groups_mod.organise(everything)
+    by_key = {g.key: g for g in grouped}
+
+    # 1-3. the three groups form
+    check("1. four TLS findings form one group",
+          by_key["tls"].count, 4)
+    check("   and it is titled for a reader",
+          by_key["tls"].title, "TLS/SSL — Several Issues Detected")
+    check("2. three CSP findings form one group", by_key["csp"].count, 3)
+    check("   titled for CSP", by_key["csp"].title,
+          "Content-Security-Policy — Several Issues Detected")
+    check("3. the header findings group too", by_key["headers"].count, 3)
+    check("   titled for headers", by_key["headers"].title,
+          "HTTP Security Headers — Several Issues Detected")
+
+    # 4. CSP is not also under HTTP Security Headers
+    csp_ids = {id(f) for f in by_key["csp"].findings}
+    header_ids = {id(f) for f in by_key["headers"].findings}
+    check("4. no finding is in both CSP and HTTP Security Headers",
+          csp_ids & header_ids, set())
+    check("   the CSP keys are the CSP ones",
+          sorted(f.key for f in by_key["csp"].findings),
+          ["cross_site_framing", "csp_form_hijack", "csp_unsafe_script"])
+
+    # 5. unrelated findings stay separate
+    check("5. unrelated findings are not grouped", len(loose), 2)
+    check("   the critical injection keeps its own row",
+          any(f.key == "command_injection" for f in loose))
+    check("   and so does the file exposure",
+          any(f.key == "shell_history_exposed" for f in loose))
+
+    # counts, once each
+    check("every finding is placed exactly once",
+          groups_mod.total_shown(grouped, loose), len(everything))
+    placed = [f for g in grouped for f in g.findings] + loose
+    check("and none is placed twice",
+          len({id(f) for f in placed}), len(everything))
+
+    # 8. children keep everything that was theirs
+    tls_lucky = next(f for f in by_key["tls"].findings
+                     if f.key == "lucky13")
+    original = next(f for f in TLS if f.key == "lucky13")
+    check("8. a grouped child is the same object, not a copy",
+          tls_lucky is original)
+    check("   it keeps its severity", tls_lucky.severity, "LOW")
+    check("   its confirmation status",
+          getattr(tls_lucky, "status_label", ""), "Potential")
+    check("   its scanner attribution", tls_lucky.stage, "testssl")
+    check("   and its evidence", tls_lucky.evidence, "evidence")
+
+    # 9. parent summaries are computed from the children
+    tls_summary = by_key["tls"].summary()
+    check("9. the summary counts the findings",
+          tls_summary.startswith("4 findings"))
+    check("   and the severities present",
+          "2 Medium" in tls_summary and "1 Low" in tls_summary
+          and "1 Informational" in tls_summary)
+    check("   and the confirmation statuses",
+          "3 Confirmed" in tls_summary and "1 Potential" in tls_summary)
+    check("   a severity that is absent is not mentioned",
+          "Critical" in tls_summary, False)
+    check("   the worst severity present is reported as such",
+          by_key["tls"].worst_severity, "MEDIUM")
+    check("   and the group is not labelled by its worst child alone",
+          tls_summary.strip().startswith("Medium"), False)
+
+    # 12. an informational-only group claims nothing
+    info_only = groups_mod.organise([
+        made("xss_protection_deprecated", "INFO", "Deprecated header",
+             "nuclei"),
+        made("referrer_policy", "INFO", "Referrer-Policy not set",
+             "headers")])[0][0]
+    check("12. a group of observations says so",
+          "no vulnerability claimed" in info_only.summary())
+    check("    and reports itself as informational only",
+          info_only.informational_only)
+    check("    while a group with a real finding does not",
+          by_key["tls"].informational_only, False)
+
+    # 13. a single finding is not forced into a group
+    single_groups, single_loose = groups_mod.organise(
+        [made("lucky13", "LOW", "Lucky 13", "testssl")])
+    check("13. one TLS finding is not a group of one",
+          (len(single_groups), len(single_loose)), (0, 1))
+
+    # 11. separate targets never share a group instance
+    print("\n\033[1mWhat belongs where, corrected from a real scan\033[0m")
+    # 1. A missing CSP is an HTTP security header finding. A reader
+    # looking for it under HTTP Security Headers was not finding it,
+    # because one CSP finding is not a CSP group and it fell out as a
+    # loose row of its own.
+    one_csp = groups_mod.organise(HEADERS + [
+        made("csp_missing", "MEDIUM", "Content-Security-Policy missing",
+             "headers")])
+    header_group = next(g for g in one_csp[0] if g.key == "headers")
+    check("a lone CSP finding joins the HTTP security headers",
+          any(f.key == "csp_missing" for f in header_group.findings))
+    check("   and is not left as a row of its own",
+          any(f.key == "csp_missing" for f in one_csp[1]), False)
+    check("   while several CSP findings still form their own group",
+          {g.key for g in groups_mod.organise(CSP + HEADERS)[0]},
+          {"csp", "headers"})
+    check("   with no finding counted twice",
+          groups_mod.total_shown(*groups_mod.organise(CSP + HEADERS)),
+          len(CSP + HEADERS))
+
+    # 2. HSTS is a response header, found the way a missing CSP is
+    # found. Grouping it under TLS/SSL implied testssl had reported it,
+    # and buried a Medium finding behind a chevron.
+    hsts = made("hsts_missing", "MEDIUM",
+                "HTTP Strict-Transport-Security not set", "headers")
+    with_hsts = groups_mod.organise(TLS + [hsts])
+    check("HSTS is never folded into the TLS group",
+          any(f.key == "hsts_missing"
+              for g in with_hsts[0] for f in g.findings), False)
+    check("   it stays a row of its own, visible without a click",
+          any(f.key == "hsts_missing" for f in with_hsts[1]))
+    check("   and it is not in the TLS category's key list",
+          "hsts_missing" in next(c for c in groups_mod.CATEGORIES
+                                 if c.key == "tls").keys, False)
+    check("   nor quietly moved into the header group either",
+          groups_mod.category_for(hsts), None)
+
+    # 3. The nmap findings get a group of their own.
+    PORTS = [made("remote_access_exposed", "MEDIUM", "SSH on 22/tcp",
+                  "nmap"),
+             made("cleartext_service", "HIGH", "FTP on 21/tcp", "nmap"),
+             made("service_version_disclosed", "LOW",
+                  "Service version disclosed — ssh", "nmap"),
+             made("excessive_ports", "LOW", "Potentially excessive ports",
+                  "nmap")]
+    port_group = next(g for g in groups_mod.organise(PORTS)[0]
+                      if g.key == "ports")
+    check("the open ports form one group", port_group.count, 4)
+    check("   titled as the scan a tester ran",
+          "Open Ports and Services" in port_group.category.title)
+    check("   naming its worst findings on the parent row",
+          "FTP on 21/tcp" in port_group.headline())
+    check("   and an unrecognised nmap finding still lands there",
+          groups_mod.category_for(
+              made("", "INFO", "something", "nmap_quick")).key, "ports")
+
+    first = groups_mod.organise(TLS)[0][0]
+    other_target = [made(f.key, f.severity, f.title, f.stage) for f in TLS]
+    for finding in other_target:
+        finding.where = "https://other.example/"
+    second = groups_mod.organise(other_target)[0][0]
+    check("11. each target's group holds only its own findings",
+          {id(f) for f in first.findings} & {id(f) for f in second.findings},
+          set())
+    check("    and its own locations",
+          {f.where for f in second.findings}, {"https://other.example/"})
+
+    check("a category with no members produces no group",
+          any(g.key == "injection" for g in grouped), False)
+    check("adding a category needs no UI change — the UI reads this list",
+          all(hasattr(c, "title") and hasattr(c, "order")
+              for c in groups_mod.CATEGORIES))
 
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0

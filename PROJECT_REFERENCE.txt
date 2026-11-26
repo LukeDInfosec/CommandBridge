@@ -19,6 +19,37 @@ HOW TO USE THIS FILE
  CHANGELOG (most recent first)
 ================================================================================
 
+## 2026-11-26 — SMARTFUZZ: UMBRACO, AND /modules IS NOT DRUPAL (6.12.4)
+
+Reported from a live scan: the target returned Microsoft-IIS headers and
+answered on /umbraco — an Umbraco (.NET) site — and SmartFuzz ran a
+DRUPAL deep scan. Two causes:
+
+  * /modules was a Drupal AND a Joomla signature path. It is shipped by
+    Umbraco, SilverStripe and others and identifies nothing on its own,
+    so a lone /modules was promoting Drupal. Removed from both (and the
+    equally generic /node dropped from Drupal). The remaining Drupal
+    signatures (/sites/default, /core/misc, /misc/drupal.js, /user/login)
+    actually identify Drupal.
+  * there was NO Umbraco signature, so /umbraco — an unambiguous,
+    one-path tell — matched nothing. Added at the highest priority: a
+    host that answers on /umbraco is Umbraco. Inference also now breaks
+    priority ties by match count.
+
+NEW: wordlists/umbraco.txt — the back office, the installer, App_Data,
+the .NET config leaks (web.config, umbracoSettings.config) and the
+diagnostic handlers (elmah.axd, trace.axd). It is bundled, so it also
+appears in the right-click Directory-Fuzzing menu automatically (the
+menu auto-populates wordlists/), and SmartFuzz's Umbraco deep scan uses
+it.
+
+NEW: tests/test_smartfuzz.py — the reported scan now infers Umbraco, a
+lone /modules infers nothing, and the genuine CMS signatures still
+resolve.
+
+CHANGED: smartfuzz.py, command_bridge/modules/fuzzing.py (menu label),
+         wordlists/umbraco.txt, tests/test_smartfuzz.py
+
 ## 2026-11-23 — CIPHER LISTINGS: NAMES ONLY (6.12.3)
 
 The suite listing under Lucky 13 / BEAST / weak-cipher findings appended

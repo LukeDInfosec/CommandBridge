@@ -67,14 +67,36 @@ SIGNATURES = {
         'wordlist': f'{_CM}/trickest-cms-wordlist/wordpress.txt',
         'priority': 10,
     },
+    # Umbraco is the .NET/IIS CMS, and /umbraco (its back office) is an
+    # unambiguous, one-path tell — unlike /modules below, which half the
+    # CMSs in this table happen to ship. Highest priority for that reason:
+    # a target that answers on /umbraco is Umbraco, full stop, and a scan
+    # that then ran a Drupal wordlist (because /modules also matched) was
+    # fuzzing the wrong CMS entirely. The wordlist is the one bundled with
+    # Command Bridge, since SecLists has no Umbraco list.
+    'umbraco': {
+        'paths':    ['/umbraco', '/umbraco/surface', '/umbraco/backoffice',
+                     '/umbraco_client', '/app_plugins'],
+        'headers':  ['umbraco'],
+        'wordlist': str(Path(__file__).resolve().parent /
+                        'wordlists' / 'umbraco.txt'),
+        'priority': 11,
+    },
     'drupal': {
-        'paths':    ['/user/login', '/node', '/modules', '/sites/default', '/admin/config'],
+        # /modules and /node removed: both are far too generic (Umbraco,
+        # SilverStripe and others expose /modules; /node means nothing on
+        # its own), and /modules alone was promoting Drupal over the real
+        # CMS. What is left actually identifies Drupal.
+        'paths':    ['/sites/default', '/core/misc', '/misc/drupal.js',
+                     '/user/login', '/admin/config'],
         'headers':  ['drupal'],
         'wordlist': f'{_CM}/trickest-cms-wordlist/drupal.txt',
         'priority': 9,
     },
     'joomla': {
-        'paths':    ['/administrator', '/components', '/modules', '/templates', '/plugins'],
+        # /modules removed for the same reason — it is not a Joomla tell.
+        'paths':    ['/administrator', '/components', '/templates',
+                     '/plugins', '/language/en-GB'],
         'headers':  ['joomla'],
         'wordlist': f'{_CM}/trickest-cms-wordlist/joomla.txt',
         'priority': 9,
@@ -429,7 +451,11 @@ class SmartFuzz:
         if phase1_results:
             detected_map = self._analyse_paths(phase1_results)
             if detected_map:
-                best = max(detected_map.items(), key=lambda x: x[1]['priority'])
+                # Priority dominates (a specific tell like /umbraco outranks
+                # a generic one), and the number of matching paths breaks a
+                # tie between two equally specific signatures.
+                best = max(detected_map.items(),
+                           key=lambda x: (x[1]['priority'], x[1]['matches']))
                 inferred = best[0]
                 if inferred != detected_tech:
                     print(
