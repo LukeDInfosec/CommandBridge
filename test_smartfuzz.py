@@ -95,6 +95,40 @@ def main():
     check("   no entry starts with a slash (fuzzers append to the URL)",
           [r for r in rows if r.startswith("/")], [])
 
+    print("\n\033[1mWordlist resolution tries every known location\033[0m")
+    # The reported failure: the bundled umbraco.txt was not at its path, so
+    # the scan dropped straight to a generic raft-small-words sweep instead
+    # of checking SecLists (or saying where it looked).
+    stub = _Stub()
+    wl, tried = stub._resolve_wordlist("umbraco")
+    check("Umbraco resolves to a real file when one exists",
+          wl is not None and os.path.isfile(wl))
+    check("   and it is the bundled list", wl and "wordlists" in wl)
+    check("every CMS signature carries MULTIPLE candidate locations",
+          all(len(sf.SIGNATURES[t].get("wordlists", [])) >= 2
+              for t in ("umbraco", "wordpress", "drupal", "joomla")))
+    check("   Umbraco's candidates include a SecLists path, not only the "
+          "bundled one",
+          any("seclists" in c.lower()
+              for c in sf.SIGNATURES["umbraco"]["wordlists"]))
+    # When nothing exists anywhere, the resolver reports the paths it tried
+    # rather than silently falling back.
+    saved = (sf.SIGNATURES["umbraco"]["wordlist"],
+             sf.SIGNATURES["umbraco"]["wordlists"])
+    sf.SIGNATURES["umbraco"]["wordlist"] = "/nope/umbraco.txt"
+    sf.SIGNATURES["umbraco"]["wordlists"] = ["/nope/a.txt", "/nope/b.txt"]
+    wl2, tried2 = stub._resolve_wordlist("umbraco")
+    check("with nothing on disk, no wordlist is resolved", wl2, None)
+    check("   and the paths it tried are reported for the operator",
+          len(tried2) >= 2)
+    sf.SIGNATURES["umbraco"]["wordlist"], \
+        sf.SIGNATURES["umbraco"]["wordlists"] = saved
+    # A --wl override path is tried first.
+    sf.SIGNATURES["umbraco"]["wordlist"] = str(
+        Path(wl))  # an existing file, standing in for an override
+    wl3, _ = stub._resolve_wordlist("umbraco")
+    check("an explicit wordlist is honoured first", wl3, str(Path(wl)))
+
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

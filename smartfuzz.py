@@ -53,6 +53,11 @@ class C:
 _WC = '/usr/share/seclists/Discovery/Web-Content'
 _WS = f'{_WC}/Web-Servers'
 _CM = f'{_WC}/CMS'
+_TK = f'{_CM}/trickest-cms-wordlist'   # a separate repo, not always installed
+#: Wordlists shipped with Command Bridge. Tried first for any tech that
+#: has one, so a missing SecLists file never drops the scan to a generic
+#: sweep when a purpose-built list is sitting right here.
+_BUNDLED = Path(__file__).resolve().parent / 'wordlists'
 
 INITIAL_WORDLIST  = f'{_WC}/common.txt'
 FALLBACK_WORDLIST = f'{_WC}/raft-small-words.txt'
@@ -64,7 +69,9 @@ SIGNATURES = {
     'wordpress': {
         'paths':    ['/wp-admin', '/wp-content', '/wp-includes', '/wp-login.php', '/xmlrpc.php'],
         'headers':  [],
-        'wordlist': f'{_CM}/trickest-cms-wordlist/wordpress.txt',
+        'wordlist': f'{_TK}/wordpress.txt',
+        'wordlists': [f'{_TK}/wordpress.txt', f'{_CM}/wordpress.fuzz.txt',
+                      f'{_CM}/wordpress.txt', str(_BUNDLED / 'wordpress.txt')],
         'priority': 10,
     },
     # Umbraco is the .NET/IIS CMS, and /umbraco (its back office) is an
@@ -78,8 +85,9 @@ SIGNATURES = {
         'paths':    ['/umbraco', '/umbraco/surface', '/umbraco/backoffice',
                      '/umbraco_client', '/app_plugins'],
         'headers':  ['umbraco'],
-        'wordlist': str(Path(__file__).resolve().parent /
-                        'wordlists' / 'umbraco.txt'),
+        'wordlist': str(_BUNDLED / 'umbraco.txt'),
+        'wordlists': [str(_BUNDLED / 'umbraco.txt'), f'{_TK}/umbraco.txt',
+                      f'{_CM}/umbraco.txt', f'{_CM}/umbraco.fuzz.txt'],
         'priority': 11,
     },
     'drupal': {
@@ -90,7 +98,9 @@ SIGNATURES = {
         'paths':    ['/sites/default', '/core/misc', '/misc/drupal.js',
                      '/user/login', '/admin/config'],
         'headers':  ['drupal'],
-        'wordlist': f'{_CM}/trickest-cms-wordlist/drupal.txt',
+        'wordlist': f'{_TK}/drupal.txt',
+        'wordlists': [f'{_TK}/drupal.txt', f'{_CM}/Drupal.txt',
+                      f'{_CM}/drupal.txt', str(_BUNDLED / 'drupal.txt')],
         'priority': 9,
     },
     'joomla': {
@@ -98,37 +108,45 @@ SIGNATURES = {
         'paths':    ['/administrator', '/components', '/templates',
                      '/plugins', '/language/en-GB'],
         'headers':  ['joomla'],
-        'wordlist': f'{_CM}/trickest-cms-wordlist/joomla.txt',
+        'wordlist': f'{_TK}/joomla.txt',
+        'wordlists': [f'{_TK}/joomla.txt', f'{_CM}/joomla-plugins.fuzz.txt',
+                      f'{_CM}/joomla.txt'],
         'priority': 9,
     },
     'laravel': {
         'paths':    ['/storage', '/.env', '/artisan', '/vendor', '/public'],
         'headers':  ['laravel'],
-        'wordlist': f'{_CM}/trickest-cms-wordlist/laravel.txt',
+        'wordlist': f'{_TK}/laravel.txt',
+        'wordlists': [f'{_TK}/laravel.txt', str(_BUNDLED / 'laravel.txt'),
+                      f'{_WC}/Programming-Language-Specific/Laravel.fuzz.txt'],
         'priority': 8,
     },
     'tomcat': {
         'paths':    ['/manager/html', '/host-manager', '/manager/status'],
         'headers':  ['apache-coyote', 'tomcat'],
         'wordlist': f'{_WS}/Apache-Tomcat.txt',
+        'wordlists': [f'{_WS}/Apache-Tomcat.txt'],
         'priority': 8,
     },
     'nginx': {
         'paths':    ['/nginx_status', '/server-status'],
         'headers':  ['nginx'],
         'wordlist': f'{_WS}/nginx.txt',
+        'wordlists': [f'{_WS}/nginx.txt'],
         'priority': 7,
     },
     'apache': {
         'paths':    ['/server-status', '/server-info', '/cgi-bin/', '/.htaccess'],
         'headers':  ['apache/', 'apache '],
         'wordlist': f'{_WS}/Apache.txt',
+        'wordlists': [f'{_WS}/Apache.txt'],
         'priority': 7,
     },
     'iis': {
         'paths':    ['/aspnet_client', '/iisstart.htm', '/web.config'],
         'headers':  ['microsoft-iis', 'iis/'],
         'wordlist': f'{_WS}/IIS.txt',
+        'wordlists': [f'{_WS}/IIS.txt', f'{_WS}/IIS-systemweb.txt'],
         'priority': 7,
     },
 }
@@ -363,6 +381,29 @@ class SmartFuzz:
         return found_paths, early_tech
 
     @staticmethod
+    def _resolve_wordlist(tech: str):
+        """The first wordlist that actually exists for this technology.
+
+        Tries, in order: an explicit --wl override, then the bundled list,
+        then every SecLists location the file is known to live in. Returns
+        (path, None) on a hit, or (None, [tried]) when nothing was found —
+        so the caller can fall back to a generic sweep and say which paths
+        it looked in. This is why a missing trickest-cms file, or an
+        un-uploaded bundled list, no longer silently drops a tech scan to
+        raft-small-words.txt.
+        """
+        info = SIGNATURES.get(tech, {})
+        tried, seen = [], set()
+        for cand in [info.get('wordlist', '')] + list(info.get('wordlists', [])):
+            if not cand or cand in seen:
+                continue
+            seen.add(cand)
+            tried.append(cand)
+            if Path(cand).exists():
+                return cand, None
+        return None, tried
+
+    @staticmethod
     def _wl_size(wordlist: str) -> str:
         try:
             n = sum(1 for _ in open(wordlist, encoding='utf-8', errors='ignore'))
@@ -477,24 +518,36 @@ class SmartFuzz:
             print(f"{C.BOLD}  PHASE 2 — Adaptive Deep Scan  [{detected_tech.upper()}]{C.END}")
             print(sep)
 
-            info     = SIGNATURES.get(detected_tech, {})
-            wordlist = info.get('wordlist', '')
+            wordlist, tried = self._resolve_wordlist(detected_tech)
 
-            if wordlist and Path(wordlist).exists() and wordlist not in self.scanned_with:
+            if wordlist and wordlist not in self.scanned_with:
+                where = ("bundled with Command Bridge"
+                         if str(_BUNDLED) in wordlist else "found on this system")
+                print(f"  {C.GREEN}[✓] Using {detected_tech.upper()} "
+                      f"wordlist ({where}): {Path(wordlist).name}{C.END}")
                 self._run_ffuf(
                     wordlist,
                     f"{detected_tech.upper()}-specific deep scan",
                     stop_on_detect=False,
                 )
                 self.scanned_with.add(wordlist)
+            elif wordlist in self.scanned_with:
+                print(f"  {C.CYAN}[*] {detected_tech.upper()} wordlist already "
+                      f"run in an earlier phase — not repeating it.{C.END}")
             else:
-                if wordlist and not Path(wordlist).exists():
-                    print(f"\n  {C.YELLOW}[!] Wordlist missing: {wordlist}{C.END}")
-
-                # Fall back to broad wordlist
+                # No tech-specific list exists anywhere we looked. Say where
+                # we looked, so the operator can drop one in, then fall back.
+                print(f"\n  {C.YELLOW}[!] No {detected_tech.upper()} wordlist "
+                      f"found. Looked in:{C.END}")
+                for cand in tried:
+                    print(f"        {cand}")
+                print(f"  {C.YELLOW}    Add one at any of those paths (or "
+                      f"{_BUNDLED}/{detected_tech}.txt) for a specialised "
+                      f"scan next time.{C.END}")
                 fallback = FALLBACK_WORDLIST
                 if fallback not in self.scanned_with and Path(fallback).exists():
-                    print(f"  {C.CYAN}[*] Falling back to: {Path(fallback).name}{C.END}")
+                    print(f"  {C.CYAN}[*] Falling back to a broad scan: "
+                          f"{Path(fallback).name}{C.END}")
                     self._run_ffuf(fallback, "Broad fallback scan", stop_on_detect=False)
                     self.scanned_with.add(fallback)
 

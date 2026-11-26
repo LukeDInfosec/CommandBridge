@@ -19,6 +19,29 @@ HOW TO USE THIS FILE
  CHANGELOG (most recent first)
 ================================================================================
 
+## 2026-11-26 — SMARTFUZZ: LOOK EVERYWHERE FOR THE WORDLIST (6.12.5)
+
+Follow-up to 6.12.4. SmartFuzz correctly identified Umbraco, then its
+deep scan reported "Wordlist missing: …/wordlists/umbraco.txt" and
+dropped straight to a generic raft-small-words sweep — it never checked
+SecLists, and never said where it had looked.
+
+The cause was structural, not Umbraco-specific: each signature had ONE
+hardcoded wordlist path. The trickest-cms-wordlist paths the CMS
+signatures point at are a separate repo that is NOT installed on many
+Kali boxes, so WordPress / Drupal / Joomla would have hit the same
+generic fallback.
+
+Each signature now carries a LIST of candidate locations, and
+_resolve_wordlist(tech) returns the first that exists — an explicit
+--wl override, then the bundled list, then every SecLists path the file
+is known to live in. Only when none of them exist does it fall back to
+a broad scan, and then it PRINTS the paths it tried so the operator can
+drop a list in. Umbraco's candidates are the bundled list plus three
+SecLists locations.
+
+CHANGED: smartfuzz.py, tests/test_smartfuzz.py
+
 ## 2026-11-26 — SMARTFUZZ: UMBRACO, AND /modules IS NOT DRUPAL (6.12.4)
 
 Reported from a live scan: the target returned Microsoft-IIS headers and
