@@ -187,6 +187,23 @@ class WebTabMixin:
         wildcard_btn.clicked.connect(self.check_wildcard_cert)
         scraping_layout.addWidget(wildcard_btn, 4, 0)
 
+        # HTTP -> HTTPS Redirect — GET the http:// form of the target without
+        # following redirects and report whether a 301 upgrade to https is in
+        # place (green), a weaker/temporary or non-upgrading redirect (amber),
+        # or no redirect at all (red).
+        http_redirect_btn = QPushButton("HTTP → HTTPS Redirect")
+        http_redirect_btn.setObjectName("secondaryButton")
+        http_redirect_btn.setMinimumHeight(40)
+        http_redirect_btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        http_redirect_btn.setToolTip(
+            "Send a GET to the target over plain HTTP (port 80) and check whether\n"
+            "it is redirected to HTTPS. A permanent 301 → https:// is the healthy\n"
+            "result; a temporary (302/307) redirect, a redirect that doesn't\n"
+            "upgrade the scheme, or no redirect at all are each flagged."
+        )
+        http_redirect_btn.clicked.connect(self.check_http_https_redirect)
+        scraping_layout.addWidget(http_redirect_btn, 4, 1)
+
         scraping_card.layout().addLayout(scraping_layout)
         layout.addWidget(scraping_card)
 
