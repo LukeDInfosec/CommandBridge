@@ -19,6 +19,48 @@ HOW TO USE THIS FILE
  CHANGELOG (most recent first)
 ================================================================================
 
+## 2026-11-26 — HTTP->HTTPS REDIRECT TEST + TOOL-CHECK FALSE POSITIVES (6.12.8)
+
+1. New Web-section test: "HTTP → HTTPS Redirect"
+   (web_testing.py check_http_https_redirect, button in tabs_web.py beside
+   Wildcard SSL Cert). GETs the http:// form of the target on port 80
+   WITHOUT following redirects and classifies the response: 301/308 ->
+   https = healthy permanent upgrade ([✔] green); 302/307 -> https =
+   upgrade but temporary ([!] amber); 3xx to a non-https destination, or a
+   3xx with no Location = scheme not upgraded ([✖]); 200/no redirect =
+   served over plain HTTP ([✖]); connection refused on :80 = reported as a
+   valid HTTPS-only posture, not a failure. Verified against local 301,
+   200, 302->http and refused-port servers.
+
+2. Check Installed Tools — two false positives fixed (install_tools.sh):
+   - dirsearch was reported "[BROKEN] -- --log=PATH  Log file": check_tool
+     scanned the giant --help text for failure phrases even when the tool
+     ran and EXITED 0. Now the broken-signature greps only run when the
+     probe exits non-zero, so a tool that prints its help and exits cleanly
+     is OK regardless of what its help text says. (Also added
+     PackageNotFoundError to the python-error signatures so ghauri's real
+     breakage still reports a clean reason.)
+   - testssl.sh was double-counted as [MISSING] while testssl was [OK].
+     They are one tool (Coffee Break calls testssl first, testssl.sh as
+     fallback); the .sh entry now reports OK when either name resolves and
+     only registers missing when neither does.
+   Genuine breakages on the user's box are unchanged and still actionable
+   via Install/Repair: droopescan ("No module named 'imp'", abandoned
+   upstream on Python 3.12+), dotdotpwn (not installed), ghauri (reinstall
+   from git).
+
+Difference between the two JS buttons (for reference):
+   - "Retrieve & Analyse JS Files" (web_retrieve_js): wget-downloads the
+     site's .js into <target>_js_files/ on disk (editable depth/host/
+     filetypes), then runs the static analyser over the saved folder
+     (_LocalJsAnalysisWorker; source maps read off disk). You keep the files.
+   - "JS Recon & Analysis" (run_js_analysis / _JsAnalysisWorker): a pure
+     in-memory Python spider — crawls same-site, writes every JS URL to
+     identified_js.txt (third-party included), fetches each over HTTP (not
+     saved) and fetches source maps over HTTP, then runs the SAME rule
+     engine. Recon-oriented; nothing kept on disk but the URL list + report.
+   Both share analyse_javascript and write js_analysis_results.txt.
+
 ## 2026-11-26 — SMARTFUZZ DUAL DEEP SCAN + CONSOLE COLOUR/URL SELECT (6.12.7)
 
 Three fixes from a live Umbraco-on-IIS scan:
