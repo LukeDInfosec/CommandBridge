@@ -74,37 +74,45 @@ check_tool() {
         echo "missing"
         return
     fi
-    local out
+    local out rc
     out="$(timeout 8 "$bin" "$flag" 2>&1)"
-    # The exact wording bash/coreutils use for "this file exists but can't
-    # actually be executed" (a rotted pipx-venv shebang being the classic
-    # cause) is NOT consistent across systems, so match every phrasing we've
-    # actually observed rather than one exact string:
-    #   - "bad interpreter: No such file or directory"   (classic glibc bash,
-    #     e.g. the droopescan error this app was built to catch)
-    #   - "cannot execute: required file not found"      (some bash builds,
-    #     printed when `bin` itself is exec'd and fails)
-    #   - "failed to run command"                        (coreutils `timeout`
-    #     itself reporting the same underlying exec failure, since we run
-    #     the tool *through* timeout above)
-    # A working tool's own --help output essentially never contains any of
-    # these phrases, so this stays safe against false positives.
-    if echo "$out" | grep -qiE 'bad interpreter|cannot execute|required file not found|failed to run command'; then
-        echo "broken|$(_last_meaningful_line "$out")"
-        return
-    fi
-    # A Python tool that dies before it can print its own --help is just as
-    # broken, and this is the second failure mode a Kali box reliably
-    # produces: a pip-installed console script in /usr/local/bin pinned to an
-    # old version ("wafw00f==2.2.0") shadowing the apt package that actually
-    # got upgraded, so every run ends in DistributionNotFound or
-    # VersionConflict. A working tool's --help never contains a traceback.
-    if echo "$out" | grep -qE 'Traceback \(most recent call last\)|DistributionNotFound|VersionConflict|ModuleNotFoundError|ImportError:'; then
-        local reason
-        reason="$(_last_meaningful_line "$out")"
-        [ -z "$reason" ] && reason="python error on startup"
-        echo "broken|$reason"
-        return
+    rc=$?
+    # A tool that ran its own --help/--version and EXITED CLEANLY (rc 0) is
+    # working, full stop — no matter what phrases happen to appear in that
+    # help text. dirsearch was the false positive this guards against: its
+    # --help lists an option whose description trips the phrase matches
+    # below, and it was reported "[BROKEN] -- --log=PATH  Log file" while
+    # running perfectly. A genuinely broken tool (rotted pipx shebang, a
+    # Python import error on startup) exits non-zero, so we only even look
+    # at the failure signatures when rc is non-zero. `timeout` returns 124
+    # on a hang, which is also a real failure, so that path stays covered.
+    if [ "$rc" -ne 0 ]; then
+        # The exact wording bash/coreutils use for "this file exists but
+        # can't actually be executed" (a rotted pipx-venv shebang being the
+        # classic cause) is NOT consistent across systems, so match every
+        # phrasing we've actually observed rather than one exact string:
+        #   - "bad interpreter: No such file or directory"  (classic glibc
+        #     bash, e.g. the droopescan error this app was built to catch)
+        #   - "cannot execute: required file not found"     (some bash builds)
+        #   - "failed to run command"                       (coreutils
+        #     `timeout` reporting the same underlying exec failure)
+        if echo "$out" | grep -qiE 'bad interpreter|cannot execute|required file not found|failed to run command'; then
+            echo "broken|$(_last_meaningful_line "$out")"
+            return
+        fi
+        # A Python tool that dies before it can print its own --help is just
+        # as broken: a pip console script in /usr/local/bin pinned to an old
+        # version shadowing the upgraded package (DistributionNotFound /
+        # VersionConflict), or a dependency that no longer imports on a newer
+        # Python — e.g. droopescan's `No module named 'imp'` on Python 3.12+,
+        # or ghauri's missing package metadata.
+        if echo "$out" | grep -qE 'Traceback \(most recent call last\)|DistributionNotFound|VersionConflict|ModuleNotFoundError|ImportError:|PackageNotFoundError'; then
+            local reason
+            reason="$(_last_meaningful_line "$out")"
+            [ -z "$reason" ] && reason="python error on startup"
+            echo "broken|$reason"
+            return
+        fi
     fi
     echo "ok"
 }
@@ -627,9 +635,16 @@ handle_tool "nuclei"      nuclei      _i_nuclei
 handle_tool "whatweb"     whatweb     _i_whatweb
 handle_tool "testssl"     testssl     _i_testssl
 # Kali ships the binary as testssl.sh and _i_testssl symlinks it to the
-# bare name. Coffee Break calls both spellings, so both are declared
-# here — a machine where the symlink did not take still gets covered.
-handle_tool "testssl.sh" testssl.sh  _i_testssl
+# bare name. Coffee Break calls both spellings, so both must work — but
+# they are ONE tool, so don't report testssl.sh as a separate MISSING when
+# testssl is already present (that just double-counted the same install and
+# confused the summary). Only when NEITHER name resolves does this register
+# as missing so the installer lays the tool (and the symlink) down.
+if command -v testssl >/dev/null 2>&1 || command -v testssl.sh >/dev/null 2>&1; then
+    report "testssl.sh" ok
+else
+    handle_tool "testssl.sh" testssl.sh  _i_testssl
+fi
 handle_tool "arjun"       arjun       _i_arjun
 handle_tool "wpscan"      wpscan      _i_wpscan
 handle_tool "droopescan"  droopescan  _i_droopescan

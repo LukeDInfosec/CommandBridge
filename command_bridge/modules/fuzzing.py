@@ -25,6 +25,7 @@ from command_bridge.constants import APP_TITLE, APP_VERSION, THEMES, BASE_DIR
 #: the common ones say what they are for.
 _BUNDLED_WORDLIST_LABELS = {
     "caddy.txt": "Caddy (admin API & config)",
+    "umbraco.txt": "Umbraco (.NET CMS back office)",
     "django.txt": "Django (admin, DRF, debug)",
     "nextjs.txt": "Next.js / React (build & API)",
     "nodejs-express.txt": "Node.js / Express",

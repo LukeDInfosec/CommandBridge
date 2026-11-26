@@ -1256,6 +1256,120 @@ class WebTestingMixin:
         if sans:
             self.console.append_ansi(f"    SAN: {', '.join(sorted(set(sans)))}\n")
 
+    def check_http_https_redirect(self):
+        """Check whether plain HTTP is redirected to HTTPS on the target.
+
+        Sends a single GET to the http:// form of the target host (port 80)
+        WITHOUT following redirects, so the redirect itself is observed rather
+        than its destination, and reports what the server does:
+
+          - 301 -> https on the same host : the correct, permanent upgrade.
+          - 302/307/308 -> https          : an upgrade, but not a permanent
+                                            (301) one — browsers and HSTS
+                                            preload treat 301 as the canonical
+                                            "always HTTPS" signal.
+          - 3xx -> somewhere not-https    : a redirect that does NOT upgrade
+                                            the scheme (flagged).
+          - 200 / no redirect             : the page is served over plain
+                                            HTTP with no upgrade (flagged).
+          - connection refused on :80     : HTTP is not served at all, which
+                                            is itself a valid "HTTPS-only"
+                                            posture, so it is reported plainly
+                                            rather than as a failure.
+
+        Output is colour-coded by the console: [✔] green for the healthy
+        301->https case, [✖] red where HTTP is served without an upgrade.
+        """
+        import http.client
+        import socket
+        from urllib.parse import urlparse, urlunparse
+
+        if not self.target:
+            self.show_themed_message(
+                "No Target", "Please set a target first in the Target Setup tab.",
+                QMessageBox.Icon.Warning,
+            )
+            return
+
+        raw = self.target.strip()
+        parsed = urlparse(raw if "://" in raw else "http://" + raw)
+        host = parsed.hostname or raw
+        port = parsed.port or 80
+        path = parsed.path or "/"
+
+        try:
+            self.goto_console()
+        except Exception:
+            pass
+
+        self.console.append_ansi("\n" + "-" * 80 + "\n")
+        self.console.append_ansi(
+            f"[*] HTTP -> HTTPS Redirect Check — http://{host}"
+            f"{'' if port == 80 else ':' + str(port)}{path}\n"
+        )
+        self.console.append_ansi("-" * 80 + "\n")
+
+        try:
+            conn = http.client.HTTPConnection(host, port, timeout=10)
+            # method GET, but we never read a body past the headers — a GET is
+            # what a browser sends, and some servers answer HEAD differently.
+            conn.request("GET", path, headers={"User-Agent": "CommandBridge/redirect-check"})
+            resp = conn.getresponse()
+            status = resp.status
+            location = resp.getheader("Location", "") or ""
+            conn.close()
+        except (ConnectionRefusedError, socket.timeout, socket.gaierror, OSError) as e:
+            self.console.append_ansi(
+                f"[i] Could not reach http://{host}:{port} — {e}\n"
+            )
+            self.console.append_ansi(
+                "    Plain HTTP is not being served here. If the site is only "
+                "reachable over HTTPS, that is a valid HTTPS-only posture "
+                "(nothing to downgrade).\n"
+            )
+            return
+
+        self.console.append_ansi(f"    Status : {status} {resp.reason}\n")
+        if location:
+            self.console.append_ansi(f"    Location: {location}\n")
+
+        dest = urlparse(location) if location else None
+        dest_scheme = (dest.scheme or "").lower() if dest else ""
+        # A scheme-relative or relative Location keeps the original scheme, so
+        # treat only an explicit https:// destination as an upgrade.
+        upgrades_to_https = dest_scheme == "https"
+
+        if status in (301, 308) and upgrades_to_https:
+            label = "permanent (301)" if status == 301 else "permanent (308)"
+            self.console.append_ansi(
+                f"[✔] HTTP is redirected to HTTPS — {label}. "
+                f"This is the correct upgrade.\n"
+            )
+        elif status in (302, 307) and upgrades_to_https:
+            self.console.append_ansi(
+                f"[!] HTTP redirects to HTTPS, but with a TEMPORARY {status} "
+                f"rather than a permanent 301/308. Browsers and the HSTS "
+                f"preload list treat 301 as the canonical 'always HTTPS' "
+                f"signal — consider making it permanent.\n"
+            )
+        elif 300 <= status < 400 and location and not upgrades_to_https:
+            self.console.append_ansi(
+                f"[✖] HTTP returns a {status} redirect, but NOT to https:// — "
+                f"the scheme is not upgraded. Destination scheme: "
+                f"{dest_scheme or '(relative/unknown)'}\n"
+            )
+        elif 300 <= status < 400 and not location:
+            self.console.append_ansi(
+                f"[✖] HTTP returns a {status} redirect but sent no Location "
+                f"header, so no HTTPS upgrade can be confirmed.\n"
+            )
+        else:
+            self.console.append_ansi(
+                f"[✖] No HTTP->HTTPS redirect: the server answered {status} over "
+                f"plain HTTP without redirecting to https://. Traffic to this "
+                f"host can be served unencrypted.\n"
+            )
+
     def run_insecure_redirect_scan(self):
         """Test the current target for unvalidated / open redirects.
 
