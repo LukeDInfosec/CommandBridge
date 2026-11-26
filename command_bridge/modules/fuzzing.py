@@ -304,9 +304,7 @@ class FuzzingMixin:
             aspnet_bd_action    = menu.addAction("   ASP.NET (backdoors / handlers)")
             aspnet_elmah_action = menu.addAction("   ASP.NET (ELMAH / debug endpoints)")
             tomcat_action       = menu.addAction("   Tomcat")
-            laravel_action      = menu.addAction("   Laravel")
             php_arch_action     = menu.addAction("   PHP Application")
-            drupal_arch_action  = menu.addAction("   Drupal")
             graphql_action      = menu.addAction("   GraphQL API")
             generic_action      = menu.addAction("   Generic Web App")
             other_action        = menu.addAction("   Other (manual path)")
@@ -316,11 +314,16 @@ class FuzzingMixin:
             cms_header.setEnabled(False)
 
             wordpress_action    = menu.addAction("   WordPress")
-            laravel_cms_action  = menu.addAction("   Laravel (CMS / Routes)")
-            drupal_cms_action   = menu.addAction("   Drupal (CMS)")
+            laravel_cms_action  = menu.addAction("   Laravel")
+            drupal_cms_action   = menu.addAction("   Drupal")
             joomla_action       = menu.addAction("   Joomla")
             magento_action      = menu.addAction("   Magento")
             dnn_action          = menu.addAction("   DotNetNuke (.NET CMS)")
+            # Umbraco's list is shipped in the app's wordlists/ folder, but it
+            # belongs with the other CMSs here, not down in the generic
+            # "Bundled with Command Bridge" group — so it is listed here and
+            # filtered out of that auto-glob below to avoid showing twice.
+            umbraco_cms_action  = menu.addAction("   Umbraco")
 
             menu.addSeparator()
             bonus_header = menu.addAction("🎁 Bonus Wordlists")
@@ -352,8 +355,12 @@ class FuzzingMixin:
             bundled_pairs = []
             try:
                 wl_dir = _Path(BASE_DIR) / "wordlists"
-                bundled_files = sorted(wl_dir.glob("*.txt")) \
-                    if wl_dir.is_dir() else []
+                # umbraco.txt is surfaced under "CMS Endpoints" (above), so
+                # keep it out of this generic bundled list to avoid a duplicate.
+                bundled_files = sorted(
+                    f for f in wl_dir.glob("*.txt")
+                    if f.name.lower() != "umbraco.txt"
+                ) if wl_dir.is_dir() else []
             except Exception:                           # noqa: BLE001
                 bundled_files = []
             if bundled_files:
@@ -380,9 +387,7 @@ class FuzzingMixin:
                     (aspnet_bd_action,    '/usr/share/seclists/Discovery/Web-Content/Programming-Language-Specific/ASP.NET/CommonBackdoors-ASP.fuzz.txt'),
                     (aspnet_elmah_action, '/usr/share/seclists/Discovery/Web-Content/Programming-Language-Specific/ASP.NET/ELMAH-Debugger.txt'),
                     (tomcat_action,       '/usr/share/seclists/Discovery/Web-Content/Web-Servers/Apache-Tomcat.txt'),
-                    (laravel_action,      '/usr/share/seclists/Discovery/Web-Content/Programming-Language-Specific/PHP.fuzz.txt'),
                     (php_arch_action,     '/usr/share/seclists/Discovery/Web-Content/Programming-Language-Specific/PHP.fuzz.txt'),
-                    (drupal_arch_action,  '/usr/share/seclists/Discovery/Web-Content/CMS/Drupal.txt'),
                     (graphql_action,      '/usr/share/seclists/Discovery/Web-Content/graphql.txt'),
                     (generic_action,      '/usr/share/seclists/Discovery/Web-Content/raft-medium-words.txt'),
                     (wordpress_action,    '/usr/share/seclists/Discovery/Web-Content/CMS/wordpress.fuzz.txt'),
@@ -391,6 +396,7 @@ class FuzzingMixin:
                     (joomla_action,       '/usr/share/seclists/Discovery/Web-Content/CMS/joomla-plugins.fuzz.txt'),
                     (magento_action,      '/usr/share/seclists/Discovery/Web-Content/CMS/sitemap-magento.txt'),
                     (dnn_action,          '/usr/share/seclists/Discovery/Web-Content/CMS/dotnetnuke.txt'),
+                    (umbraco_cms_action,  str(_Path(BASE_DIR) / "wordlists" / "umbraco.txt")),
                     (big_action,              '/usr/share/seclists/Discovery/Web-Content/big.txt'),
                     (common_action,           '/usr/share/seclists/Discovery/Web-Content/common.txt'),
                     (combined_dirs_action,    '/usr/share/seclists/Discovery/Web-Content/combined_directories.txt'),
