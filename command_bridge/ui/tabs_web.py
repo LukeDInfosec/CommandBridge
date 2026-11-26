@@ -373,12 +373,6 @@ class WebTabMixin:
             # carriage-return updates straight to the console, which our
             # console widget renders as a flood of separate lines.
             ("Dalfox Scan", "web_dalfox", "dalfox url {TARGET} --skip-bav --no-spinner -o {SAFE_TARGET}_dalfox.txt"),
-            # Send the target into httpx on stdin and filter for HTML content-types.
-            # Kali ships ProjectDiscovery's httpx as "httpx-toolkit" (a bare
-            # "httpx" on PATH is usually the unrelated Python HTTP client), so
-            # the packaged name is what gets called here and what the installer
-            # guarantees is present.
-            ("Content-Type Filter", "web_ct_filter", "echo {TARGET} | httpx-toolkit -ct -silent | grep 'text/html' | tee {SAFE_TARGET}_ct.txt"),
             # Paramspider always writes a ./results/<domain>.txt file internally.
             # We normalise the domain via {TARGET_HOST}, auto-create the results
             # folder inside the configured output directory, and capture stdout
