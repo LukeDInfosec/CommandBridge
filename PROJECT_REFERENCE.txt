@@ -19,6 +19,18 @@ HOW TO USE THIS FILE
  CHANGELOG (most recent first)
 ================================================================================
 
+## 2026-11-26 — SMARTFUZZ: CASE-INSENSITIVE WORDLIST MATCH (6.12.6)
+
+6.12.5 looked in the right SecLists directory but asked for
+"umbraco.txt" when SecLists ships "Umbraco.txt" (capital U). Linux is
+case-sensitive, so it missed a file sitting right there and fell back to
+a generic sweep. _resolve_wordlist now, when an exact path misses, scans
+that path's own directory for a filename matching case-insensitively and
+uses the real on-disk name. Fixes Umbraco.txt / Umbraco.fuzz.txt and any
+other tool whose SecLists capitalisation differs from this table.
+
+CHANGED: smartfuzz.py, tests/test_smartfuzz.py
+
 ## 2026-11-26 — SMARTFUZZ: LOOK EVERYWHERE FOR THE WORDLIST (6.12.5)
 
 Follow-up to 6.12.4. SmartFuzz correctly identified Umbraco, then its

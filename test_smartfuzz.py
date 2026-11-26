@@ -129,6 +129,33 @@ def main():
     wl3, _ = stub._resolve_wordlist("umbraco")
     check("an explicit wordlist is honoured first", wl3, str(Path(wl)))
 
+    print("\n\033[1mCase-insensitive filename matching\033[0m")
+    # SecLists ships "Umbraco.txt" and "Umbraco.fuzz.txt" (capital U) while
+    # the signature table asks for lowercase. On a case-sensitive Linux
+    # filesystem that is a miss, and the scan dropped to a generic sweep
+    # even though the file was right there.
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        real = os.path.join(d, "Umbraco.txt")
+        with open(real, "w") as fh:
+            fh.write("umbraco\nweb.config\n")
+        hit = sf.SmartFuzz._case_insensitive_file(os.path.join(d, "umbraco.txt"))
+        check("a lowercase request finds the capital-U file", hit, real)
+        check("   and an exact-case request still works",
+              sf.SmartFuzz._case_insensitive_file(real), real)
+        check("   a name with no match returns None",
+              sf.SmartFuzz._case_insensitive_file(os.path.join(d, "nope.txt")),
+              None)
+        # Through the resolver, end to end.
+        saved = (sf.SIGNATURES["umbraco"]["wordlist"],
+                 sf.SIGNATURES["umbraco"]["wordlists"])
+        sf.SIGNATURES["umbraco"]["wordlist"] = "/nope/umbraco.txt"
+        sf.SIGNATURES["umbraco"]["wordlists"] = [os.path.join(d, "umbraco.txt")]
+        wl4, _ = _Stub()._resolve_wordlist("umbraco")
+        check("the resolver returns the real on-disk filename", wl4, real)
+        sf.SIGNATURES["umbraco"]["wordlist"], \
+            sf.SIGNATURES["umbraco"]["wordlists"] = saved
+
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

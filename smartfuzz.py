@@ -401,7 +401,34 @@ class SmartFuzz:
             tried.append(cand)
             if Path(cand).exists():
                 return cand, None
+            # Linux filesystems are case-sensitive, and SecLists ships
+            # "Umbraco.txt" / "Umbraco.fuzz.txt" with a capital U while this
+            # table asks for lowercase. Rather than guess every tool's
+            # capitalisation, look in the candidate's own directory for a
+            # file whose name matches case-insensitively, and use that.
+            hit = SmartFuzz._case_insensitive_file(cand)
+            if hit:
+                return hit, None
         return None, tried
+
+    @staticmethod
+    def _case_insensitive_file(path: str):
+        """A file in path's directory whose name matches case-insensitively.
+
+        The real path is returned (so the scan uses the actual filename on
+        disk), or None. "Umbraco.txt" is found when asked for "umbraco.txt".
+        """
+        try:
+            p = Path(path)
+            folder, want = p.parent, p.name.lower()
+            if not folder.is_dir():
+                return None
+            for entry in folder.iterdir():
+                if entry.is_file() and entry.name.lower() == want:
+                    return str(entry)
+        except Exception:
+            pass
+        return None
 
     @staticmethod
     def _wl_size(wordlist: str) -> str:
