@@ -19,6 +19,28 @@ HOW TO USE THIS FILE
  CHANGELOG (most recent first)
 ================================================================================
 
+## 2026-11-26 — WEB TAB + FUZZING MENU TIDY-UP (6.12.9)
+
+1. Removed the "Content-Type Filter" button from the XSS Testing card
+   (tabs_web.py). It was an httpx-toolkit content-type probe
+   (echo {TARGET} | httpx-toolkit -ct -silent | grep text/html) — a
+   host-up/HTML check, not XSS testing — so it didn't belong there.
+   web_ct_filter had no other references.
+
+2. Fuzzing right-click menu (fuzzing.py) CMS Endpoints section:
+   - Umbraco now appears under "CMS Endpoints" instead of the generic
+     "Bundled with Command Bridge" group. It still uses the bundled
+     wordlists/umbraco.txt, and is filtered out of the auto-bundled glob
+     so it isn't listed twice.
+   - Renamed "Laravel (CMS / Routes)" -> "Laravel" and "Drupal (CMS)" ->
+     "Drupal" (the "CMS" qualifier was redundant under the CMS header).
+   - Those renames collided with "Laravel" and "Drupal" that also sat
+     under "Server Architecture" pointing at the SAME wordlists
+     (PHP.fuzz.txt / Drupal.txt). Removed the Server Architecture copies:
+     Laravel's list is already covered there by "PHP Application", and
+     Drupal belongs under CMS Endpoints — so each now appears once, in
+     the right section.
+
 ## 2026-11-26 — HTTP->HTTPS REDIRECT TEST + TOOL-CHECK FALSE POSITIVES (6.12.8)
 
 1. New Web-section test: "HTTP → HTTPS Redirect"
