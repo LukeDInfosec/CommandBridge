@@ -1,0 +1,102 @@
+# Umbraco (ASP.NET CMS on IIS) — content discovery
+#
+# Umbraco gives itself away with /umbraco (the back office). The findings
+# that matter: a reachable installer (/install, /umbraco/install), the
+# back-office login, exposed .NET config (web.config, umbracoSettings.config),
+# App_Data (which holds the content cache, logs and sometimes the SQLite db
+# on older installs), and the diagnostic handlers (elmah.axd, trace.axd).
+# The back-office API's timeout endpoint also leaks that Umbraco is present
+# and often its behaviour even before auth.
+
+# ── the back office ────────────────────────────────────────────────
+umbraco
+umbraco/
+umbraco/login
+umbraco/#/login
+umbraco/backoffice
+umbraco/backoffice/umbracoapi/authentication/getremainingtimeoutseconds
+umbraco/backoffice/UmbracoApi/Authentication/IsAuthenticated
+umbraco/backoffice/UmbracoApi/Authentication/GetCurrentUser
+umbraco/surface
+umbraco/api
+umbraco/RestApi
+umbraco/ping.aspx
+umbraco/preview
+umbraco/developer
+umbraco/settings
+umbraco/dashboard.aspx
+umbraco/webservices
+umbraco/channels
+umbraco/preview/frame
+umbraco_client
+Umbraco
+Umbraco/
+
+# ── the installer, a finding if it answers ─────────────────────────
+install
+install/
+umbraco/install
+umbraco/install/
+installer
+
+# ── ASP.NET / Umbraco application folders ──────────────────────────
+App_Plugins
+App_Plugins/
+App_Data
+App_Data/
+App_Data/Logs
+App_Data/TEMP
+App_Data/umbraco.config
+App_Data/Umbraco.sdf
+App_Code
+App_Browsers
+App_GlobalResources
+App_LocalResources
+App_Themes
+bin
+bin/
+Views
+Views/Partials
+Views/MacroPartials
+masterpages
+usercontrols
+xslt
+macroScripts
+
+# ── .NET configuration, the high-value leaks ───────────────────────
+web.config
+web.config.bak
+web.config.old
+Web.config
+umbracoSettings.config
+appsettings.json
+appsettings.Development.json
+config
+config/umbracoSettings.config
+config/applications.config
+config/trees.config
+config/dashboards.config
+config/404handlers.config
+config/ClientDependency.config
+connectionstrings.config
+global.asax
+
+# ── diagnostic handlers that leak data on IIS/.NET ─────────────────
+elmah.axd
+trace.axd
+ScriptResource.axd
+WebResource.axd
+DependencyHandler.axd
+glimpse.axd
+
+# ── content and media ──────────────────────────────────────────────
+media
+media/
+scripts
+css
+Content
+images
+sitemap.xml
+robots.txt
+umbraco/api/content
+umbraco/api/media
