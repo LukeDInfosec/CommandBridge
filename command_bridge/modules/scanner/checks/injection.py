@@ -132,6 +132,13 @@ class TemplateInjectionCheck:
         return True
 
     def run(self, ctx, point, baseline):
+        # If the page already carries the canary number (1337 appears inside
+        # cache cookies, asset hashes, CSS pixel values and timestamps all the
+        # time), this oracle cannot tell evaluation from the page's own
+        # content — don't run it here rather than report a coincidence.
+        baseline_body = getattr(baseline, "body", "") or ""
+        if CANARY_RESULT in baseline_body or "1146" in baseline_body:
+            return []
         for engine, payload in TEMPLATE_PAYLOADS:
             request = point.build(payload, mode="replace")
             response = ctx.auth.send(request)
@@ -191,6 +198,10 @@ class CodeInjectionCheck:
         return True
 
     def run(self, ctx, point, baseline):
+        # Same guard as the template check: if 1337 is already on the page,
+        # its presence after injection proves nothing.
+        if CANARY_RESULT in (getattr(baseline, "body", "") or ""):
+            return []
         for language, payload in CODE_PAYLOADS:
             for mode in ("append", "replace"):
                 request = point.build(payload, mode)
@@ -338,10 +349,35 @@ class CommandInjectionCheck:
                     if not self._controlled(ctx, point, separator, mode,
                                             command, expected):
                         continue
+                    # Does this point simply reflect whatever is put in it?
+                    # A path segment echoed back in a canonical URL, a
+                    # breadcrumb or a 404 brings the whole payload — token and
+                    # all — back into the page in encodings the stripper above
+                    # cannot always anticipate. On such a point the echoed
+                    # token proves nothing; only real command output does.
+                    reflects = self._point_reflects_input(ctx, point)
                     return self._capture(ctx, point, separator, mode,
                                          request, response, payload,
-                                         command, expected, baseline_body)
+                                         command, expected, baseline_body,
+                                         reflects)
         return None
+
+    def _point_reflects_input(self, ctx, point):
+        """True if a harmless sentinel put in this point comes back verbatim.
+
+        The sentinel is plain alphanumeric, so no HTML/URL encoding can alter
+        it on the way back — if it appears in the response, the endpoint
+        reflects its input and an echoed proof token cannot be trusted.
+        """
+        sentinel = "cbREFL" + secrets.token_hex(4)
+        for mode in ("append", "replace"):
+            try:
+                probe = ctx.auth.send(point.build(sentinel, mode))
+            except Exception:
+                probe = None
+            if probe is not None and sentinel in (probe.text or ""):
+                return True
+        return False
 
     def _controlled(self, ctx, point, separator, mode, command, expected):
         """Is the marker caused by the payload, or just present sometimes?
@@ -377,7 +413,7 @@ class CommandInjectionCheck:
     # ── making it produce something worth screenshotting ─────────────────
     def _capture(self, ctx, point, separator, mode, first_request,
                  first_response, first_payload, first_command, expected,
-                 baseline_body):
+                 baseline_body, reflects=False):
         """Run the read-only evidence commands through the proven separator."""
         proof_step = step(
             f"Shell execution proved with '{separator}'",
@@ -420,6 +456,17 @@ class CommandInjectionCheck:
                     platform = family
             if platform == family:
                 break
+
+        # The decisive guard against the reflection false positive. When the
+        # point echoes its input, the proof token (and any arithmetic product)
+        # can be in the response with no shell involved. If no read-only
+        # command actually returned its output — the one thing reflection
+        # cannot fake — there is nothing here that can be told apart from
+        # reflection, so report nothing rather than a bogus CRITICAL. A real
+        # injection that returns command output still passes, because that
+        # output was never in the request.
+        if reflects and not observations:
+            return None
 
         # Which step leads the proof of concept. The token echo is what
         # *proved* execution, but the request worth putting in front of a
