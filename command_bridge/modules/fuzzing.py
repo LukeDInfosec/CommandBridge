@@ -582,6 +582,22 @@ class FuzzingMixin:
             )
             return
 
+        # A manually-edited command takes over completely: the user is in
+        # full control, so don't re-prompt for auth or rebuild it. They can
+        # clear it from the right-click menu to return to the auto-built one.
+        override = self.command_registry.get("smartfuzz_cmd_override")
+        if override:
+            try:
+                self.console.append_ansi(
+                    "\n[i] Using your manually-edited SmartFuzz command "
+                    "(right-click → Reset Command to Auto to restore the "
+                    f"generated one):\n    {override}\n\n"
+                )
+            except Exception:
+                pass
+            self.run_command_template(override)
+            return
+
         auth_type, auth_value = self._prompt_auth("SmartFuzz Authentication")
         if auth_type is None:
             return
@@ -603,10 +619,26 @@ class FuzzingMixin:
     _SMARTFUZZ_TECHS = ("nginx", "apache", "iis", "tomcat",
                         "wordpress", "drupal", "joomla", "laravel")
 
+    #: Default SmartFuzz thread count when the user has not set one.
+    _SMARTFUZZ_DEFAULT_THREADS = "2"
+
+    def _smartfuzz_threads(self) -> str:
+        """The configured SmartFuzz thread count, validated, as a string."""
+        raw = self.command_registry.get("smartfuzz_threads",
+                                        self._SMARTFUZZ_DEFAULT_THREADS)
+        try:
+            n = int(str(raw))
+            if 1 <= n <= 200:
+                return str(n)
+        except (TypeError, ValueError):
+            pass
+        return self._SMARTFUZZ_DEFAULT_THREADS
+
     def _build_smartfuzz_command(self, auth_type: str, auth_value: str) -> str:
         """Build SmartFuzz command, injecting auth headers and any user-set
         per-architecture wordlist overrides (configured via right-click)."""
-        cmd = f"python3 {BASE_DIR}/smartfuzz.py -u {{TARGET}} -t 2"
+        cmd = (f"python3 {BASE_DIR}/smartfuzz.py -u {{TARGET}} "
+               f"-t {self._smartfuzz_threads()}")
 
         initial = self.command_registry.get("smartfuzz_wl_initial")
         if initial:
@@ -638,6 +670,19 @@ class FuzzingMixin:
         except Exception:
             pass
 
+        has_override = bool(self.command_registry.get("smartfuzz_cmd_override"))
+
+        # Manual command editing and thread count sit at the top, mirroring the
+        # fuzzing buttons' "Manually Modify Underlying Command" entry.
+        edit_action = menu.addAction("✏️ Manually Modify Underlying Command"
+                                     + ("  ✓" if has_override else ""))
+        threads_action = menu.addAction(
+            f"⚙️ Set Thread Count  (current: {self._smartfuzz_threads()})")
+        reset_cmd_action = None
+        if has_override:
+            reset_cmd_action = menu.addAction("🔄 Reset Command to Auto-Generated")
+        menu.addSeparator()
+
         header = menu.addAction("🧠 SmartFuzz Wordlist Overrides")
         header.setEnabled(False)
 
@@ -668,6 +713,21 @@ class FuzzingMixin:
         if action is None:
             return
 
+        if action == edit_action:
+            self._edit_smartfuzz_command()
+            return
+        if action == threads_action:
+            self._set_smartfuzz_threads()
+            return
+        if reset_cmd_action is not None and action == reset_cmd_action:
+            self.command_registry.pop("smartfuzz_cmd_override", None)
+            self.save_custom_commands()
+            self.show_themed_message(
+                "SmartFuzz",
+                "Manual command cleared — SmartFuzz will use the "
+                "auto-generated command again.")
+            return
+
         if action in action_tech:
             tech = action_tech[action]
             start_dir = "/usr/share/seclists/Discovery/Web-Content"
@@ -693,6 +753,86 @@ class FuzzingMixin:
                 v = self.command_registry.get(f"smartfuzz_wl_{tech}")
                 lines.append(f"{label.replace('Set ', '')}: {v if v else '(default)'}")
             self.show_themed_message("SmartFuzz Overrides", "\n".join(lines))
+
+    def _set_smartfuzz_threads(self):
+        """Prompt for and persist the SmartFuzz thread count (-t)."""
+        from PyQt6.QtWidgets import QInputDialog
+
+        current = int(self._smartfuzz_threads())
+        value, ok = QInputDialog.getInt(
+            self, "SmartFuzz Thread Count",
+            "Number of concurrent threads (-t) for SmartFuzz / ffuf:\n"
+            "Higher is faster but noisier and harder on the target.",
+            value=current, min=1, max=200, step=1,
+        )
+        if not ok:
+            return
+        self.command_registry["smartfuzz_threads"] = str(value)
+        self.save_custom_commands()
+        note = ""
+        if self.command_registry.get("smartfuzz_cmd_override"):
+            note = ("\n\nNote: a manual command is currently set, so this "
+                    "thread count only applies after you reset to the "
+                    "auto-generated command.")
+        self.show_themed_message(
+            "SmartFuzz Threads",
+            f"Thread count set to {value}.{note}")
+
+    def _edit_smartfuzz_command(self):
+        """Edit the full SmartFuzz command by hand (stored as an override).
+
+        Pre-fills with the auto-built command — current thread count, wordlist
+        overrides and any persisted auth flags — so nothing is silently lost.
+        While an override is set, SmartFuzz runs it verbatim (see
+        run_smartfuzz_with_auth) until it is reset from the menu.
+        """
+        from PyQt6.QtWidgets import (
+            QDialog, QVBoxLayout, QLabel, QDialogButtonBox,
+        )
+
+        prefill = self.command_registry.get("smartfuzz_cmd_override")
+        if not prefill:
+            prefill = self._build_smartfuzz_command(
+                self._smartfuzz_auth_type, self._smartfuzz_auth_value)
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Edit SmartFuzz Command")
+        dialog.resize(820, 400)
+        try:
+            self.apply_theme_to_dialog(dialog)
+        except Exception:
+            pass
+
+        layout = QVBoxLayout(dialog)
+        info = QLabel(
+            "Edit the SmartFuzz command below. Use {TARGET} as the target "
+            "placeholder.\nWhile a manual command is set it is run exactly as "
+            "written (auth is not re-prompted);\nclear it from the right-click "
+            "menu to return to the auto-generated command.")
+        info.setObjectName("fieldLabel")
+        layout.addWidget(info)
+
+        text_edit = QPlainTextEdit()
+        text_edit.setPlainText(prefill)
+        text_edit.setMinimumHeight(240)
+        layout.addWidget(text_edit)
+
+        box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel)
+        box.accepted.connect(dialog.accept)
+        box.rejected.connect(dialog.reject)
+        layout.addWidget(box)
+
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            new_cmd = text_edit.toPlainText().strip()
+            if new_cmd:
+                self.command_registry["smartfuzz_cmd_override"] = new_cmd
+                self.save_custom_commands()
+                self.show_themed_message(
+                    "SmartFuzz Command Updated",
+                    "SmartFuzz will now run your edited command until you "
+                    "reset it from the right-click menu.")
 
     def get_smartfuzz_auth_flags(self) -> str:
         """
