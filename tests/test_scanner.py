@@ -224,9 +224,69 @@ def main():
           len(oracles.Differential(auth, baseline).confirm(
               point, [(" AND 1=1", " AND 1=2"), (" AND 1=1", " AND 1=2")])), 2)
 
+    print("\n\033[1mA point that reflects its input is not command "
+          "injection\033[0m")
+    # Reported from a live engagement: dozens of CONFIRMED "OS command
+    # injection" on path segments. The payload "; echo <TOKEN>" went into a
+    # segment and the server echoed the whole requested path back in a
+    # canonical <link> / breadcrumb / 404, so the token came back with no
+    # shell involved. The echoed proof can only be trusted when the point
+    # does NOT reflect its input; otherwise real command output is required.
+    import types as _types
+    import re as _re
+    from command_bridge.modules.scanner.model import Request as _Req, \
+        insertion_points as _ipoints
+    from command_bridge.modules.scanner.checks import injection as inj
+
+    _path_req = _Req("GET", "https://t.example/news/2026/june/activity-pack")
+    _seg = [p for p in _ipoints(_path_req, include_path=True)
+            if p.kind == "path"][0]
+
+    def _ctx(auth):
+        c = _types.SimpleNamespace()
+        c.auth = auth
+        c.profile = _types.SimpleNamespace(timing_checks=False)
+        return c
+
+    class _Baseline:
+        body = "normal page with news and june content"
+
+    class _ReflectAuth:
+        """Echoes the requested path back — payload and token included."""
+        config = outcome = None
+        logged_in = False
+
+        def send(self, request, allow_redirects=False, timeout=None):
+            decoded = urllib.parse.unquote(request.url)
+            return FakeResponse(f'<link rel="canonical" href="{decoded}"> page')
+
+    class _VulnAuth:
+        """Prints the echoed token AND real `id` / passwd output."""
+        config = outcome = None
+        logged_in = False
+
+        def send(self, request, allow_redirects=False, timeout=None):
+            url = request.url
+            body = "clean page "
+            m = _re.search(r"echo(%20|\+| )(CB[0-9A-F]{8})", url)
+            if m:
+                body += " " + m.group(2) + " "
+            if _re.search(r"(%3B|;)(%20|\+| )?id\b", url):
+                body += " uid=0(root) gid=0(root) groups=0(root) "
+            if "whoami" in url:
+                body += " root "
+            if "passwd" in url:
+                body += " root:x:0:0:root:/root:/bin/bash "
+            return FakeResponse(body)
+
+    _cmdi = inj.CommandInjectionCheck()
+    check("a path that reflects its input yields no command injection",
+          _cmdi.run(_ctx(_ReflectAuth()), _seg, _Baseline()), [])
+    check("but a point that returns real command output still confirms",
+          len(_cmdi.run(_ctx(_VulnAuth()), _seg, _Baseline())), 1)
+
     print("\n\033[1mThe arithmetic oracle cannot be satisfied by "
           "chance\033[0m")
-    from command_bridge.modules.scanner.checks import injection as inj
     pairs = [inj.arithmetic_canary() for _ in range(40)]
     check("every product is at least six digits",
           all(len(product) >= 6 for _, _, product in pairs))
