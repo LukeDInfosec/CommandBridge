@@ -50,6 +50,9 @@ _TAB_BUILDERS = {
     "api":       "create_api_testing_tab",
     "coffee":    "create_coffee_break_tab",
     "scan":      "create_active_scan_tab",
+    "transparency": "create_transparency_tab",
+    "tools":     "create_tools_tab",
+    "uat":       "create_uat_tab",
     "console":   "create_console_tab",
     "bounty":    "create_methodology_tab",
 }
@@ -59,7 +62,7 @@ _TAB_BUILDERS = {
 # the console into existence.
 _SAFE_BUILD_ORDER = [
     "target", "console", "recon", "externals", "web", "api", "scan",
-    "coffee", "bounty",
+    "coffee", "transparency", "tools", "uat", "bounty",
 ]
 
 # Header target chip: grows with the target, but never so far that it crowds
@@ -489,6 +492,15 @@ class NavigationMixin:
             if section == "PINNED":
                 continue
             if section != current_section:
+                # Breathing room above each heading (but not the first) so the
+                # groups read as distinct bands rather than one long list.
+                if current_section is not None:
+                    spacer = QWidget()
+                    spacer.setFixedHeight(14)
+                    layout.addWidget(spacer)
+                    self._nav_section_spacers = getattr(
+                        self, "_nav_section_spacers", [])
+                    self._nav_section_spacers.append(spacer)
                 current_section = section
                 caption = QLabel(section)
                 caption.setObjectName("navSectionLabel")
@@ -517,8 +529,57 @@ class NavigationMixin:
             if section == "PINNED":
                 layout.addWidget(self._create_nav_item(key, short, full, icon_name))
 
+        # "Update" sits below the pinned destinations — an action, not a tab,
+        # so it runs the updater rather than switching views.
+        layout.addWidget(self._create_nav_action_item(
+            "update", "Update", "Check for Command Bridge updates",
+            "refresh", self.check_for_updates))
+        # Fill the revision caption / button state once the window is up.
+        QTimer.singleShot(0, self.refresh_update_label)
+
         self._apply_rail_mode()
         return rail
+
+    def _create_nav_action_item(self, key, short, full, icon_name, callback):
+        """A rail button that runs an action instead of switching tabs.
+
+        Styled like a nav item but non-checkable; its label/icon are tracked
+        so compact mode and theme refresh treat it like the others.
+        """
+        btn = QPushButton()
+        btn.setObjectName("navItem")
+        btn.setFixedHeight(42)
+        btn.setToolTip(full)
+        btn.setCursor(QtGui.QCursor(Qt.CursorShape.PointingHandCursor))
+        btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+        inner = QHBoxLayout(btn)
+        inner.setContentsMargins(13, 0, 10, 0)
+        inner.setSpacing(12)
+
+        icon_label = QLabel()
+        icon_label.setFixedSize(20, 20)
+        icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        inner.addWidget(icon_label)
+
+        text_label = QLabel(short)
+        text_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        inner.addWidget(text_label)
+        inner.addStretch()
+
+        btn.clicked.connect(lambda _checked: callback())
+
+        # The updater disables/enables this during a check, so keep the handle
+        # on the conventional name it already looks for, plus the text label so
+        # it can show "Checking…" without writing over the custom layout.
+        self._update_button = btn
+        self._update_text_label = text_label
+        self._nav_action_items = getattr(self, "_nav_action_items", [])
+        self._nav_action_items.append((btn, icon_label, icon_name, text_label))
+        # Tracked for compact-mode label hiding alongside the tab labels.
+        self._nav_text_labels[key] = text_label
+        return btn
 
     def _create_nav_item(self, key: str, short: str, full: str, icon_name: str):
         btn = QPushButton()
@@ -614,6 +675,15 @@ class NavigationMixin:
                 f"background: transparent; font-size: 12.5px;"
                 f"font-weight: {'700' if active else '500'};"
                 f"color: {accent if active else text};"
+            )
+
+        # Action items (e.g. "Update") are never "selected" — always dim.
+        for _btn, icon_label, icon_name, text_label in getattr(
+                self, "_nav_action_items", []):
+            icon_label.setPixmap(icons.icon_pixmap(icon_name, dim, 19, 1.85))
+            text_label.setStyleSheet(
+                f"background: transparent; font-size: 12.5px;"
+                f"font-weight: 500; color: {text};"
             )
 
     def _nav_activate(self, index: int, init: bool = False):

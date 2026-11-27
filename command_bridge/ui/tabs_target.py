@@ -95,8 +95,26 @@ class TargetTabMixin:
         headers_group.layout().addLayout(headers_layout)
         layout.addWidget(headers_group)
 
-        layout.addWidget(self._create_egress_card())
+        layout.addStretch()
 
+        return scroll
+
+    # ── version catalogue ────────────────────────────────────────────────
+    # ── Traffic transparency ─────────────────────────────────────────
+    #
+    # The question a client asks is "what does your tool talk to?", and
+    # the answer should not be a paragraph in a README. Two controls,
+    # both off until the operator turns them on:
+    #
+    #   * a proxy, which sends this application's own HTTP and every
+    #     tool it launches through Burp / ZAP / mitmproxy, and
+    #   * a log, which records every outbound request this application
+    #     makes, to a JSONL file that can be read offline.
+    #
+    # See modules/egress.py for what is recorded and what deliberately
+    # is not.
+    def _create_tools_card(self):
+        """Build the tools_group card (own Settings tab)."""
         # Environment / Tool Setup group — checks and (best-effort) repairs
         # the external tools every button in this app shells out to. Kali
         # boxes commonly end up with pipx-installed tools whose venv shims
@@ -181,8 +199,10 @@ class TargetTabMixin:
         tools_layout.addWidget(self.versions_age)
         self._refresh_version_age()
         tools_group.layout().addLayout(tools_layout)
-        layout.addWidget(tools_group)
+        return tools_group
 
+    def _create_uat_card(self):
+        """Build the uat_group card (own Settings tab)."""
         # UAT — a known-vulnerable target to test changes against.
         uat_group = self.create_card("UAT \u2014 test against a known target")
         uat_layout = QVBoxLayout()
@@ -244,69 +264,36 @@ class TargetTabMixin:
         self.uat_status.setWordWrap(True)
         uat_layout.addWidget(self.uat_status)
         uat_group.layout().addLayout(uat_layout)
-        layout.addWidget(uat_group)
+        return uat_group
 
-        # Software Updates — pulls the latest code from the git remote this
-        # copy was cloned from and restarts in place, so a fix never has to
-        # travel by zip file again. Everything the user has customised lives
-        # in ~/.config/CommandBridge, outside the repo, and survives updates.
-        update_group = self.create_card("Software Updates")
-        update_layout = QVBoxLayout()
-
-        update_desc = QLabel(
-            "Fetch the latest version of Command Bridge, show what changed and "
-            "restart. Your saved commands, theme and output directory are kept."
-        )
-        update_desc.setWordWrap(True)
-        update_desc.setObjectName("autoDesc")
-        update_layout.addWidget(update_desc)
-
-        self._update_revision_label = QLabel("Installed revision: checking…")
-        self._update_revision_label.setObjectName("cardHint")
-        update_layout.addWidget(self._update_revision_label)
-
-        update_btn_row = QHBoxLayout()
-        self._update_button = QPushButton("Check for Updates")
-        self._update_button.setObjectName("primaryButton")
-        self._update_button.setMinimumHeight(38)
-        self._update_button.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
-        self._update_button.setToolTip(
-            "Runs 'git fetch' against the remote this copy was cloned from, "
-            "lists the incoming commits and — if you confirm — fast-forwards "
-            "and restarts. Only ever fast-forwards: if this box has local "
-            "commits or edits, it stops and tells you rather than overwriting "
-            "them."
-        )
-        self._update_button.clicked.connect(self.check_for_updates)
-        update_btn_row.addWidget(self._update_button)
-        update_btn_row.addStretch()
-
-        update_layout.addLayout(update_btn_row)
-        update_group.layout().addLayout(update_layout)
-        layout.addWidget(update_group)
-
-        # Fill in the revision caption once the window is up; reading it needs
-        # a couple of git calls and there is no reason to make startup wait.
-        QtCore.QTimer.singleShot(0, self.refresh_update_label)
-
+    # ── Settings tabs (relocated from the old Target tab) ────────────────
+    def _settings_scroll(self, card):
+        """Wrap a single settings card in a scrollable tab page."""
+        from PyQt6.QtWidgets import QWidget, QScrollArea, QVBoxLayout, QFrame
+        widget = QWidget()
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(widget)
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(25, 25, 25, 25)
+        layout.setSpacing(20)
+        layout.addWidget(card)
         layout.addStretch()
-
         return scroll
 
-    # ── version catalogue ────────────────────────────────────────────────
-    # ── Traffic transparency ─────────────────────────────────────────
-    #
-    # The question a client asks is "what does your tool talk to?", and
-    # the answer should not be a paragraph in a README. Two controls,
-    # both off until the operator turns them on:
-    #
-    #   * a proxy, which sends this application's own HTTP and every
-    #     tool it launches through Burp / ZAP / mitmproxy, and
-    #   * a log, which records every outbound request this application
-    #     makes, to a JSONL file that can be read offline.
-    #
-    # See modules/egress.py for what is recorded and what deliberately
-    # is not.
+    def create_transparency_tab(self):
+        """Settings → Traffic Transparency (proxy and egress log)."""
+        return self._settings_scroll(self._create_egress_card())
+
+    def create_tools_tab(self):
+        """Settings → Environment / Tool Setup."""
+        return self._settings_scroll(self._create_tools_card())
+
+    def create_uat_tab(self):
+        """Settings → UAT (test against a known target)."""
+        return self._settings_scroll(self._create_uat_card())
+
     def _create_egress_card(self):
         from command_bridge.modules import egress
 

@@ -347,7 +347,10 @@ QToolTip {{
 #navRail {{ background-color: {nav_bg}; }}
 
 #navSectionLabel {{
-    color: {text_dim};
+    /* Section headings (ENGAGE / DISCOVER / TEST / SETTINGS) take the active
+       theme's accent so they stand out like the highlighted buttons. The
+       child nav items (Web, API, …) keep their own text colour. */
+    color: {accent};
     background: transparent;
     font-size: 10.5px;
     font-weight: 700;
