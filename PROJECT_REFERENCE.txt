@@ -19,6 +19,110 @@ HOW TO USE THIS FILE
  CHANGELOG (most recent first)
 ================================================================================
 
+## 2026-11-27 — ACTIVE-SCAN INJECTION: KILL REFLECTION FALSE POSITIVES (6.12.14)
+
+Reported from a live engagement: 36 (then 76) CONFIRMED "OS command
+injection" on path segments, all false. Root cause: the echo proof token
+is part of the payload (`; echo <TOKEN>`), and an endpoint that reflects
+its input — a path segment echoed back in a canonical <link>, breadcrumb
+or 404 — brings the token back into the page with no shell involved, in
+encodings _without_payload could not always strip. _controlled didn't
+catch it (a reflecting endpoint reflects the control value, not the
+canary).
+
+Fix (scanner/checks/injection.py):
+ - CommandInjectionCheck now probes whether the point reflects its input
+   (_point_reflects_input: a plain alphanumeric sentinel that no encoding
+   can alter — if it comes back, the point reflects). When it does, the
+   echoed token / arithmetic product cannot be trusted, so _capture
+   reports NOTHING unless a read-only command actually returned its output
+   (id, whoami, uname, /etc/passwd) — the one thing reflection cannot
+   fake. A genuine injection that returns output still confirms (verified:
+   the planted /ping vuln is still found).
+ - SSTI and code-injection checks now bail out when the canary number
+   (1337 / 1146) is already present in the baseline page, so a page that
+   carries those digits in a cache cookie / asset hash / CSS value cannot
+   produce a coincidental finding.
+
+Tests: test_scanner.py gained "a path that reflects its input yields no
+command injection" + "a point that returns real command output still
+confirms"; full suite 314 passed / 0 failed.
+
+## 2026-11-27 — NAV RAIL: SETTINGS SECTION, UPDATE ACTION, ACCENT HEADINGS (6.12.13)
+
+Sidebar restructure (navigation.py / constants.py / theme.py /
+tabs_target.py / updater.py):
+
+1. New "SETTINGS" rail section with three tabs, moved OUT of the Target
+   tab: Proxy (Traffic Transparency / egress log), Tools (Environment /
+   Tool Setup), UAT (test against a known target). TABS gained three
+   entries (section SETTINGS); RAIL_SECTIONS gained "SETTINGS";
+   _TAB_BUILDERS / _SAFE_BUILD_ORDER updated. The Target tab now holds
+   only Primary Target, Output Directory and Custom Headers. The moved
+   cards became _create_tools_card / _create_uat_card (and the existing
+   _create_egress_card), each wrapped by a create_*_tab via
+   _settings_scroll.
+2. "Check for Updates" removed from the Target tab and relocated to the
+   rail as an "Update" action below Bounty (refresh icon). It's an action
+   item (_create_nav_action_item), not a tab — runs check_for_updates.
+   updater.py now writes the caption via _set_update_button_text (updates
+   the rail button's child QLabel: "Update" / "Checking…" / "Updating…"),
+   and refresh_update_label still no-ops safely without the old revision
+   label.
+3. Section headings (ENGAGE / DISCOVER / TEST / SETTINGS) now use the
+   active theme's accent colour (navSectionLabel color -> {accent}) so
+   they stand out like the highlighted buttons; child nav items keep their
+   normal text colour.
+4. Sections are spaced apart (a 14px spacer above each heading but the
+   first) so the groups read as distinct bands.
+
+## 2026-11-27 — HTTP->HTTPS CHECK: CAPTURE ONLY, NO COMMENTARY (6.12.12)
+
+Per request, check_http_https_redirect now prints ONLY the captured
+request and captured response blocks (plus the title line). Removed the
+verdict/impact paragraph and the whole _report_hsts_status() HSTS
+follow-up — the captured 301-over-HTTP response speaks for itself in a
+finding. Also dropped the now-unused `ssl` import and `location` var.
+
+## 2026-11-27 — HTTP->HTTPS CHECK REFRAMED AS MITM FINDING (6.12.11)
+
+Corrected the polarity of check_http_https_redirect (web_testing.py). It
+previously reported a 301 -> https as "[✔] correct upgrade". That is
+wrong for pentest reporting: the redirect is delivered over cleartext
+HTTP, so the initial request is interceptable (SSL strip / MITM). The
+button now:
+ - sends the GET and prints the CAPTURED REQUEST and CAPTURED RESPONSE in
+   Burp style (### Captured Request submitted over HTTP ### / ### Captured
+   HTTP Server Response ###), using the target's path+query, so the
+   exchange can be pasted straight into a finding;
+ - reports a 3xx -> https over HTTP as "[✖] VULNERABLE — insecure
+   HTTP-to-HTTPS redirect" with the MITM / SSL-strip impact text;
+ - follows up with _report_hsts_status(): checks Strict-Transport-Security
+   on the HTTPS site (and whether it carries 'preload'), since HSTS
+   preload is the real mitigation that stops the browser making the
+   cleartext request at all;
+ - still flags a plain 200 over HTTP (content served unencrypted) and
+   reports connection-refused on :80 as a valid HTTPS-only posture.
+
+## 2026-11-27 — SMARTFUZZ: EDIT COMMAND + THREAD COUNT (6.12.10)
+
+The SmartFuzz right-click menu now also carries, at the top:
+- "✏️ Manually Modify Underlying Command" — opens an editor pre-filled
+  with the auto-built command (threads + wordlist overrides + persisted
+  auth). The edit is stored as smartfuzz_cmd_override and run verbatim
+  (auth is not re-prompted) until reset. A "🔄 Reset Command to
+  Auto-Generated" item appears while an override is set.
+- "⚙️ Set Thread Count (current: N)" — prompts 1–200, stored as
+  smartfuzz_threads. The command builder previously hardcoded `-t 2`;
+  it now uses _smartfuzz_threads() (validated, default 2). Out-of-range
+  or non-numeric values fall back to 2.
+
+Both are in fuzzing.py (run_smartfuzz_with_auth honours the override;
+_build_smartfuzz_command uses the thread count; _set_smartfuzz_threads
+and _edit_smartfuzz_command are the handlers). The SmartFuzz button
+tooltip (tabs_web.py) was updated to mention them. Coffee Break's own
+SmartFuzz stage is unchanged.
+
 ## 2026-11-26 — WEB TAB + FUZZING MENU TIDY-UP (6.12.9)
 
 1. Removed the "Content-Type Filter" button from the XSS Testing card
