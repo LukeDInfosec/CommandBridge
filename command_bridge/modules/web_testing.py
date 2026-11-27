@@ -1257,23 +1257,17 @@ class WebTestingMixin:
             self.console.append_ansi(f"    SAN: {', '.join(sorted(set(sans)))}\n")
 
     def check_http_https_redirect(self):
-        """Capture the plain-HTTP request/response and assess the redirect.
+        """Capture and print the plain-HTTP request and response (Burp style).
 
-        This is a MITM / SSL-strip check, not a "does it upgrade" health check.
-        A site that answers the insecure HTTP URL with a 301/302 to its HTTPS
-        URL still delivers that redirect over cleartext: the very first request
-        leaves the client unencrypted, so an on-path attacker can intercept it
-        and send the victim anywhere, or strip TLS and relay the session. The
-        real mitigation is HSTS preload, which stops the browser ever making
-        the HTTP request.
-
-        The button prints the captured request and the captured response (Burp
-        style) so the exchange can be pasted straight into a finding, then
-        states the assessment and checks whether HSTS is set on the HTTPS site.
+        Sends a GET to the http:// form of the target (using its path and
+        query) and prints the exact request and the server's response — status
+        line and headers — so the exchange can be pasted straight into a
+        finding. A 301/302 to the HTTPS URL here is the interceptable
+        cleartext redirect; the captured response makes that evident on its
+        own, so the button just reports the exchange without commentary.
         """
         import http.client
         import socket
-        import ssl
         from urllib.parse import urlparse
 
         if not self.target:
@@ -1328,7 +1322,6 @@ class WebTestingMixin:
             reason = resp.reason
             resp_headers = resp.getheaders()
             http_ver = "HTTP/1.1" if resp.version == 11 else "HTTP/1.0"
-            location = resp.getheader("Location", "") or ""
             conn.close()
         except (ConnectionRefusedError, socket.timeout, socket.gaierror, OSError) as e:
             self.console.append_ansi(
@@ -1354,101 +1347,6 @@ class WebTestingMixin:
         for name, value in resp_headers:
             self.console.append_ansi(f"{name}: {value}\n")
         self.console.append_ansi("\n")
-
-        # ── Assessment ──────────────────────────────────────────────────────
-        dest = urlparse(location) if location else None
-        dest_scheme = (dest.scheme or "").lower() if dest else ""
-        redirects_to_https = 300 <= status < 400 and dest_scheme == "https"
-
-        if redirects_to_https:
-            self.console.append_ansi(
-                f"[✖] VULNERABLE — insecure HTTP-to-HTTPS redirect. The server "
-                f"redirects the plain-HTTP URL to its HTTPS URL with a {status}, "
-                f"but that redirect is itself delivered over unencrypted HTTP. "
-                f"The request above travels in cleartext.\n"
-            )
-            self.console.append_ansi(
-                "    Impact: an attacker able to intercept this initial "
-                "non-HTTPS request can redirect the user to a URL of their "
-                "choosing, or strip the SSL connection and act as a relay "
-                "between the client and the server (SSL stripping / MITM).\n"
-            )
-            self._report_hsts_status(host, parsed.port)
-        elif 300 <= status < 400 and location:
-            self.console.append_ansi(
-                f"[✖] The HTTP URL returns a {status} redirect to a NON-HTTPS "
-                f"destination (scheme: {dest_scheme or 'relative/unknown'}). "
-                f"The scheme is not upgraded and the request is in cleartext.\n"
-            )
-        elif status == 200:
-            self.console.append_ansi(
-                "[✖] The HTTP URL serves content directly (200) with no "
-                "redirect to HTTPS — the response is delivered unencrypted and "
-                "is fully interceptable.\n"
-            )
-        else:
-            self.console.append_ansi(
-                f"[i] The HTTP URL answered {status} with no HTTPS redirect. "
-                f"Review the captured response above.\n"
-            )
-
-    def _report_hsts_status(self, host, port):
-        """Check whether the HTTPS site sets HSTS — the real fix for the
-        cleartext-redirect finding — and report it.
-
-        HSTS is only honoured by browsers when delivered over HTTPS, and only
-        the preload list protects the very first visit, so this is reported as
-        mitigation context rather than as a pass/fail on its own.
-        """
-        import http.client
-        import ssl
-        import socket
-
-        https_port = port or 443
-        try:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            conn = http.client.HTTPSConnection(
-                host, https_port, timeout=10, context=ctx)
-            conn.request("HEAD", "/", headers={"Host": host})
-            resp = conn.getresponse()
-            hsts = resp.getheader("Strict-Transport-Security", "") or ""
-            conn.close()
-        except Exception as e:
-            self.console.append_ansi(
-                f"    (Could not check HSTS on https://{host}:{https_port}: {e})\n"
-            )
-            return
-
-        if hsts:
-            preload = "preload" in hsts.lower()
-            self.console.append_ansi(
-                f"    HSTS on the HTTPS site: present — {hsts.strip()}\n"
-            )
-            if preload:
-                self.console.append_ansi(
-                    "    It includes 'preload'. Once the domain is on the HSTS "
-                    "preload list, browsers go straight to HTTPS and never send "
-                    "the cleartext request, which closes this gap for preloaded "
-                    "clients. Confirm it is actually submitted at "
-                    "hstspreload.org.\n"
-                )
-            else:
-                self.console.append_ansi(
-                    "    It does NOT include 'preload', so the first-ever visit "
-                    "(or a visit after the max-age expires) still goes over "
-                    "HTTP and stays exploitable. Add 'preload' and submit the "
-                    "domain to hstspreload.org.\n"
-                )
-        else:
-            self.console.append_ansi(
-                "    HSTS on the HTTPS site: ABSENT. Nothing tells the browser "
-                "to avoid HTTP, so every visit can begin with the interceptable "
-                "cleartext request above. Add a Strict-Transport-Security "
-                "header (e.g. 'max-age=31536000; includeSubDomains; preload') "
-                "and submit the domain to the HSTS preload list.\n"
-            )
 
     def run_insecure_redirect_scan(self):
         """Test the current target for unvalidated / open redirects.
