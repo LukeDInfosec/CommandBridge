@@ -205,7 +205,7 @@ class UpdaterMixin:
         button = getattr(self, "_update_button", None)
         if button is not None:
             button.setEnabled(False)
-            button.setText("Checking…")
+            self._set_update_button_text("Checking…")
 
         worker = _GitWorker("check", self)
         worker.finished_ok.connect(lambda info: self._on_check_done(info, silent))
@@ -214,11 +214,26 @@ class UpdaterMixin:
         self._update_worker = worker  # keep a reference alive
         worker.start()
 
+    def _set_update_button_text(self, text: str):
+        """Set the Update control's caption.
+
+        The rail button keeps its caption in a child QLabel (so the icon +
+        text layout is preserved); fall back to the button's own text for any
+        plain-button call site.
+        """
+        label = getattr(self, "_update_text_label", None)
+        if label is not None:
+            label.setText(text)
+            return
+        button = getattr(self, "_update_button", None)
+        if button is not None:
+            button.setText(text)
+
     def _reset_update_button(self):
         button = getattr(self, "_update_button", None)
         if button is not None:
             button.setEnabled(True)
-            button.setText("Check for Updates")
+            self._set_update_button_text("Update")
         self.refresh_update_label()
 
     def _on_check_failed(self, message: str, silent: bool):
@@ -331,7 +346,7 @@ class UpdaterMixin:
         button = getattr(self, "_update_button", None)
         if button is not None:
             button.setEnabled(False)
-            button.setText("Updating…")
+            self._set_update_button_text("Updating…")
         worker = _GitWorker("pull", self)
         worker.finished_ok.connect(lambda res: self._on_pull_done(res, stashed))
         worker.failed.connect(lambda msg: self._on_pull_failed(msg, stashed))
