@@ -314,7 +314,8 @@ class WebTabMixin:
         smartfuzz_btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
         smartfuzz_btn.setToolTip(
             "Adaptive directory enumeration: auto-detects the server architecture and\n"
-            "switches to a matching wordlist mid-scan. Right-click to set custom\n"
+            "switches to a matching wordlist mid-scan. Right-click to set the thread\n"
+            "count, edit the underlying command, or set custom\n"
             "Nginx / Apache / IIS / Tomcat / CMS wordlist paths."
         )
         smartfuzz_btn.clicked.connect(self.run_smartfuzz_with_auth)
